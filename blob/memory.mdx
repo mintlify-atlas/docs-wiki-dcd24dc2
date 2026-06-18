@@ -1,0 +1,115 @@
+---
+title: "In-memory provider"
+sidebarTitle: "Memory"
+description: "Volo.Abp.BlobStoring.Memory — MemoryBlobProvider backed by ConcurrentDictionary<string, byte[]>, scoped per tenant + container, with no naming normaliser and no persistence."
+---
+
+The memory provider package is `framework/src/Volo.Abp.BlobStoring.Memory/Volo/Abp/BlobStoring/Memory/`. It exists for tests, integration scenarios, and ephemeral preview flows where you want to exercise the BLOB API without a real backing store. **It does not persist across process restarts**, it does not implement any naming rules, and storage is bounded by process memory.
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `AbpBlobStoringMemoryModule.cs` | `[DependsOn(AbpBlobStoringModule)]`, empty body. |
+| `MemoryBlobContainerConfigurationExtensions.cs` | `UseMemory()` extension — just sets `ProviderType = typeof(MemoryBlobProvider)`. No options class, no naming normaliser registration. |
+| `MemoryBlobProvider.cs` | The provider — a `ConcurrentDictionary<string, byte[]>`. |
+
+There is no `MemoryBlobProviderConfiguration`, no `MemoryBlobProviderConfigurationNames`, no `MemoryBlobNamingNormalizer` and no name calculator interface — the provider does it all inline.
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule))]
+public class AbpBlobStoringMemoryModule : AbpModule { }
+```
+
+## `UseMemory()` extension
+
+```csharp
+public static BlobContainerConfiguration UseMemory(
+    this BlobContainerConfiguration containerConfiguration)
+{
+    containerConfiguration.ProviderType = typeof(MemoryBlobProvider);
+    return containerConfiguration;
+}
+```
+
+Note this is the only `Use*` extension in the BLOB stack that takes no `Action` — the provider has nothing to configure.
+
+```csharp
+Configure<AbpBlobStoringOptions>(o =>
+{
+    o.Containers.ConfigureDefault(c => c.UseMemory());
+});
+```
+
+## `MemoryBlobProvider`
+
+```csharp
+public class MemoryBlobProvider : BlobProviderBase, ITransientDependency
+{
+    protected ConcurrentDictionary<string, byte[]> MemoryStore { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+
+    public MemoryBlobProvider(ICurrentTenant currentTenant)
+    {
+        MemoryStore   = new ConcurrentDictionary<string, byte[]>();
+        CurrentTenant = currentTenant;
+    }
+
+    protected virtual string GetCacheKey(BlobProviderArgs args)
+        => $"{CurrentTenant.Id}_{args.BlobName}_{args.ContainerName}";
+}
+```
+
+### Lifetime gotcha
+
+`ITransientDependency` looks alarming — a transient provider would mean a new store per resolution and instant data loss. The dictionary survives because `IBlobProviderSelector` resolves `IEnumerable<IBlobProvider>` from the root container, and `DefaultBlobProviderSelector` is `ITransientDependency` but its dependencies (including the resolved provider instance) are constructed once per request scope. **In practice the provider is re-instantiated frequently, but the dictionary is a field on the provider instance, so storage is not shared across resolutions.**
+
+To make this work as expected, register the provider as a **singleton** in your test module (or wrap the dictionary in a singleton service) before depending on it:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.Replace(
+        ServiceDescriptor.Singleton<MemoryBlobProvider, MemoryBlobProvider>());
+    context.Services.AddSingleton<IBlobProvider>(sp => sp.GetRequiredService<MemoryBlobProvider>());
+}
+```
+
+`AbpBlobStoringMemoryModule` itself does not do this — it's a deliberate choice so the package can stay minimal for the most common case (single-resolution test inside one `using var application = ...`). Production code should never rely on the memory provider.
+
+### Operations
+
+| Method | Implementation |
+| --- | --- |
+| `SaveAsync` | Buffers `args.BlobStream` into a `MemoryStream`, takes `ToArray()`. If `!OverrideExisting`, calls `MemoryStore.TryAdd(key, bytes)` and throws `BlobAlreadyExistsException` on collision. Otherwise `MemoryStore.AddOrUpdate(key, bytes, (_, __) => bytes)`. |
+| `DeleteAsync` | `Task.FromResult(MemoryStore.TryRemove(GetCacheKey(args), out _))`. |
+| `ExistsAsync` | `Task.FromResult(MemoryStore.ContainsKey(GetCacheKey(args)))`. |
+| `GetOrNullAsync` | `TryGetValue` → return `new MemoryStream(bytes, writable: false)` or null. The returned stream wraps the original byte array directly; callers should not assume independence between successive reads. |
+
+### Tenant scoping
+
+The cache key includes `CurrentTenant.Id`, so blobs under tenant A are invisible to tenant B even though they live in the same dictionary. Setting `IsMultiTenant = false` on the container configuration makes `BlobContainer` skip the tenant change, in which case `CurrentTenant.Id` collapses to whatever the ambient scope is — typically null at host level.
+
+### Naming
+
+There is **no `IBlobNamingNormalizer` registered** by `UseMemory()`, and the underlying `ConcurrentDictionary` accepts any string. You can store blob names with `/`, special characters, etc., that other providers would reject — useful for testing with realistic but unnormalised names.
+
+## When to use it
+
+- **Unit tests** for `IBlobContainer` consumers — assert that `SaveAsync` was called with the expected bytes by reading them back.
+- **Integration tests** where you want the full `BlobContainerFactory` → `IBlobProvider` plumbing but don't want to depend on real storage.
+- **Local demos** where you don't want temp directories to accumulate.
+
+It is not suitable for production because:
+
+- Bytes are kept on the managed heap — large blobs cause LOH pressure.
+- Nothing survives a restart.
+- Without an explicit singleton override, every resolution may get a fresh store.
+
+## Cross-references
+
+- [BLOB storing overview](/blob/blob-storing-overview).
+- [File system provider](/blob/file-system) — persistent local alternative for development.
+- [Test base](/aspnetcore/test-base) — integration test bootstrap that often pairs with `UseMemory()`.

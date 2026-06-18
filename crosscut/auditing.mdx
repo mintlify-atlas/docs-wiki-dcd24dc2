@@ -1,0 +1,128 @@
+---
+title: "Auditing (Volo.Abp.Auditing)"
+description: "AuditingManager scopes, AuditLogInfo, entity change tracking, IAuditedObject family, AuditingInterceptor and pluggable IAuditingStore."
+---
+
+`Volo.Abp.Auditing` records who did what, when, and on which entity. It is composed of an ambient `IAuditLogScope`, a DynamicProxy `AuditingInterceptor` that opens that scope around application-service calls, a property setter that stamps `CreationTime` / `CreatorId` / `LastModificationTime` / `DeleterId` on tracked entities, and a pluggable `IAuditingStore` sink. The actual database persistence lives in the `Volo.Abp.AuditLogging.*` modules — see `/modules/audit-logging`.
+
+Source: `framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/` and `framework/src/Volo.Abp.Auditing.Contracts/Volo/Abp/Auditing/`.
+
+## Modules
+
+`AbpAuditingContractsModule` (in `Volo.Abp.Auditing.Contracts`) holds the marker interfaces and attributes — no services. It is the dependency you reference from `Domain.Shared` / DTO projects so your entities can implement `IFullAuditedObject` without pulling the full auditing pipeline.
+
+`AbpAuditingModule` (in `Volo.Abp.Auditing`) depends on `AbpDataModule`, `AbpJsonModule`, `AbpTimingModule`, `AbpSecurityModule`, `AbpThreadingModule`, `AbpMultiTenancyModule`, `AbpAuditingContractsModule`. In `PreConfigureServices` it hooks `AuditingInterceptorRegistrar.RegisterIfNeeded` into `IServiceCollection.OnRegistered` so every later DI registration is inspected and wrapped with `AuditingInterceptor` if it qualifies. In `ConfigureServices` it copies the application name from `IServiceCollection.GetApplicationName()` into `AbpAuditingOptions.ApplicationName`.
+
+## `AbpAuditingOptions`
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `IsEnabled` | `true` | Master kill switch. `AuditingInterceptor.ShouldIntercept` exits early when `false`. |
+| `IsEnabledForAnonymousUsers` | `true` | If `false` and no user is authenticated, the log is dropped at the end of the scope. |
+| `AlwaysLogOnException` | `true` | Even if filters would reject the log, write it when the method threw. |
+| `IsEnabledForGetRequests` | `false` | If `false`, methods named `Get*` (or HTTP `GET`/`HEAD`) are not logged. |
+| `IsEnabledForIntegrationServices` | `false` | Whether `[IntegrationService]`-attributed services are audited. |
+| `HideErrors` | `true` | Swallow exceptions raised by the `IAuditingStore`. |
+| `ApplicationName` | from `GetApplicationName()` | Written to every `AuditLogInfo.ApplicationName`. |
+| `SaveEntityHistoryWhenNavigationChanges` | `true` | Whether navigation-property updates trigger an entity-change row. |
+| `DisableLogActionInfo` | `false` | Skip per-method `AuditLogActionInfo` capture (only entity changes are written). |
+| `AlwaysLogSelectors` | `List<Func<AuditLogInfo, Task<bool>>>` | Custom predicates that force a log to be written. Evaluated in `AuditingInterceptor.ShouldWriteAuditLogAsync`. |
+| `Contributors` | `List<AuditLogContributor>` | Extra metadata writers. `PreContribute` runs when the scope opens, `PostContribute` runs in `AuditingManager.BeforeSave`. |
+| `IgnoredTypes` | `Stream`, `Expression`, `CancellationToken` | Parameters of these types are nulled before serialization. |
+| `EntityHistorySelectors` | `IEntityHistorySelectorList` | Predicates that opt entity types into history without `[Audited]`. |
+
+## Marker contracts (`Volo.Abp.Auditing.Contracts`)
+
+All of these are pure interfaces with no behaviour — they exist for both the property setter and the EF/Mongo data filters to recognize an entity.
+
+| Interface | Adds | Notes |
+| --- | --- | --- |
+| `IHasCreationTime` | `DateTime CreationTime` | Set on insert by `AuditPropertySetter.SetCreationTime` if value is `default`. |
+| `IMayHaveCreator` / `IMayHaveCreator<TUser>` | `Guid? CreatorId` (`+ TUser Creator`) | Nullable creator. Skipped if cross-tenant. |
+| `IMustHaveCreator` | `Guid CreatorId` | Required creator. |
+| `ICreationAuditedObject` | combines the two above | Standard "created by" pair. |
+| `IHasModificationTime` | `DateTime? LastModificationTime` | Set on update. |
+| `IModificationAuditedObject` | `+ Guid? LastModifierId` | Set to current user or `null` on cross-tenant updates. |
+| `IAuditedObject` | `ICreationAuditedObject + IModificationAuditedObject` | The common DDD aggregate base shape. |
+| `ISoftDelete` (in `Volo.Abp.Data`) | `bool IsDeleted` | Re-exported through `IHasDeletionTime`. |
+| `IHasDeletionTime` | `+ DateTime? DeletionTime` | Implies `ISoftDelete`. |
+| `IDeletionAuditedObject` | `+ Guid? DeleterId` | |
+| `IFullAuditedObject` | `IAuditedObject + IDeletionAuditedObject` | Used by `FullAuditedAggregateRoot<TKey>`. |
+| `IHasEntityVersion` | `int EntityVersion` | `AuditPropertySetter.IncrementEntityVersionProperty` bumps it on every change. |
+| `IAuditingEnabled` | marker | Forces auditing even without `[Audited]`. Implemented by `ApplicationService`. |
+
+Attributes:
+
+- `[Audited]` (class/method/property) — opt in.
+- `[DisableAuditing]` (class/method/property) — opt out. On properties, `UpdateModificationProps = false` keeps the property change from bumping `LastModificationTime`, and `PublishEntityEvent = false` suppresses the `EntityUpdatedEvent`.
+- `[IntegrationService]` (in `Volo.Abp`) — combined with `AbpAuditingOptions.IsEnabledForIntegrationServices` to decide whether integration services are audited.
+
+## File-by-file enumeration (`Volo.Abp.Auditing`)
+
+| File | Type | Role |
+| --- | --- | --- |
+| `IAuditingManager.cs` | `IAuditingManager` | `IAuditLogScope? Current { get; }` + `IAuditLogSaveHandle BeginScope()`. |
+| `AuditingManager.cs` | `AuditingManager : IAuditingManager, ITransientDependency` | Stores the scope on the ambient key `"Volo.Abp.Auditing.IAuditLogScope"` through `IAmbientScopeProvider<IAuditLogScope>`. `BeginScope` calls `IAuditingHelper.CreateAuditLogInfo()`, pushes a new `AuditLogScope`, and returns a `DisposableSaveHandle` that holds a `Stopwatch`. `SaveAsync` runs `ExecutePostContributors`, `MergeEntityChanges` (collapses multiple `Updated` rows for the same entity), and finally `IAuditingStore.SaveAsync(auditLog)`. |
+| `IAuditLogScope.cs` / `AuditLogScope.cs` | scope | Holds the `AuditLogInfo Log` for the duration of the request/operation. |
+| `IAuditLogSaveHandle.cs` | `IAuditLogSaveHandle : IDisposable` | Returned by `BeginScope`. Caller is expected to `await SaveAsync()` then `Dispose()`. |
+| `AuditLogInfo.cs` | DTO | The aggregate of one audited operation. See table below. |
+| `AuditLogActionInfo.cs` | `AuditLogActionInfo` | One method call inside the scope: `ServiceName`, `MethodName`, `Parameters` (JSON), `ExecutionTime`, `ExecutionDuration`. |
+| `EntityChangeInfo.cs` | `EntityChangeInfo` | One create/update/delete inside the scope: `ChangeType`, `EntityId`, `EntityTypeFullName`, `EntityTenantId`, `PropertyChanges`, `EntityEntry`. `Merge(other)` is used by `MergeEntityChanges`. |
+| `EntityPropertyChangeInfo.cs` | `EntityPropertyChangeInfo` | `PropertyName`, `OriginalValue`, `NewValue`, `PropertyTypeFullName`. Constants `MaxPropertyNameLength = 96`, `MaxValueLength = 512`, `MaxPropertyTypeFullNameLength = 512`. |
+| `EntityChangeType.cs` | enum | `Created = 0`, `Updated = 1`, `Deleted = 2`. |
+| `IAuditingStore.cs` | `IAuditingStore` | `Task SaveAsync(AuditLogInfo auditInfo)`. The persistence seam. |
+| `SimpleLogAuditingStore.cs` | default impl | `[Dependency(TryRegister = true)] ISingletonDependency`. Writes `auditInfo.ToString()` to `ILogger`. Replaced by `AuditLogStore` from `Volo.Abp.AuditLogging.*` when the module is loaded. |
+| `IAuditingHelper.cs` / `AuditingHelper.cs` | `IAuditingHelper, ITransientDependency` | Decides whether a method/entity should be audited; builds new `AuditLogInfo` snapshots from `ICurrentUser`, `ICurrentTenant`, `ICurrentClient`, `IClock`, `ICorrelationIdProvider`; builds `AuditLogActionInfo` with serialized arguments. Also owns `DisableAuditing()` which wraps `IAmbientScopeProvider<AuditingDisabledState>`. |
+| `AuditingDisabledState.cs` | record | The flag the helper stores in the ambient scope (`AuditingDisabledScopeKey = "Volo.Abp.Auditing.DisabledScope"`). |
+| `IAuditPropertySetter.cs` / `AuditPropertySetter.cs` | `IAuditPropertySetter, ITransientDependency` | Sets `CreationTime`/`CreatorId`, `LastModificationTime`/`LastModifierId`, `DeletionTime`/`DeleterId` and increments `EntityVersion`. Used by EF Core (`AbpDbContext`) and MongoDB (`AbpMongoDbContext`) when saving entities. Honours multi-tenant boundaries: a tenant user editing a host entity does *not* get stamped as the creator/modifier. |
+| `AuditingInterceptor.cs` | `AuditingInterceptor : AbpInterceptor, ITransientDependency` | The DynamicProxy interceptor. `ShouldIntercept` checks `Options.IsEnabled`, the `AbpCrossCuttingConcerns.Auditing` aspect flag, and `IAuditingHelper.ShouldSaveAudit`. If `IAuditingManager.Current != null` it just appends an `AuditLogActionInfo`. Otherwise it opens a fresh scope via `ProcessWithNewAuditingScopeAsync`, runs the method, flushes the `IUnitOfWork` (so entity changes are captured), then writes via `IAuditLogSaveHandle.SaveAsync()`. |
+| `AuditingInterceptorRegistrar.cs` | static | `RegisterIfNeeded` adds the interceptor when the type carries `[Audited]`, implements `IAuditingEnabled`, or has any `[Audited]` method. `IntegrationService` types are excluded unless explicitly enabled. |
+| `AbpAuditingOptions.cs` | options | See table above. |
+| `AuditLogContributor.cs` / `AuditLogContributionContext.cs` | extension point | Subclass `AuditLogContributor` and add to `Options.Contributors`. `PreContribute` runs at scope open, `PostContribute` runs in `BeforeSave`. |
+| `IAuditSerializer.cs` / `JsonAuditSerializer.cs` | argument serializer | The JSON serializer used to render method parameters into `AuditLogActionInfo.Parameters`. |
+| `IEntityHistorySelectorList.cs` / `EntityHistorySelectorList.cs` | list of `(Name, Predicate)` | Lets the host opt arbitrary entity types into change history without modifying them. |
+| `AbpAuditingModule.cs` | module | See above. |
+
+### `AuditLogInfo`
+
+| Field | Type | Source |
+| --- | --- | --- |
+| `ApplicationName` | `string?` | `AbpAuditingOptions.ApplicationName`. |
+| `UserId`, `UserName` | `Guid?`, `string?` | `ICurrentUser`. |
+| `TenantId`, `TenantName` | `Guid?`, `string?` | `ICurrentTenant`. |
+| `ImpersonatorUserId`, `ImpersonatorTenantId`, … | impersonation pair | `ICurrentUser.FindImpersonator*()`. |
+| `ExecutionTime`, `ExecutionDuration` | `DateTime`, `int` (ms) | `IClock.Now` at scope open; stopwatch on save. |
+| `ClientId`, `ClientIpAddress`, `ClientName`, `BrowserInfo` | string | filled by ASP.NET Core contributors. |
+| `CorrelationId` | string | `ICorrelationIdProvider.Get()`. |
+| `HttpMethod`, `HttpStatusCode`, `Url` | string/int | filled by ASP.NET Core contributors. |
+| `Actions` | `List<AuditLogActionInfo>` | One per intercepted method call inside the scope. |
+| `EntityChanges` | `List<EntityChangeInfo>` | One per inserted/updated/deleted entity. |
+| `Exceptions` | `List<Exception>` | Anything thrown inside the scope. |
+| `Comments` | `List<string>` | Arbitrary annotations from contributors / user code. |
+| `ExtraProperties` | `ExtraPropertyDictionary` | Per-row extension data. |
+
+## Auditing flow
+
+1. Request arrives at an MVC action / app service method.
+2. DI resolves the application service. Because it implements `IAuditingEnabled` (via `ApplicationService`), the registrar has already inserted `AuditingInterceptor` for it.
+3. `AuditingInterceptor.InterceptAsync` resolves `IAuditingHelper`, `AbpAuditingOptions`, `IAuditingManager`, `ICurrentUser`, `IUnitOfWorkManager` from a *new* `IServiceScope` (so the auditing graph is independent of the caller's scope).
+4. If `IAuditingManager.Current` is `null`, a new scope is opened (`AuditingManager.BeginScope` → `AuditLogInfo` is built from `ICurrentUser`, `ICurrentTenant`, `ICurrentClient`, `IClock`, `ICorrelationIdProvider`). Otherwise the call appends to the existing scope.
+5. The actual method runs (`invocation.ProceedAsync()`). Exceptions go into `auditLog.Exceptions`.
+6. The interceptor stops the stopwatch, copies the duration into the new `AuditLogActionInfo`, and adds it to `auditLog.Actions`.
+7. If this was the outermost scope, the interceptor flushes the active `IUnitOfWork` (`SaveChangesAsync`) — this causes EF Core / MongoDB to materialize `EntityChangeInfo` rows through `AbpDbContext` change tracking.
+8. `ShouldWriteAuditLogAsync` is consulted: anonymous-user and `Get*` rules apply, `AlwaysLogSelectors` and `AlwaysLogOnException` short-circuit.
+9. `IAuditLogSaveHandle.SaveAsync()` → `AuditingManager.SaveAsync` → `BeforeSave` (post-contributors, merge entity rows) → `IAuditingStore.SaveAsync(auditLog)`.
+
+To suppress auditing for a section of code, resolve `IAuditingHelper` and wrap the work in `using (helper.DisableAuditing())`.
+
+## `IAuditingStore` implementations
+
+- `SimpleLogAuditingStore` — default; logs to `ILogger<SimpleLogAuditingStore>`.
+- `AuditLogStore` (in `Volo.Abp.AuditLogging.Domain`) — maps `AuditLogInfo` → `AuditLog`, `EntityChangeInfo` → `EntityChange`, `EntityPropertyChangeInfo` → `EntityPropertyChange`, persists through `IAuditLogRepository`. Documented in `/modules/audit-logging`.
+
+## Related
+
+- `/modules/audit-logging` — DB-backed `IAuditingStore` and the `AuditLog`/`EntityChange` aggregates.
+- `/ddd/entities-and-aggregates` — `AuditedAggregateRoot`, `FullAuditedAggregateRoot`, `CreationAuditedEntity` base classes that already implement the marker interfaces.
+- `/data/entity-framework-core` — how `AbpDbContext.ApplyAbpConceptsForAddedEntity` calls `IAuditPropertySetter` and emits `EntityChangeInfo`.
+- `/aspnetcore/mvc-integration` — `AbpAuditActionFilter` opens the outermost `IAuditingManager` scope per HTTP request and fills the HTTP fields on `AuditLogInfo`.

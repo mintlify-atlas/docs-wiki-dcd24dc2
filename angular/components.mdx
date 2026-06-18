@@ -1,0 +1,240 @@
+---
+title: "Shared Components: @abp/ng.components UI Primitives"
+sidebarTitle: "Components"
+description: "The shared UI primitives umbrella: extensible tables and forms, page wrappers, lookups, charts, dynamic forms, and the tree component."
+---
+
+`@abp/ng.components` is the umbrella for the UI primitives every feature module reuses — most importantly the **Extensible** subsystem that powers every list and CRUD form in `@abp/ng.identity`, `@abp/ng.tenant-management`, `@abp/ng.cms-kit`, and the application's own pages. The package is organised as seven secondary entry points, one per primitive family. Sources: [`npm/ng-packs/packages/components/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/components).
+
+## Secondary entry points
+
+| Entry point | Source folder | Purpose |
+| --- | --- | --- |
+| `@abp/ng.components` | `src/` (umbrella) | Re-exports `public-api.ts` from every sub-entry |
+| `@abp/ng.components/extensible` | `extensible/src/lib/` | `ExtensibleTableComponent`, `ExtensibleFormComponent`, props/actions model |
+| `@abp/ng.components/page` | `page/src/` | `PageComponent` + breadcrumb / title / toolbar slots |
+| `@abp/ng.components/lookup` | `lookup/src/lib/` | `LookupSearchComponent` (typeahead picker) |
+| `@abp/ng.components/tree` | `tree/src/lib/` | `TreeComponent` (drag-and-drop hierarchical tree) |
+| `@abp/ng.components/dynamic-form` | `dynamic-form/src/` | `DynamicFormComponent` + nested form-array / form-group / form-field |
+| `@abp/ng.components/chart.js` | `chart.js/src/` | `ChartComponent` wrapping Chart.js |
+
+Runtime dependencies declared in `package.json`: `chart.js`, `ng-zorro-antd` (used by the tree), `@ctrl/tinycolor`. Peer dependencies: `@abp/ng.core`, `@abp/ng.theme.shared`.
+
+## The extensible subsystem
+
+`@abp/ng.components/extensible` is the most consumed entry point. The core components live in `extensible/src/lib/components/`:
+
+| Component | Selector | Role |
+| --- | --- | --- |
+| `ExtensibleTableComponent` | `abp-extensible-table` | Renders a paged `ngx-datatable` from `EntityProp` + `EntityAction` lists; row-level `actionsTemplate` slot |
+| `ExtensibleTableRowDetailComponent` | `abp-extensible-table-row-detail` | Expandable row detail driven by row-detail contributors |
+| `ExtensibleFormComponent` | `abp-extensible-form` | Builds a reactive form from `FormProp` lists; bidirectional binding via `[record]` / `(recordChange)` |
+| `ExtensibleFormPropComponent` | `abp-extensible-form-prop` | Renders a single field with the correct primitive |
+| `ExtensibleDateTimePickerComponent` | `abp-extensible-date-time-picker` | `ngb-datepicker` + `ngb-timepicker` composite |
+| `ExtensibleFormMultiselectComponent` | `abp-extensible-form-multiselect` | Multi-select dropdown for `ePropType.Enum` collections |
+| `GridActionsComponent` | `abp-grid-actions` | Dropdown of row actions filtered by `requiredPolicy` + `visible()` |
+| `PageToolbarComponent` | `abp-page-toolbar` | Toolbar action renderer (Create button etc.) |
+
+### Models that power the props/actions system
+
+`extensible/src/lib/models/`:
+
+| File | Symbol(s) | Used as |
+| --- | --- | --- |
+| `props.ts` | `Prop`, `PropList`, `ePropType` | Base class for all props |
+| `entity-props.ts` | `EntityProp` | Table columns |
+| `form-props.ts` | `FormProp` | Form fields (input, textarea, select, checkbox, datetime, multi-select) |
+| `entity-actions.ts` | `EntityAction` | Row-level action items |
+| `toolbar-actions.ts` | `ToolbarAction` | Page-toolbar buttons |
+| `actions.ts` | `Action<T>` contract — `action(data)`, `visible?(data)`, `permission?` | Shared action shape |
+| `row-detail.ts` | `RowDetail` contributors | Expandable detail panels |
+| `object-extensions.ts` | `ObjectExtensions` | Bridge to backend `ObjectExtensionManager` |
+
+A `Prop` carries `name`, `displayName`, `valueResolver?`, `visible?`, `permission?`, `sortable?`, and (`FormProp` adds) `validators?`, `options?`, `readonly?`, `disabled?`, `defaultValue?`. Lists are typed as `PropList<EntityProp>` / `PropList<FormProp>` and expose `addAfter`, `addBefore`, `addHead`, `addTail`, `dropByValue`.
+
+### Extensibility flow
+
+1. Backend ships `ObjectExtensionManager` registrations (see [`/ddd/object-extending`](/ddd/object-extending)).
+2. `ConfigStateService` includes the `objectExtensions` map in `ApplicationConfigurationDto`.
+3. `ExtensionsService.applyExtensions(componentKey, defaults, contributors)` merges:
+   - Module **defaults** (`packages/<module>/src/lib/defaults/*.ts`)
+   - Application **contributors** (passed to `provideIdentity(...)`, `provideTenantManagement(...)`, etc.)
+   - Backend **object extensions** from config state
+4. The result is exposed on `route.snapshot.data['extensions']` via a per-module resolver.
+5. `ExtensibleTableComponent` / `ExtensibleFormComponent` read the resolved `PropList` from `EXTENSIONS_IDENTIFIER` (`tokens/extensions.token.ts`) and render rows / fields without per-module template code.
+
+```typescript
+// extensible/src/lib/services/extensions.service.ts (simplified)
+@Injectable({ providedIn: 'root' })
+export class ExtensionsService {
+  entityActions  = new Map<string, EntityActionList<any>>();
+  toolbarActions = new Map<string, ToolbarActionList<any>>();
+  entityProps    = new Map<string, EntityPropList<any>>();
+  createFormProps = new Map<string, FormPropList<any>>();
+  editFormProps   = new Map<string, FormPropList<any>>();
+}
+```
+
+## Page component
+
+`@abp/ng.components/page` ships a layout primitive consumed by virtually every routed page.
+
+| Component | Selector | Role |
+| --- | --- | --- |
+| `PageComponent` | `abp-page` | Skeleton: breadcrumb slot + title slot + toolbar slot + content |
+| `PageTitleContainerComponent` | structural slot | Where `[abpPageTitle]` content projects |
+| `PageBreadcrumbContainerComponent` | structural slot | Where `[abpPageBreadcrumb]` content projects |
+| `PageToolbarContainerComponent` | structural slot | Where `[abpPageToolbar]` content projects |
+| `PagePartDirective` | `[abpPagePart]` (or named directives) | Content-projection markers |
+
+Used by `SettingManagementComponent`, the CMS Kit pages, and every Identity/Tenant Management table.
+
+```html
+<abp-page [title]="'AbpIdentity::Users' | abpLocalization">
+  <ng-container *abpPagePart="'toolbar'">
+    <button type="button" (click)="add()">{{ 'AbpUi::NewItem' | abpLocalization }}</button>
+  </ng-container>
+  <!-- body -->
+</abp-page>
+```
+
+## Lookup
+
+`@abp/ng.components/lookup` provides `LookupSearchComponent` (`abp-lookup-search`) — a typeahead picker that hits any `GET /lookup` endpoint. Used by the User Lookup row picker in Identity and by Tag selection in CMS Kit.
+
+| Input | Meaning |
+| --- | --- |
+| `getFn` | `(filter: string) => Observable<{ items: T[]; totalCount: number }>` |
+| `placeholder` | i18n key |
+| `formControl` / `formControlName` | Standard form integration |
+| `displayWith` | Render function for picked items |
+
+## Tree
+
+`@abp/ng.components/tree` wraps `ng-zorro-antd`'s tree to integrate with ABP icon + drag/drop conventions. Components live in `tree/src/lib/components/`:
+
+| Component | Role |
+| --- | --- |
+| `TreeComponent` | Hierarchical view with selection and drag handles |
+| `templates/` | Default `nzTreeTemplate` ref implementations |
+
+The `DISABLE_TREE_STYLE_LOADING` token (`tree/src/lib/disable-tree-style-loading.token.ts`) opts out of the runtime CSS injection — useful when the app already loads the antd styles itself.
+
+## Dynamic form
+
+`@abp/ng.components/dynamic-form` is an older but still-maintained reactive-form schema renderer. It accepts a `DynamicForm` model:
+
+```typescript
+// dynamic-form/src/dynamic-form.models.ts
+export interface DynamicFormField {
+  fieldType: 'input' | 'select' | 'checkbox' | 'group' | 'array';
+  name: string;
+  label?: string;
+  validators?: ValidatorFn[];
+  options?: { value: any; label: string }[];
+  children?: DynamicFormField[];
+}
+```
+
+Sub-components handle nested groups and arrays:
+
+| Folder | Role |
+| --- | --- |
+| `dynamic-form-field/` | Renders a single primitive |
+| `dynamic-form-group/` | Renders a nested `FormGroup` |
+| `dynamic-form-array/` | Renders a `FormArray` with add/remove |
+
+See `dynamic-form/NESTED-FORMS.md` for the documented usage.
+
+## Chart
+
+`@abp/ng.components/chart.js` wraps Chart.js v3:
+
+```typescript
+// chart.js/src/chart.component.ts (excerpt)
+@Component({ selector: 'abp-chart', /* … */ })
+export class ChartComponent {
+  @Input() type: ChartType;     // 'line' | 'bar' | 'pie' | …
+  @Input() data: ChartData;
+  @Input() options?: ChartOptions;
+}
+```
+
+`widget-utils.ts` exports helpers for the ABP `widgets` module to render dashboard charts driven by `IWidgetDefinition`.
+
+## Wiring an extensible page end-to-end
+
+```mermaid
+graph TD
+  defaults[Module defaults\npackages/<m>/src/lib/defaults]
+  contrib[Application contributors\nprovide<Module>({...})]
+  ext[ObjectExtensions from\nConfigStateService]
+  service[ExtensionsService]
+  resolver[*ExtensionsResolver]
+  routeData["route.data['extensions']"]
+  table[ExtensibleTableComponent]
+  form[ExtensibleFormComponent]
+
+  defaults --> service
+  contrib --> service
+  ext --> service
+  service --> resolver
+  resolver --> routeData
+  routeData --> table
+  routeData --> form
+```
+
+A consumer that wants a custom column declares the contributor in `provideIdentity({ entityPropContributors })`, the resolver merges it with the defaults and the backend object extensions, and `ExtensibleTableComponent` renders the merged `PropList<EntityProp>` without any per-page template change.
+
+## Worked example — adding a calculated column
+
+```typescript
+import { of } from 'rxjs';
+import { EntityProp, EntityPropContributors, ePropType } from '@abp/ng.components/extensible';
+import { eIdentityComponents } from '@abp/ng.identity';
+import { IdentityUserDto } from '@abp/ng.identity/proxy';
+
+export const entityPropContributors: EntityPropContributors = {
+  [eIdentityComponents.Users]: [
+    propList => propList.addAfter(
+      new EntityProp<IdentityUserDto>({
+        type: ePropType.String,
+        name: 'lastLoginRelative',
+        displayName: 'MyApp::LastLogin',
+        sortable: false,
+        valueResolver: ({ record }) =>
+          of(record.lastLoginTime ? relativeTime(record.lastLoginTime) : '—'),
+      }),
+      'email',
+      (a, b) => a.name === b,
+    ),
+  ],
+};
+```
+
+Hand it to `provideIdentity({ entityPropContributors })` and the new column appears between `email` and the next default column.
+
+## Token reference
+
+| Token | Source | Meaning |
+| --- | --- | --- |
+| `EXTENSIONS_IDENTIFIER` | `extensible/src/lib/tokens/extensions.token.ts` | Route-data key under which resolved props are stored |
+| `EXTENSIBLE_FORM_VIEW_PROVIDER` | `extensible/src/lib/tokens/extensible-form-view-provider.token.ts` | `viewProviders` override for nested forms |
+| `DISABLE_TREE_STYLE_LOADING` | `tree/src/lib/disable-tree-style-loading.token.ts` | Opt out of antd CSS injection |
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Where the props come from" href="/ddd/object-extending">
+    `ObjectExtensionManager` is the backend source of extra props.
+  </Card>
+  <Card title="Identity uses every primitive" href="/angular/identity">
+    `UsersComponent` is the canonical consumer of the extensible table + form.
+  </Card>
+  <Card title="CMS Kit pages" href="/angular/cms-kit">
+    Each list page uses `PageComponent` + `ExtensibleTableComponent`.
+  </Card>
+  <Card title="Theme shared modal/toast" href="/angular/theme-basic-shared">
+    `ExtensibleFormComponent` is normally rendered inside `<abp-modal>`.
+  </Card>
+</CardGroup>

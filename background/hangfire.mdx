@@ -1,0 +1,384 @@
+---
+title: "Hangfire integration for ABP background jobs and workers"
+sidebarTitle: "Hangfire"
+description: "AbpHangfireModule, HangfireBackgroundJobManager, HangfireBackgroundWorkerManager, the dashboard, recurring-job adapters and AbpHangfireOptions queue prefixing."
+---
+
+ABP integrates Hangfire through three packages: `Volo.Abp.HangFire` (the base scheduler module), `Volo.Abp.BackgroundJobs.HangFire` (replaces `IBackgroundJobManager` with `HangfireBackgroundJobManager`) and `Volo.Abp.BackgroundWorkers.Hangfire` (replaces `IBackgroundWorkerManager` with `HangfireBackgroundWorkerManager` and lets ABP `IBackgroundWorker` implementations be hosted as Hangfire **recurring jobs**). Once composed, fire-and-forget jobs land in a Hangfire queue and periodic workers turn into recurring jobs on the Hangfire scheduler, all visible from the dashboard.
+
+The three modules live under `framework/src/Volo.Abp.HangFire/`, `framework/src/Volo.Abp.BackgroundJobs.HangFire/` and `framework/src/Volo.Abp.BackgroundWorkers.Hangfire/`. They depend on Hangfire's `Hangfire`, `Hangfire.AspNetCore` and your chosen storage package (e.g. `Hangfire.SqlServer`, `Hangfire.Redis.StackExchange`).
+
+## Topology
+
+```mermaid
+sequenceDiagram
+    participant App as Application code
+    participant Mgr as HangfireBackgroundJobManager
+    participant HF as Hangfire (BackgroundJob)
+    participant Storage as JobStorage (SQL/Redis)
+    participant Srv as AbpHangfireBackgroundJobServer
+    participant Adapter as HangfireJobExecutionAdapter&lt;TArgs&gt;
+    participant Exec as IBackgroundJobExecuter
+    participant Job as IAsyncBackgroundJob&lt;TArgs&gt;
+
+    App->>Mgr: EnqueueAsync(args, priority, delay)
+    Mgr->>HF: BackgroundJob.Enqueue&lt;Adapter&gt;(a => a.ExecuteAsync(queue, args, default))
+    HF->>Storage: persist job
+    Note over Srv: BackgroundJobServer pulls from Storage queues
+    Srv->>Adapter: invoke ExecuteAsync (resolved via JobActivator)
+    Adapter->>Exec: ExecuteAsync(JobExecutionContext)
+    Exec->>Job: ExecuteAsync(args)
+```
+
+## `AbpHangfireModule`
+
+`framework/src/Volo.Abp.HangFire/Volo/Abp/Hangfire/AbpHangfireModule.cs` is the scheduler-level integration. Its `ConfigureServices`:
+
+```csharp
+var preActions = context.Services.GetPreConfigureActions<IGlobalConfiguration>();
+context.Services.AddHangfire(configuration =>
+{
+    preActions.Configure(configuration);
+});
+
+context.Services.AddSingleton(serviceProvider =>
+{
+    var options = serviceProvider.GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+    return new AbpHangfireBackgroundJobServer(options.BackgroundJobServerFactory.Invoke(serviceProvider));
+});
+
+context.Services.TryAddEnumerable(
+    ServiceDescriptor.Singleton<IPostConfigureOptions<AbpHangfireOptions>, AbpHangfireOptionsConfiguration>());
+```
+
+Two things to know:
+
+1. **Pre-configure actions are the way to configure Hangfire itself.** Anything you would pass to `services.AddHangfire(config => ...)` (storage, serializer, filters) is added via `PreConfigure<IGlobalConfiguration>` in your module:
+
+    ```csharp
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IGlobalConfiguration>(c => c.UseSqlServerStorage(_connStr));
+    }
+    ```
+
+2. **`AbpHangfireBackgroundJobServer` is a thin holder** for the actual `BackgroundJobServer`, registered as a singleton so the lifecycle is managed by ABP. `OnApplicationInitialization` resolves it; `OnApplicationShutdown` calls `HangfireJobServer.SendStop()` followed by `Dispose()` for a graceful shutdown.
+
+### `AbpHangfireOptions`
+
+`framework/src/Volo.Abp.HangFire/Volo/Abp/Hangfire/AbpHangfireOptions.cs` exposes the configurable surface:
+
+| Property | Default | Purpose |
+|---|---|---|
+| `DefaultQueuePrefix` | `""` | Prefix applied to all queue names (post-configured into the form `prefix_`). |
+| `MaxQueueNameLength` | `50` | Hangfire's queue name limit; the post-configurer throws if a prefixed queue exceeds this. |
+| `DefaultQueue` | `EnqueuedState.DefaultQueue` (`"default"`) | Queue used by `HangfireBackgroundJobManager` when the job type has no `[Queue]`. |
+| `ServerOptions` | `null` → built from `BackgroundJobServerOptions` defaults | Server configuration (worker count, queues). |
+| `AdditionalProcesses` | `null` → resolved as `IEnumerable<IBackgroundProcess>` | Custom Hangfire background processes. |
+| `Storage` | `null` → resolved as `JobStorage` from DI | The Hangfire storage; usually configured by the pre-configure action. |
+| `BackgroundJobServerFactory` | `CreateJobServer` | Lets you swap in a stub `null` server (used internally when job execution is disabled). |
+
+`AbpHangfireOptionsConfiguration` (post-configurer) normalises `DefaultQueuePrefix`:
+
+```csharp
+var queuesPrefix = Regex.Replace(options.DefaultQueuePrefix.ToLower().Replace(".", "_"), "[^a-z0-9_-]", "");
+options.DefaultQueuePrefix = queuesPrefix.EnsureEndsWith('_');
+```
+
+Hangfire queue names must be lowercase letters, digits, underscores and dashes only. The post-configurer rewrites `MyApp.Tenant1` → `myapp_tenant1_` and then prepends it to every queue declared in `ServerOptions.Queues`. If no `ServerOptions` is supplied, it builds one with a single queue `{prefix}{EnqueuedState.DefaultQueue}`.
+
+<Warning>
+  If `ServerOptions` is preset by you and `DefaultQueuePrefix` is set, the post-configurer **mutates** the existing `Queues` array in place. Pass a fresh `BackgroundJobServerOptions` per app or copy the array if you reuse it.
+</Warning>
+
+## Background jobs over Hangfire
+
+### `HangfireBackgroundJobManager`
+
+`framework/src/Volo.Abp.BackgroundJobs.HangFire/Volo/Abp/BackgroundJobs/Hangfire/HangfireBackgroundJobManager.cs`:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class HangfireBackgroundJobManager : IBackgroundJobManager, ITransientDependency
+{
+    public virtual Task<string> EnqueueAsync<TArgs>(TArgs args,
+        BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+        TimeSpan? delay = null)
+    {
+        return Task.FromResult(delay.HasValue
+            ? BackgroundJob.Schedule<HangfireJobExecutionAdapter<TArgs>>(
+                a => a.ExecuteAsync(GetQueueName(typeof(TArgs)), args, default),
+                delay.Value)
+            : BackgroundJob.Enqueue<HangfireJobExecutionAdapter<TArgs>>(
+                a => a.ExecuteAsync(GetQueueName(typeof(TArgs)), args, default)));
+    }
+
+    protected virtual string GetQueueName(Type argsType)
+    {
+        var queueAttribute = BackgroundJobOptions.Value.GetJob(argsType).JobType
+            .GetCustomAttribute<QueueAttribute>();
+        return queueAttribute != null
+            ? HangfireOptions.Value.DefaultQueuePrefix + queueAttribute.Queue
+            : HangfireOptions.Value.DefaultQueue;
+    }
+}
+```
+
+Notes:
+
+- **`BackgroundJobPriority` is dropped.** Hangfire has no native priority. If you need it, define multiple queues and a worker count proportional to priority.
+- **Queue assignment uses Hangfire's `[Queue]` attribute on the job class** (not the args class). Decorate your `IAsyncBackgroundJob<TArgs>` implementation with `[Queue("high")]` to route it. The prefix from `AbpHangfireOptions` is applied automatically.
+- The Hangfire job-id returned is forwarded as the manager's `string` identifier.
+
+### `HangfireJobExecutionAdapter<TArgs>`
+
+`HangfireJobExecutionAdapter.cs` is the bridge between Hangfire's `IBackgroundJobPerformer` and ABP's `IBackgroundJobExecuter`:
+
+```csharp
+[Queue("{0}")]   // bound to the first method argument
+public async Task ExecuteAsync(string queue, TArgs args, CancellationToken cancellationToken = default)
+{
+    if (!Options.IsJobExecutionEnabled)
+        throw new AbpException("Background job execution is disabled. ...");
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var jobType = Options.GetJob(typeof(TArgs)).JobType;
+        var context = new JobExecutionContext(scope.ServiceProvider, jobType, args!,
+                                              cancellationToken: cancellationToken);
+        await JobExecuter.ExecuteAsync(context);
+    }
+}
+```
+
+The `[Queue("{0}")]` attribute is Hangfire's way of binding the **runtime queue** to the value of the first method parameter. Combined with `HangfireBackgroundJobManager.GetQueueName`, this is what propagates per-job-type queues all the way to the storage layer. The remainder is identical to the default flow: a per-execution DI scope, a `JobExecutionContext`, and a delegate call into `IBackgroundJobExecuter` which handles `ICurrentTenant`, `ICancellationTokenProvider` and exception wrapping.
+
+### Module behaviour when execution is disabled
+
+`AbpBackgroundJobsHangfireModule.OnPreApplicationInitialization` checks the global kill switch:
+
+```csharp
+var options = sp.GetRequiredService<IOptions<AbpBackgroundJobOptions>>().Value;
+if (!options.IsJobExecutionEnabled)
+{
+    sp.GetRequiredService<JobStorage>();   // force resolution to validate config
+    var hangfireOptions = sp.GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+    hangfireOptions.BackgroundJobServerFactory = _ => null;
+}
+```
+
+Setting the factory to `_ => null` means `AbpHangfireBackgroundJobServer.HangfireJobServer` is `null` — the host can still **enqueue** jobs (the storage and `BackgroundJob.Enqueue` machinery remain wired) but no server runs in-process. This is the canonical pattern for splitting producer apps and worker apps.
+
+## Background workers over Hangfire
+
+`AbpBackgroundWorkersHangfireModule.ConfigureServices` registers an open generic singleton:
+
+```csharp
+context.Services.AddSingleton(typeof(HangfirePeriodicBackgroundWorkerAdapter<>));
+```
+
+and `OnPreApplicationInitialization` calls `HangfireBackgroundWorkerManager.Initialize()` to grab the singleton `AbpHangfireBackgroundJobServer`.
+
+### `HangfireBackgroundWorkerManager`
+
+`framework/src/Volo.Abp.BackgroundWorkers.Hangfire/Volo/Abp/BackgroundWorkers/Hangfire/HangfireBackgroundWorkerManager.cs` is marked `[Dependency(ReplaceServices = true)]` and `[ExposeServices(typeof(IBackgroundWorkerManager), typeof(HangfireBackgroundWorkerManager))]`. Its `AddAsync` switches on worker kind:
+
+<Tabs>
+  <Tab title="IHangfireBackgroundWorker">
+    A worker that implements `IHangfireBackgroundWorker` (typically inheriting `HangfireBackgroundWorkerBase`) supplies its own `RecurringJobId`, `CronExpression`, `TimeZone` and `Queue`. The manager registers it directly with `RecurringJob.AddOrUpdate`:
+
+    ```csharp
+    RecurringJob.AddOrUpdate(
+        hangfireBackgroundWorker.RecurringJobId,
+        queueName,
+        () => ((IHangfireBackgroundWorker)unProxyWorker).DoWorkAsync(cancellationToken),
+        hangfireBackgroundWorker.CronExpression,
+        new RecurringJobOptions { TimeZone = hangfireBackgroundWorker.TimeZone });
+    ```
+
+    If the storage backend does not support per-job queues (`!JobStorage.Current.HasFeature(JobStorageFeatures.JobQueueProperty)`), it falls back to a non-queue overload and logs an error suggesting `[Queue]`.
+  </Tab>
+  <Tab title="Periodic worker base">
+    For `AsyncPeriodicBackgroundWorkerBase`/`PeriodicBackgroundWorkerBase`, the manager resolves `HangfirePeriodicBackgroundWorkerAdapter<TWorker>` (the open generic singleton above), uses its `RecurringJobId` and `Queue` settings, and schedules:
+
+    ```csharp
+    Expression<Func<Task>> methodCall = () => workerAdapter.DoWorkAsync(cancellationToken);
+    var recurringJobId = !workerAdapter.RecurringJobId.IsNullOrWhiteSpace()
+        ? workerAdapter.RecurringJobId
+        : GetRecurringJobId(worker, methodCall);
+
+    RecurringJob.AddOrUpdate(recurringJobId, queueName, methodCall,
+                             cronExpression ?? GetCron(period!.Value),
+                             new RecurringJobOptions { TimeZone = workerAdapter.TimeZone });
+    ```
+
+    `GetCron(period)` translates an ABP `Timer.Period` (ms) into a 5- or 6-field cron expression: every-N-seconds uses 6 fields (`*/{n} * * * * *`), every-N-minutes uses 5 fields, and so on. If `Period` exceeds 31 days, the conversion throws — for very-long periods you must use `HangfireBackgroundWorkerBase` and write the cron explicitly.
+
+    If a worker has neither `Period` nor `CronExpression`, the manager logs an error and skips it.
+  </Tab>
+  <Tab title="Anything else">
+    Falls through to `base.AddAsync(worker, cancellationToken)` — i.e. the worker starts in-process as if Hangfire was not loaded. This is the escape hatch for `BackgroundJobWorker`, which still polls the database in-process; the Hangfire managers only redirect periodic workers, not the polling worker for `IBackgroundJobStore`.
+  </Tab>
+</Tabs>
+
+### `HangfirePeriodicBackgroundWorkerAdapter<TWorker>`
+
+`HangfirePeriodicBackgroundWorkerAdapter.cs`:
+
+```csharp
+public HangfirePeriodicBackgroundWorkerAdapter(
+    IOptions<AbpHangfirePeriodicBackgroundWorkerAdapterOptions> options)
+{
+    TimeZone = options.Value.TimeZone;
+    Queue = options.Value.Queue;
+    RecurringJobId = BackgroundWorkerNameAttribute.GetNameOrNull<TWorker>();
+
+    _doWorkAsyncMethod = typeof(TWorker).GetMethod("DoWorkAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+    _doWorkMethod      = typeof(TWorker).GetMethod("DoWork",      BindingFlags.Instance | BindingFlags.NonPublic)!;
+}
+
+public override async Task DoWorkAsync(CancellationToken cancellationToken = default)
+{
+    var workerContext = new PeriodicBackgroundWorkerContext(ServiceProvider, cancellationToken);
+    var worker = ServiceProvider.GetRequiredService<TWorker>();
+    switch (worker)
+    {
+        case AsyncPeriodicBackgroundWorkerBase async:
+            await (Task)(_doWorkAsyncMethod.Invoke(async, [workerContext])!); break;
+        case PeriodicBackgroundWorkerBase sync:
+            _doWorkMethod.Invoke(sync, [workerContext]); break;
+    }
+}
+```
+
+The adapter calls the **protected** `DoWorkAsync(PeriodicBackgroundWorkerContext)` / `DoWork(PeriodicBackgroundWorkerContext)` method via reflection. From the worker class's perspective the call looks exactly like one fired by `AbpAsyncTimer` — same context, same scoped resolution — so the same worker can be hosted by either runtime without modification.
+
+`AbpHangfirePeriodicBackgroundWorkerAdapterOptions` sets `TimeZone = TimeZoneInfo.Utc` and a default empty `Queue`. Override per app via `Configure<AbpHangfirePeriodicBackgroundWorkerAdapterOptions>(o => o.TimeZone = TimeZoneInfo.Local)`.
+
+### `HangfireBackgroundWorkerBase`
+
+For workers that want full control:
+
+```csharp
+public class WeeklyReportWorker : HangfireBackgroundWorkerBase
+{
+    public WeeklyReportWorker()
+    {
+        RecurringJobId = "weekly-report";
+        CronExpression = "0 8 * * MON";   // Mondays at 08:00
+        Queue = "reports";
+        TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Europe/Istanbul");
+    }
+
+    public override async Task DoWorkAsync(CancellationToken cancellationToken = default)
+    {
+        // Hangfire creates a scope for this call via JobActivator
+        // Resolve scoped services through ServiceProvider (BackgroundWorkerBase)
+    }
+}
+```
+
+Then register through `context.AddBackgroundWorkerAsync<WeeklyReportWorker>()` — `HangfireBackgroundWorkerManager` recognises it via `IHangfireBackgroundWorker` and schedules it directly.
+
+## The dashboard
+
+`framework/src/Volo.Abp.BackgroundJobs.HangFire/Microsoft/AspNetCore/Builder/AbpHangfireApplicationBuilderExtensions.cs`:
+
+```csharp
+public static IApplicationBuilder UseAbpHangfireDashboard(
+    this IApplicationBuilder app,
+    string pathMatch = "/hangfire",
+    Action<DashboardOptions>? configure = null,
+    JobStorage? storage = null)
+{
+    var options = app.ApplicationServices.GetRequiredService<AbpDashboardOptionsProvider>().Get();
+    configure?.Invoke(options);
+    return app.UseHangfireDashboard(pathMatch, options, storage);
+}
+```
+
+`AbpDashboardOptionsProvider.Get()` returns a `DashboardOptions` whose `DisplayNameFunc` cleans up the auto-generated names: when the job has the adapter's three-argument signature (`queue, args, CancellationToken`), it returns the ABP `JobName` from `AbpBackgroundJobOptions.GetJob(args.GetType()).JobName` instead of the raw method name — so jobs appear in the dashboard under their `[BackgroundJobName]` or args-type-FullName.
+
+### Authorization
+
+`framework/src/Volo.Abp.HangFire/Volo/Abp/Hangfire/AbpHangfireAuthorizationFilter.cs` wraps Hangfire's `IDashboardAsyncAuthorizationFilter` into ABP's `IAuthorizationService` + permission system:
+
+```csharp
+public AbpHangfireAuthorizationFilter(
+    bool enableTenant = false,
+    string? requiredPermissionName = null,
+    params string[]? requiredRoleNames)
+```
+
+Usage:
+
+```csharp
+app.UseAbpHangfireDashboard("/hangfire", options =>
+{
+    options.Authorization = new[]
+    {
+        new AbpHangfireAuthorizationFilter(
+            requiredPermissionName: AbpHangfirePermissions.Default)
+    };
+});
+```
+
+The filter requires an authenticated user, and (when `enableTenant = false`) explicitly **rejects tenant-scoped requests** — protecting the dashboard from being shown to non-host users in a multi-tenant deployment.
+
+## Putting it together
+
+<Steps>
+  <Step title="Compose the modules">
+    ```csharp
+    [DependsOn(
+        typeof(AbpBackgroundJobsHangfireModule),
+        typeof(AbpBackgroundWorkersHangfireModule))]
+    public class MyAppHostModule : AbpModule { ... }
+    ```
+  </Step>
+  <Step title="Pre-configure Hangfire storage">
+    ```csharp
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IGlobalConfiguration>(c => c
+            .UseSqlServerStorage(_config.GetConnectionString("Hangfire")));
+    }
+    ```
+  </Step>
+  <Step title="Define queues (optional)">
+    ```csharp
+    Configure<AbpHangfireOptions>(o =>
+    {
+        o.DefaultQueuePrefix = "myapp"; // becomes "myapp_"
+        o.ServerOptions = new BackgroundJobServerOptions
+        {
+            Queues = new[] { "default", "reports", "high" },
+            WorkerCount = Environment.ProcessorCount * 2
+        };
+    });
+    ```
+  </Step>
+  <Step title="Register jobs and workers">
+    Background jobs are registered with `AbpBackgroundJobOptions.AddJob<TJob>()` (same as in-process). Periodic workers are added via `context.AddBackgroundWorkerAsync<TWorker>()`.
+  </Step>
+  <Step title="Mount the dashboard">
+    ```csharp
+    app.UseRouting();
+    app.UseAbpHangfireDashboard("/hangfire", o =>
+        o.Authorization = new[] { new AbpHangfireAuthorizationFilter(
+            requiredPermissionName: "MyApp.HangfireDashboard") });
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  You can run the **background jobs module** (with `BackgroundJobStore`) **and** the Hangfire integration at once: jobs registered against `IBackgroundJobManager` go through Hangfire, while the older `BackgroundJobInfo` rows are not polled because no `BackgroundJobWorker` runs (it is replaced). This is fine for greenfield apps; for migrations, drain the existing `BackgroundJobs` table before switching.
+</Tip>
+
+## Related reading
+
+- [Background jobs](/background/background-jobs) — the abstractions you reuse.
+- [Background workers](/background/background-workers) — periodic bases hosted by `HangfirePeriodicBackgroundWorkerAdapter`.
+- [Quartz](/background/quartz) — comparable scheduler integration.
+- [TickerQ](/background/tickerq) — DB-only scheduler alternative.
+- [Background-jobs application module](/modules/background-jobs-module) — when used together, you typically disable its polling worker via `AbpBackgroundJobOptions.IsJobExecutionEnabled = false` on the producer.

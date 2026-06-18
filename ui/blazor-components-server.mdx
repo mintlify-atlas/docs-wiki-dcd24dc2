@@ -1,0 +1,197 @@
+---
+title: "Blazor Server hosting model"
+sidebarTitle: "Blazor Server"
+description: "AbpAspNetCoreComponentsServerModule: AddServerSideBlazor wiring, MapBlazorHub fallback, BlazorServerComponentBundleManager (re-uses MVC BundleManager), Blazor Web App vs classic Server split, and the server-side theming bundle layout."
+---
+
+This page documents the **Blazor Server** adapter — `Volo.Abp.AspNetCore.Components.Server` plus its theming sister `Volo.Abp.AspNetCore.Components.Server.Theming`. Before reading this, see [`/ui/blazor-components-web`](/ui/blazor-components-web) for the host-agnostic primitives that this stack composes on top of.
+
+## Module composition
+
+`framework/src/Volo.Abp.AspNetCore.Components.Server/Volo/Abp/AspNetCore/Components/Server/AbpAspNetCoreComponentsServerModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpHttpClientModule),
+    typeof(AbpAspNetCoreComponentsWebModule),
+    typeof(AbpAspNetCoreSignalRModule),
+    typeof(AbpEventBusModule),
+    typeof(AbpAspNetCoreMvcContractsModule))]
+public class AbpAspNetCoreComponentsServerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient(nameof(BlazorServerLookupApiRequestService))
+            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+            {
+                AutomaticDecompression = DecompressionMethods.All
+            });
+
+        var serverSideBlazorBuilder = context.Services.AddServerSideBlazor(options =>
+        {
+            if (context.Services.GetHostingEnvironment().IsDevelopment())
+                options.DetailedErrors = true;
+        });
+        context.Services.ExecutePreConfiguredActions(serverSideBlazorBuilder);
+
+        Configure<AbpAspNetCoreUnitOfWorkOptions>(o => o.IgnoredUrls.AddIfNotContains("/_blazor"));
+        Configure<AbpAspNetCoreAuditingOptions>(o   => o.IgnoredUrls.AddIfNotContains("/_blazor"));
+
+        if (!context.Services.ExecutePreConfiguredActions<AbpAspNetCoreComponentsWebOptions>().IsBlazorWebApp)
+        {
+            var preConfigureActions = context.Services.GetPreConfigureActions<HttpConnectionDispatcherOptions>();
+            Configure<AbpEndpointRouterOptions>(options =>
+            {
+                options.EndpointConfigureActions.Add(endpointContext =>
+                {
+                    endpointContext.Endpoints.MapBlazorHub(opts => preConfigureActions.Configure(opts));
+                    endpointContext.Endpoints.MapFallbackToPage("/_Host");
+                });
+            });
+        }
+    }
+}
+```
+
+Highlights:
+
+1. **Pre-configurable `AddServerSideBlazor`** — `ExecutePreConfiguredActions(serverSideBlazorBuilder)` runs any `PreConfigure<IServerSideBlazorBuilder>` actions a host application registers before module loading (e.g. `serverSideBlazorBuilder.AddCircuitOptions(...)`). Use that hook to set `MaximumReceiveMessageSize` etc.
+2. **Detailed errors only in Development.**
+3. **Unit-of-work and auditing skip `/_blazor`** — SignalR negotiation/long-poll traffic must not enrol in UoW or be audited.
+4. **`/_blazor` hub + fallback to `/_Host`** registered automatically — but only for the **classic** Blazor Server flow. If the host is a **Blazor Web App** (`AbpAspNetCoreComponentsWebOptions.IsBlazorWebApp == true`, set during the Blazor Web App host startup), the module skips this block and lets the new `AddRazorComponents().AddInteractiveServerRenderMode()` pipeline own hub registration. That gate is the single most important behaviour an agent must respect when wiring a new Blazor Server app.
+5. **`HttpConnectionDispatcherOptions`** is itself pre-configurable — host code can call `PreConfigure<HttpConnectionDispatcherOptions>(o => o.ApplicationMaxBufferSize = ...)` before `MapBlazorHub` is invoked.
+6. **`BlazorServerLookupApiRequestService`** is a typed `HttpClient` for the WASM/server-shared lookup-API DTO support (see `Components.Server/Extensibility/`).
+
+## Theming module
+
+`framework/src/Volo.Abp.AspNetCore.Components.Server.Theming/AbpAspNetCoreComponentsServerThemingModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsServerModule),
+    typeof(AbpAspNetCoreMvcUiPackagesModule),
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpAspNetCoreMvcUiBundlingModule))]
+public class AbpAspNetCoreComponentsServerThemingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.StyleBundles
+                .Add(BlazorStandardBundles.Styles.Global, b => b.AddContributors(typeof(BlazorGlobalStyleContributor)));
+
+            options.ScriptBundles
+                .Add(BlazorStandardBundles.Scripts.Global, b => b.AddContributors(typeof(BlazorGlobalScriptContributor)));
+        });
+    }
+}
+```
+
+Three things to note:
+
+- The Server stack **shares the MVC bundling pipeline** (`AbpAspNetCoreMvcUiBundlingModule`), because the host process is a real ASP.NET Core web host with a `wwwroot`. There's no separate "pre-render the bundle into a static file at app startup" step (which is the WASM and MauiBlazor pattern).
+- `BlazorStandardBundles.Styles.Global` / `BlazorStandardBundles.Scripts.Global` are both `"Blazor.Global"`:
+
+  ```csharp
+  public class BlazorStandardBundles
+  {
+      public static class Styles  { public static string Global = "Blazor.Global"; }
+      public static class Scripts { public static string Global = "Blazor.Global"; }
+  }
+  ```
+
+  The theme's `_Host.cshtml` (or `App.razor` head outlet for Blazor Web App) emits `<abp-style-bundle name="Blazor.Global" />` and `<abp-script-bundle name="Blazor.Global" />` to inject the merged framework + theme assets.
+- `BlazorGlobalStyleContributor` / `BlazorGlobalScriptContributor` add the per-package contributors (Bootstrap, Blazorise, theme stylesheets …) into the global bundle.
+
+`AbpAspNetCoreComponentsWebThemingModule` (depended upon) is what brings in `AbpAuthenticationState`, `DynamicLayoutComponent`, `IThemeManager`, `IComponentBundleManager` etc. (See [`/ui/blazor-components-web`](/ui/blazor-components-web).)
+
+## Bundle manager — the Server implementation
+
+`Server.Theming/Bundling/BlazorServerComponentBundleManager.cs`:
+
+```csharp
+public class BlazorServerComponentBundleManager : IComponentBundleManager, ITransientDependency
+{
+    protected IBundleManager BundleManager { get; }
+
+    public BlazorServerComponentBundleManager(IBundleManager bundleManager) => BundleManager = bundleManager;
+
+    public virtual async Task<IReadOnlyList<string>> GetStyleBundleFilesAsync(string bundleName)
+        => (await BundleManager.GetStyleBundleFilesAsync(bundleName)).Select(f => f.FileName).ToList();
+
+    public virtual async Task<IReadOnlyList<string>> GetScriptBundleFilesAsync(string bundleName)
+        => (await BundleManager.GetScriptBundleFilesAsync(bundleName)).Select(f => f.FileName).ToList();
+}
+```
+
+It's a thin adapter on the *real* MVC `IBundleManager`. So `Blazor.Global` resolution honours the same `BundlingMode` (`Auto`/`Bundle`/`BundleAndMinify`/`None`) you set on the MVC bundling options. In production you typically get one minified `Blazor.Global.css` + one `Blazor.Global.js` served by the `CachedBundleDynamicFileProvider`. See [`/aspnetcore/mvc-ui-bundling`](/aspnetcore/mvc-ui-bundling).
+
+## Hosting flavours
+
+| Flavour | Host setup | Module behaviour |
+| --- | --- | --- |
+| **Classic Blazor Server** (`AddServerSideBlazor` + `MapBlazorHub` + `MapFallbackToPage("/_Host")`) | Default. `AbpAspNetCoreComponentsWebOptions.IsBlazorWebApp = false`. | Module maps `/_blazor` and `/_Host` itself. |
+| **Blazor Web App with InteractiveServer render mode** | Host calls `services.AddRazorComponents().AddInteractiveServerRenderMode()` and explicitly `app.MapRazorComponents<App>()`. Sets `IsBlazorWebApp = true` via `PreConfigure<AbpAspNetCoreComponentsWebOptions>(...)`. | Module skips its own `MapBlazorHub`/`MapFallbackToPage` so the host's `MapRazorComponents<App>()` owns routing. |
+
+To preconfigure: in your host startup module's `PreConfigureServices`:
+
+```csharp
+PreConfigure<AbpAspNetCoreComponentsWebOptions>(o => o.IsBlazorWebApp = true);
+```
+
+## Configuration-cache reset on server
+
+`Server/Configuration/BlazorServerCurrentApplicationConfigurationCacheResetService.cs` implements `ICurrentApplicationConfigurationCacheResetService` for Blazor Server. It invalidates the shared `AbpApplicationConfigurationDto` cache when permissions or settings change so the next `GetAuthenticationStateAsync()` / menu render reflects the change.
+
+## Server-side authentication state
+
+There is no special ABP `AuthenticationStateProvider` for Server — Blazor Server uses the cookie-based `ServerAuthenticationStateProvider` that ships with ASP.NET Core. ABP only contributes:
+
+- `AbpAuthenticationState` (from `Components.Web`) for cross-tab `localStorage` sync — registered in every layout by `AbpDynamicLayoutComponentOptions`.
+- The `/Microsoft.AspNetCore.Authentication.Cookies/CookieAuthenticationOptionsExtensions` helper in the same package, which provides cookie-options sugar used by ABP-templated server hosts.
+
+## `HttpContext`-bound services
+
+Because every circuit is server-side, normal ABP `HttpContext`-bound services (current user from cookie, `ICurrentTenant` from `__tenant` cookie or domain, distributed cache) work out of the box. The conventional registrar from `Components` does **not** swap any of them out — that's a WASM-specific concern.
+
+## Putting it together — typical Server host
+
+```csharp
+public class MyBlazorServerHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext ctx)
+    {
+        // ... data, auth, app modules ...
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext ctx)
+    {
+        var app = ctx.GetApplicationBuilder();
+        app.UseAbpRequestLocalization();
+        app.UseStaticFiles();
+        app.UseRouting();
+        app.UseAuthentication();
+        app.UseAuthorization();
+
+        // BlazorHub + fallback are registered by AbpAspNetCoreComponentsServerModule
+        app.UseConfiguredEndpoints();
+    }
+}
+
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsServerThemingModule),
+    // ... theme module (Basic / LeptonX) ...
+    // ... your application modules ...
+)]
+public class MyBlazorServerHostModule : AbpModule { /* ... */ }
+```
+
+## Related pages
+
+- [`/ui/blazor-components-web`](/ui/blazor-components-web) — `AbpComponentBase`, `IUiMessageService`, theming, `IComponentBundleManager`.
+- [`/ui/blazor-components-webassembly`](/ui/blazor-components-webassembly) — alternate hosting model, contrasted.
+- [`/ui/blazorise-ui`](/ui/blazorise-ui) — the component library wrappers consumed by the theme.
+- [`/aspnetcore/mvc-ui-bundling`](/aspnetcore/mvc-ui-bundling) — the bundling pipeline this stack delegates to.
+- [`/aspnetcore/mvc-ui-themes`](/aspnetcore/mvc-ui-themes) — MVC-side theme contract (separate from the Blazor one).
+- [`/modules/basic-theme`](/modules/basic-theme) — a theme module that supports Server + WASM + MauiBlazor.

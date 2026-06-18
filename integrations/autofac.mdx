@@ -1,0 +1,393 @@
+---
+title: "Autofac integration: property injection and dynamic proxy"
+sidebarTitle: "Autofac"
+description: "AbpAutofacServiceProviderFactory, AbpAutofacModule, UseAutofac() extensions, AbpPropertySelector, and why ABP makes Autofac the recommended container."
+---
+
+ABP runs on the standard `Microsoft.Extensions.DependencyInjection` abstractions, so any compliant container works. In practice ABP **recommends Autofac** and several feature modules silently degrade without it. This page explains why, and walks every file in `Volo.Abp.Autofac` plus the Blazor WebAssembly hook.
+
+## Why Autofac
+
+Two Autofac-only capabilities matter to ABP:
+
+1. **Property injection** — ABP modules expose framework dependencies as public, settable properties (`public ILogger<T> Logger { get; set; } = NullLogger<T>.Instance;`). The default MS DI container does not do property injection at all. Without it, those properties keep their null-pattern defaults.
+2. **Interception via dynamic proxy** — ABP's cross-cutting concerns (auditing, authorization, validation, UoW, features, global features) all run through `IAbpInterceptor`-derived interceptors. To wrap arbitrary services with those interceptors, ABP needs a container with first-class proxy support. `Autofac.Extras.DynamicProxy` provides exactly that.
+
+Both are wired by **convention** in `AbpRegistrationBuilderExtensions.ConfigureAbpConventions`, called for every service descriptor as Autofac populates from the `IServiceCollection`. Hosts that don't call `UseAutofac()` get a working app, but with neither property injection nor interceptors.
+
+## Files in Volo.Abp.Autofac
+
+```
+framework/src/Volo.Abp.Autofac/
+├── Volo/Abp/
+│   ├── AbpAutofacAbpApplicationCreationOptionsExtensions.cs  — UseAutofac()
+│   └── Autofac/
+│       ├── AbpAutofacModule.cs                  — depends on AbpCastleCoreModule
+│       ├── AbpAutofacServiceProviderFactory.cs  — IServiceProviderFactory<ContainerBuilder>
+│       ├── AbpPropertySelector.cs               — honours [DisablePropertyInjection]
+│       └── AutoFacInjectPropertiesService.cs    — IInjectPropertiesService implementation
+├── Microsoft/Extensions/
+│   ├── DependencyInjection/
+│   │   └── AbpAutofacServiceCollectionExtensions.cs  — GetContainerBuilder, BuildAutofacServiceProvider
+│   └── Hosting/
+│       └── AbpAutofacHostBuilderExtensions.cs   — UseAutofac() on IHostBuilder
+└── Autofac/Builder/
+    └── AbpRegistrationBuilderExtensions.cs      — ConfigureAbpConventions
+```
+
+## `AbpAutofacModule`
+
+```csharp
+[DependsOn(typeof(AbpCastleCoreModule))]
+public class AbpAutofacModule : AbpModule { }
+```
+
+The module is otherwise empty — it exists to register the dependency on [`integrations/castle-core`](/integrations/castle-core), which supplies `AbpAsyncDeterminationInterceptor<TInterceptor>` and the adapter types Autofac uses to wrap ABP interceptors.
+
+## Entry points
+
+### `UseAutofac` on `AbpApplicationCreationOptions`
+
+```csharp
+public static void UseAutofac(this AbpApplicationCreationOptions options)
+{
+    options.Services.AddAutofacServiceProviderFactory();
+}
+
+public static AbpAutofacServiceProviderFactory AddAutofacServiceProviderFactory(
+    this IServiceCollection services)
+{
+    return services.AddAutofacServiceProviderFactory(new ContainerBuilder());
+}
+
+public static AbpAutofacServiceProviderFactory AddAutofacServiceProviderFactory(
+    this IServiceCollection services, ContainerBuilder containerBuilder)
+{
+    var factory = new AbpAutofacServiceProviderFactory(containerBuilder);
+    services.AddObjectAccessor(containerBuilder);
+    services.AddSingleton((IServiceProviderFactory<ContainerBuilder>)factory);
+    return factory;
+}
+```
+
+This is the canonical call from `Program.cs`:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+await builder.Services.AddApplicationAsync<MyAppModule>(options =>
+{
+    options.UseAutofac();
+});
+```
+
+After it runs:
+
+- An `AbpAutofacServiceProviderFactory` is registered as `IServiceProviderFactory<ContainerBuilder>`.
+- The `ContainerBuilder` instance itself is exposed via `AddObjectAccessor`, so modules can grab it through `IServiceCollection.GetObjectOrNull<ContainerBuilder>()` and register Autofac-native types (e.g. modules, decorators) directly.
+
+### `UseAutofac` on `IHostBuilder`
+
+```csharp
+public static IHostBuilder UseAutofac(this IHostBuilder hostBuilder)
+{
+    var containerBuilder = new ContainerBuilder();
+    return hostBuilder.ConfigureServices((_, services) =>
+        {
+            services.AddObjectAccessor(containerBuilder);
+        })
+        .UseServiceProviderFactory(new AbpAutofacServiceProviderFactory(containerBuilder));
+}
+```
+
+Same effect, but plugged directly into the generic host. Use this in console hosts or worker services where you build an `IHostBuilder` directly without going through `AbpApplicationCreationOptions`.
+
+### Service-collection helpers
+
+```csharp
+public static ContainerBuilder GetContainerBuilder(this IServiceCollection services)
+{
+    var builder = services.GetObjectOrNull<ContainerBuilder>();
+    if (builder == null)
+        throw new AbpException($"Could not find ContainerBuilder. Be sure that you have called " +
+            $"{nameof(AbpAutofacAbpApplicationCreationOptionsExtensions.UseAutofac)} method before!");
+    return builder;
+}
+
+public static IServiceProvider BuildAutofacServiceProvider(
+    this IServiceCollection services, Action<ContainerBuilder>? builderAction = null)
+{
+    return services.BuildServiceProviderFromFactory(builderAction);
+}
+```
+
+`GetContainerBuilder` is what modules call when they need to run Autofac-specific registrations during `ConfigureServices`:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.GetContainerBuilder()
+        .RegisterModule<MyAutofacModule>();
+}
+```
+
+If `UseAutofac()` wasn't called, you get a loud exception instead of a silent failure.
+
+`BuildAutofacServiceProvider` is mostly used in test hosts: it calls through to `BuildServiceProviderFromFactory`, which uses whatever `IServiceProviderFactory<ContainerBuilder>` is registered (i.e. `AbpAutofacServiceProviderFactory`).
+
+## `AbpAutofacServiceProviderFactory`
+
+```csharp
+public class AbpAutofacServiceProviderFactory : IServiceProviderFactory<ContainerBuilder>
+{
+    private readonly ContainerBuilder _builder;
+    private IServiceCollection _services = default!;
+
+    public ContainerBuilder CreateBuilder(IServiceCollection services)
+    {
+        _services = services;
+        _builder.Populate(services);    // ← key call
+        return _builder;
+    }
+
+    public IServiceProvider CreateServiceProvider(ContainerBuilder containerBuilder)
+    {
+        return new AutofacServiceProvider(containerBuilder.Build());
+    }
+}
+```
+
+The `Populate(services)` call is `AutofacRegistration.Populate` (from `Autofac.Extensions.DependencyInjection`, vendored at `Autofac/Extensions/DependencyInjection/AutofacRegistration.cs` in this package). That's where every `ServiceDescriptor` is converted into a `RegistrationBuilder`, and where `ConfigureAbpConventions` is applied per descriptor.
+
+## `ConfigureAbpConventions` — the conventional wiring
+
+`AbpRegistrationBuilderExtensions.ConfigureAbpConventions` is the most important file in the package. It is called for every reflection-activated registration during `Populate`, and does three things:
+
+```csharp
+public static IRegistrationBuilder<TLimit, TActivatorData, TRegistrationStyle> ConfigureAbpConventions<...>(
+    this IRegistrationBuilder<...> registrationBuilder,
+    ServiceDescriptor serviceDescriptor,
+    IModuleContainer moduleContainer,
+    ServiceRegistrationActionList registrationActionList,
+    ServiceActivatedActionList activatedActionList)
+{
+    registrationBuilder = registrationBuilder.InvokeActivatedActions(activatedActionList, serviceDescriptor);
+
+    var serviceType = registrationBuilder.RegistrationData.Services.OfType<IServiceWithType>().FirstOrDefault()?.ServiceType;
+    if (serviceType == null) return registrationBuilder;
+
+    var implementationType = registrationBuilder.ActivatorData.ImplementationType;
+    if (implementationType == null) return registrationBuilder;
+
+    registrationBuilder = registrationBuilder.EnablePropertyInjection(moduleContainer, implementationType);
+    registrationBuilder = registrationBuilder.InvokeRegistrationActions(
+        registrationActionList, serviceType, implementationType, serviceDescriptor.ServiceKey);
+
+    return registrationBuilder;
+}
+```
+
+### 1. Property injection
+
+```csharp
+private static IRegistrationBuilder<...> EnablePropertyInjection<...>(
+    this IRegistrationBuilder<...> registrationBuilder,
+    IModuleContainer moduleContainer,
+    Type implementationType)
+{
+    // Enable Property Injection only for types in an assembly containing an AbpModule
+    // and without a DisablePropertyInjection attribute on class or properties.
+    if (moduleContainer.Modules.Any(m => m.AllAssemblies.Contains(implementationType.Assembly))
+        && implementationType.GetCustomAttributes(typeof(DisablePropertyInjectionAttribute), true).IsNullOrEmpty())
+    {
+        registrationBuilder = registrationBuilder.PropertiesAutowired(new AbpPropertySelector(false));
+    }
+    return registrationBuilder;
+}
+```
+
+Property injection is **scoped to ABP-module assemblies**. Third-party libraries pulled in transitively don't get their properties auto-wired. `[DisablePropertyInjection]` on a class is honoured at the class level; the same attribute on individual properties is honoured by `AbpPropertySelector`:
+
+```csharp
+public class AbpPropertySelector : DefaultPropertySelector
+{
+    public override bool InjectProperty(PropertyInfo propertyInfo, object instance)
+    {
+        return propertyInfo.GetCustomAttributes(typeof(DisablePropertyInjectionAttribute), true).IsNullOrEmpty()
+            && base.InjectProperty(propertyInfo, instance);
+    }
+}
+```
+
+This is what makes ABP's "logger as a property" idiom work without explicit setter calls:
+
+```csharp
+public class MyService : ITransientDependency
+{
+    public ILogger<MyService> Logger { get; set; } = NullLogger<MyService>.Instance;
+}
+```
+
+### 2. Interceptor attachment
+
+```csharp
+private static IRegistrationBuilder<...> InvokeRegistrationActions<...>(...)
+{
+    var serviceRegistredArgs = new OnServiceRegistredContext(serviceType, implementationType, serviceKey);
+
+    foreach (var registrationAction in registrationActionList)
+    {
+        registrationAction.Invoke(serviceRegistredArgs);
+    }
+
+    if (serviceRegistredArgs.Interceptors.Any())
+    {
+        var disableAbpFeaturesAttribute = serviceRegistredArgs.ImplementationType
+            .GetCustomAttribute<DisableAbpFeaturesAttribute>(true);
+        if (disableAbpFeaturesAttribute == null || !disableAbpFeaturesAttribute.DisableInterceptors)
+        {
+            registrationBuilder = registrationBuilder.AddInterceptors(
+                registrationActionList, serviceType, serviceRegistredArgs.Interceptors);
+        }
+    }
+
+    return registrationBuilder;
+}
+
+private static IRegistrationBuilder<...> AddInterceptors<...>(
+    this IRegistrationBuilder<...> registrationBuilder,
+    ServiceRegistrationActionList serviceRegistrationActionList,
+    Type serviceType,
+    IEnumerable<Type> interceptors)
+{
+    if (serviceType.IsInterface)
+    {
+        registrationBuilder = registrationBuilder.EnableInterfaceInterceptors();
+    }
+    else
+    {
+        if (serviceRegistrationActionList.IsClassInterceptorsDisabled ||
+            serviceRegistrationActionList.DisabledClassInterceptorsSelectors.Any(s => s.Predicate(serviceType)))
+        {
+            return registrationBuilder;
+        }
+        (registrationBuilder as IRegistrationBuilder<TLimit, ConcreteReflectionActivatorData, TRegistrationStyle>)?
+            .EnableClassInterceptors();
+    }
+
+    foreach (var interceptor in interceptors)
+    {
+        registrationBuilder.InterceptedBy(
+            typeof(AbpAsyncDeterminationInterceptor<>).MakeGenericType(interceptor));
+    }
+
+    return registrationBuilder;
+}
+```
+
+Every callback in `ServiceRegistrationActionList` (populated by ABP modules during `PreConfigureServices`) gets the chance to add interceptors via `OnServiceRegistredContext.Interceptors.Add(typeof(MyInterceptor))`. If any were added:
+
+- For interface services, `EnableInterfaceInterceptors()` is used — interception via a transparent proxy of the interface.
+- For class services, `EnableClassInterceptors()` is used — interception via virtual-method subclassing. This is skipped if `ServiceRegistrationActionList.IsClassInterceptorsDisabled` is true (set by some Blazor and SignalR modules to avoid proxy-incompatible types) or if a specific predicate disables it for this service type.
+
+Each interceptor type `TInterceptor` is wrapped in `AbpAsyncDeterminationInterceptor<TInterceptor>` — the Castle adapter from [`integrations/castle-core`](/integrations/castle-core) that turns ABP's single-method `IAbpInterceptor` contract into Castle's sync/async-distinguishing interceptor model.
+
+`[DisableAbpFeatures(DisableInterceptors = true)]` on the implementation type opts out of interceptor wrapping entirely.
+
+### 3. Activation callbacks
+
+```csharp
+private static IRegistrationBuilder<...> InvokeActivatedActions<...>(
+    this IRegistrationBuilder<...> registrationBuilder,
+    ServiceActivatedActionList activatedActionList,
+    ServiceDescriptor serviceDescriptor)
+{
+    var actions = activatedActionList.GetActions(serviceDescriptor);
+    if (actions.Any())
+    {
+        registrationBuilder.OnActivated(context =>
+        {
+            var serviceActivatedContext = new OnServiceActivatedContext(context.Instance!);
+            foreach (var action in actions)
+                action.Invoke(serviceActivatedContext);
+        });
+    }
+    return registrationBuilder;
+}
+```
+
+`ServiceActivatedActionList` (also driven by modules during pre-config) lets you run code each time a service instance is activated. This is how some modules attach initialisation hooks to specific service types.
+
+## `AutoFacInjectPropertiesService`
+
+```csharp
+public class AutoFacInjectPropertiesService : IInjectPropertiesService, ITransientDependency
+{
+    public TService InjectProperties<TService>(TService instance)
+        => InjectProperties(instance, false);
+
+    public TService InjectUnsetProperties<TService>(TService instance)
+        => InjectProperties(instance, true);
+
+    protected TService InjectProperties<TService>(TService instance, bool onlyForUnsetProperties)
+    {
+        if (ServiceProvider is not AutofacServiceProvider)
+            throw new AbpException(
+                $"The {nameof(ServiceProvider)} must be an instance of {nameof(AutofacServiceProvider)}!");
+
+        return onlyForUnsetProperties
+            ? ServiceProvider.As<AutofacServiceProvider>().LifetimeScope.InjectUnsetProperties(instance)
+            : ServiceProvider.As<AutofacServiceProvider>().LifetimeScope.InjectProperties(instance);
+    }
+}
+```
+
+`IInjectPropertiesService` is defined in `Volo.Abp.Core` as an abstraction with a no-op default (`NullInjectPropertiesService`). This is the real implementation: when Autofac is in play, you can inject properties on *manually constructed* instances (e.g. instances created by factories that bypass DI). Throws if the active service provider isn't `AutofacServiceProvider`.
+
+## Volo.Abp.Autofac.WebAssembly
+
+```csharp
+[DependsOn(typeof(AbpAutofacModule), typeof(AbpAspNetCoreComponentsWebAssemblyModule))]
+public class AbpAutofacWebAssemblyModule : AbpModule { }
+
+public static class AbpWebAssemblyApplicationCreationOptionsAutofacExtensions
+{
+    public static void UseAutofac(
+        this AbpWebAssemblyApplicationCreationOptions options,
+        Action<ContainerBuilder>? configure = null)
+    {
+        options.HostBuilder.Services.AddAutofacServiceProviderFactory();
+        options.HostBuilder.ConfigureContainer(
+            options.HostBuilder.Services.GetSingletonInstance<IServiceProviderFactory<ContainerBuilder>>(),
+            configure);
+    }
+}
+```
+
+Blazor WebAssembly's `WebAssemblyHostBuilder` needs its own `ConfigureContainer` call, and that's all this package supplies — the factory itself comes straight from `Volo.Abp.Autofac`. Use it from a Blazor WASM `Program.cs`:
+
+```csharp
+await builder.AddApplicationAsync<MyClientModule>(options =>
+{
+    options.UseAutofac();
+});
+```
+
+## What you actually get back
+
+After `UseAutofac()`:
+
+| Capability | Status without Autofac | Status with Autofac |
+| --- | --- | --- |
+| `Public ILogger Logger { get; set; }` property injection | Property stays at default | Auto-set per resolution |
+| `[Audited]`, `[Authorize]`, `[UnitOfWork]` etc. on app services | Attribute parsed but no interception | Wrapped via `AbpAsyncDeterminationInterceptor<T>` |
+| `IInjectPropertiesService` | No-op | Real Autofac-backed implementation |
+| `OnServiceRegistredContext.Interceptors.Add(...)` from modules | Ignored | Honoured |
+| `OnServiceActivated` callbacks | Ignored | Honoured |
+
+ABP application services depend on the second row for **all** of auditing, authorization, validation, unit-of-work, and feature checks. That's why ABP's templates always emit `options.UseAutofac()`.
+
+## Related
+
+- [`integrations/castle-core`](/integrations/castle-core) — the Castle.DynamicProxy interceptor adapter (`AbpAsyncDeterminationInterceptor<T>`) referenced from `AddInterceptors`.
+- [`core/dynamic-proxy-and-aspects`](/core/dynamic-proxy-and-aspects) — the `IAbpInterceptor` contract and the shipped interceptors that Autofac wraps services with.
+- [`core/dependency-injection`](/core/dependency-injection) — how ABP populates `ServiceRegistrationActionList` and `ServiceActivatedActionList`.

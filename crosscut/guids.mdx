@@ -1,0 +1,152 @@
+---
+title: "GUID generation (Volo.Abp.Guids)"
+description: "IGuidGenerator with SimpleGuidGenerator and SequentialGuidGenerator; SequentialGuidType variants for SQL Server / Oracle / MySQL / PostgreSQL ordering."
+---
+
+`Volo.Abp.Guids` provides the `IGuidGenerator` abstraction every domain layer uses to mint primary keys. The default implementation, `SequentialGuidGenerator`, produces *sequentially-ordered* GUIDs so newly-inserted aggregate roots cluster together on disk — preventing the page-split storm you would otherwise get from `Guid.NewGuid()` on B-tree indexes. The flavour of "sequential" is configurable per database via `SequentialGuidType` and `AbpSequentialGuidGeneratorOptions`.
+
+Source: `framework/src/Volo.Abp.Guids/Volo/Abp/Guids/`.
+
+## Module
+
+`AbpGuidsModule` is empty — services come through `ITransientDependency`.
+
+## `IGuidGenerator`
+
+```csharp
+public interface IGuidGenerator
+{
+    Guid Create();
+}
+```
+
+That is the entire contract. Inject it into entities' construction code or any domain service that needs an id.
+
+## Implementations
+
+### `SimpleGuidGenerator`
+
+```csharp
+public class SimpleGuidGenerator : IGuidGenerator
+{
+    public static SimpleGuidGenerator Instance { get; } = new SimpleGuidGenerator();
+    public virtual Guid Create() => Guid.NewGuid();
+}
+```
+
+Just a wrapper over `Guid.NewGuid()`. Not registered as `ITransientDependency`, so it does not win over `SequentialGuidGenerator` in DI. The static `Instance` is handy for test factories and DDD entity constructors where DI isn't available:
+
+```csharp
+var book = new Book(SimpleGuidGenerator.Instance.Create(), name: "Hamlet");
+```
+
+### `SequentialGuidGenerator`
+
+`ITransientDependency` — so resolving `IGuidGenerator` from the container yields this generator unless you replace it. Adapted from [jhtodd/SequentialGuid](https://github.com/jhtodd/SequentialGuid). The algorithm:
+
+1. Pull 10 bytes of cryptographically strong randomness from a shared `RandomNumberGenerator.Create()`.
+2. Compute a 48-bit timestamp = `DateTime.UtcNow.Ticks / 10000L` (millisecond resolution, ~5900 years before overflow).
+3. Convert the timestamp's 8 bytes to network order on little-endian systems.
+4. Lay out 16 bytes according to `SequentialGuidType`:
+   - **`SequentialAsString`** — timestamp first (6 bytes), then random (10 bytes), with `Data1` and `Data2` byte-swapped to compensate for the way `.NET`'s `Guid.ToString()` reverses those fields on little-endian. Result: ids sort sequentially when stored as text. Use for MySQL and PostgreSQL.
+   - **`SequentialAsBinary`** — timestamp first, random next, no byte swaps. Result: sequential when stored as a raw byte array. Use for Oracle.
+   - **`SequentialAtEnd`** — random first (10 bytes), timestamp at the end (6 bytes). Matches SQL Server's `NEWSEQUENTIALID()` layout — Data4 carries the increasing portion. Use for SQL Server. **This is the default** (`AbpSequentialGuidGeneratorOptions.GetDefaultSequentialGuidType()` returns `SequentialAtEnd` when no value is configured).
+
+### `Create(SequentialGuidType)` overload
+
+Lets you pick a layout per call when you have a polyglot persistence (e.g. one aggregate stored in SQL Server, another in Oracle). Note that the interface contract `Create()` always uses `Options.GetDefaultSequentialGuidType()`.
+
+## `AbpSequentialGuidGeneratorOptions`
+
+```csharp
+public class AbpSequentialGuidGeneratorOptions
+{
+    public SequentialGuidType? DefaultSequentialGuidType { get; set; }
+    public SequentialGuidType GetDefaultSequentialGuidType() =>
+        DefaultSequentialGuidType ?? SequentialGuidType.SequentialAtEnd;
+}
+```
+
+Configure once per database provider, typically in the EF Core layer's module:
+
+```csharp
+// in a module that depends on Volo.Abp.EntityFrameworkCore.MySQL
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<AbpSequentialGuidGeneratorOptions>(options =>
+    {
+        options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsString;
+    });
+}
+```
+
+The EF Core provider modules (`Volo.Abp.EntityFrameworkCore.MySQL`, `Volo.Abp.EntityFrameworkCore.Oracle`, …) already do this for you in `PreConfigureServices`.
+
+## `SequentialGuidType`
+
+```csharp
+public enum SequentialGuidType
+{
+    SequentialAsString,   // MySQL, PostgreSQL
+    SequentialAsBinary,   // Oracle
+    SequentialAtEnd       // SQL Server (default)
+}
+```
+
+## File-by-file enumeration
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpGuidsModule.cs` | module | Empty. |
+| `IGuidGenerator.cs` | `IGuidGenerator` | Single-method contract. |
+| `SimpleGuidGenerator.cs` | `IGuidGenerator` | `Guid.NewGuid()` wrapper. Static `Instance`. Not auto-registered. |
+| `SequentialGuidGenerator.cs` | `IGuidGenerator, ITransientDependency` | The default. Uses a shared `RandomNumberGenerator` (`static readonly` — thread-safe). Holds `AbpSequentialGuidGeneratorOptions`. Exposes `Create()` and `Create(SequentialGuidType)`. |
+| `SequentialGuidType.cs` | enum | Layout selector. |
+| `AbpSequentialGuidGeneratorOptions.cs` | options | Holds `DefaultSequentialGuidType` (nullable). `GetDefaultSequentialGuidType()` returns the configured value or `SequentialAtEnd`. |
+
+## Using it in domain code
+
+Inject `IGuidGenerator` into your domain factory / domain service and pass the id through the aggregate's constructor:
+
+```csharp
+public class BookManager : DomainService
+{
+    private readonly IRepository<Book, Guid> _repo;
+    public BookManager(IRepository<Book, Guid> repo) => _repo = repo;
+
+    public async Task<Book> CreateAsync(string name, decimal price)
+    {
+        return await _repo.InsertAsync(new Book(GuidGenerator.Create(), name, price));
+    }
+}
+```
+
+`DomainService` exposes `GuidGenerator` (resolved via property injection of `IGuidGenerator`). Application services inherit the same property via `AbpServiceBase`.
+
+For entity constructors that don't take a generator dependency, accept a `Guid` parameter (typically named `id`) so the *caller* can produce it from `IGuidGenerator` — keeps the entity pure:
+
+```csharp
+public class Book : AggregateRoot<Guid>
+{
+    protected Book() { }
+    public Book(Guid id, string name) : base(id) { Name = name; }
+    public string Name { get; private set; }
+}
+```
+
+## Why not `Guid.NewGuid()`?
+
+Random GUIDs as clustered-index keys cause two problems:
+
+1. **Page splits.** Every insert lands on a random page, fragmenting the index.
+2. **Cache thrashing.** Hot pages don't stay in memory because each insert touches a new region.
+
+`SequentialAtEnd` (SQL Server's recommended layout) keeps the inserts at the tail of the index, identical to `NEWSEQUENTIALID()` semantics. The other layouts achieve the same effect for databases whose index order differs (MySQL/PostgreSQL store as text, Oracle as binary).
+
+The trade-off: a 48-bit millisecond timestamp is *predictable*. If you need unguessable ids for security-sensitive scenarios (e.g. shareable URLs), generate a separate slug or hash — don't rely on the GUID alone.
+
+## Related
+
+- `/ddd/entities-and-aggregates` — how aggregates take their id through the constructor.
+- `/data/entity-framework-core` — `Volo.Abp.EntityFrameworkCore.{MySQL,Oracle,PostgreSql,SqlServer}` modules each `PreConfigure<AbpSequentialGuidGeneratorOptions>` for their flavour.
+- `/data/mongodb` — Mongo aggregates also use `IGuidGenerator`; ordering doesn't matter for `_id`, so any layout is fine.

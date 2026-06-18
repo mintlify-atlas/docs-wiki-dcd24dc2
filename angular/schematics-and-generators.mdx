@@ -1,0 +1,235 @@
+---
+title: "Schematics and Nx Generators for ABP Angular"
+sidebarTitle: "Schematics"
+description: "@abp/ng.schematics and @abp/nx.generators: proxy generation, library creation, theme switching, SSR setup, AI config — and how they relate."
+---
+
+`@abp/ng.schematics` (Angular CLI / `ng generate` collection) and `@abp/nx.generators` (Nx generators) ship the code-generation tooling that produces the TypeScript proxies every `@abp/ng.*` consumer depends on, scaffolds new library entry points, switches themes, and bootstraps SSR. The Nx generators are mostly thin wrappers around the schematics so `nx generate` works inside Nx workspaces without losing the Angular schematic behaviours. Sources: [`npm/ng-packs/packages/schematics/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/schematics), [`npm/ng-packs/packages/generators/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/generators).
+
+## Packages at a glance
+
+| NPM name | Type | Source | `collection.json` / `generators.json` |
+| --- | --- | --- | --- |
+| `@abp/ng.schematics` | Angular CLI schematics | `packages/schematics/` | `src/collection.json` |
+| `@abp/nx.generators` | Nx generators | `packages/generators/` | `generators.json` |
+
+The schematics collection is built separately via `npm run build:schematics`, which runs `tsc` against `packages/schematics/tsconfig.json` and stages the output for publishing. The Nx generators are pure TypeScript that re-host the schematics through `@nx/devkit`'s `wrapAngularDevkitSchematic` helper:
+
+```typescript
+// packages/generators/src/generators/generate-proxy/generator.ts
+export default async function (host: Tree, schema: GenerateProxyGeneratorSchema) {
+  const runAngularLibrarySchematic = wrapAngularDevkitSchematic('@abp/ng.schematics', 'proxy-add');
+  await runAngularLibrarySchematic(host, { ...schema });
+  return () => { console.log(`proxy added '${schema.target}`); };
+}
+```
+
+## `@abp/ng.schematics` collection
+
+`packages/schematics/src/collection.json`:
+
+| Schematic | Factory | Purpose |
+| --- | --- | --- |
+| `proxy-add` | `./commands/proxy-add` | Hits `/api/abp/api-definition` and writes TypeScript proxy services + DTOs into the target project |
+| `proxy-index` | `./commands/proxy-index` | (Re-)generates the `index.ts` barrel inside a `proxy/` entry point |
+| `proxy-refresh` | `./commands/proxy-refresh` | Re-runs `proxy-add` using the parameters saved in `generate-proxy.json` |
+| `proxy-remove` | `./commands/proxy-remove` | Deletes the generated proxy folders for a given module |
+| `api` | `./commands/api` | Lower-level API surface generator: emits enums/models/services without the full ABP proxy scaffolding |
+| `create-lib` | `./commands/create-lib` | Creates a new ABP-style library inside the workspace (module or standalone template) |
+| `change-theme` | `./commands/change-theme` | Swaps Basic ↔ Lepton ↔ LeptonXLite ↔ LeptonX styling in an application project |
+| `ai-config` | `./commands/ai-config` | Generates AI tool configuration files (Claude, Cursor, Gemini, …) for the target project |
+| `ssr-add` | `./commands/ssr-add` | Adds Angular SSR to a project; sub-schematic `server` (hidden) creates the server entry |
+| `server` | `./commands/ssr-add/server` | (Hidden) Standalone Angular server-app generator used by `ssr-add` |
+
+### `proxy-add` — the workhorse
+
+Schema highlights from `packages/schematics/src/commands/proxy-add/schema.json`:
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `module` | Backend module name (`identity`, `tenant-management`, `app`, …) | `app` |
+| `apiName` | Remote-service name as declared by the backend (`AbpIdentity`, `AbpTenantManagement`, …) | `default` |
+| `source` | Source Angular project — `EnvironmentService.apis[apiName].url` is read from its `environment.ts` | workspace `defaultProject` |
+| `target` | Angular project the proxy files are written into | workspace `defaultProject` |
+| `url` | Override the `/api/abp/api-definition` URL | resolved from `source` |
+| `serviceType` | `application`, `integration`, or `all` | `application` |
+| `entryPoint` | Secondary entry-point name to write into (`proxy`, `proxy/admin`, etc.) | — |
+
+Generated layout under the target project:
+
+```
+src/app/proxy/
+├── generate-proxy.json             # records the call: module, apiName, source, target, url, serviceType
+├── <module>/                       # e.g. identity/
+│   ├── <service>.service.ts        # IdentityUserService, IdentityRoleService, …
+│   ├── models.ts                   # DTOs + enums
+│   └── index.ts                    # barrel
+└── index.ts                        # umbrella barrel
+```
+
+Each generated `*.service.ts` injects `RestService`, exposes `apiName`, and calls `restService.request(...)` — the exact convention documented in [`angular/core#restservice-and-the-api-contract`](/angular/core#restservice-and-the-api-contract).
+
+```bash
+# Direct ng CLI invocation
+ng generate @abp/ng.schematics:proxy-add \
+  --module identity \
+  --apiName AbpIdentity \
+  --source MyAngularApp \
+  --target MyAngularApp \
+  --url https://localhost:44305 \
+  --serviceType application \
+  --entryPoint proxy
+```
+
+The same call as an Nx generator:
+
+```bash
+nx generate @abp/nx.generators:generate-proxy \
+  identity AbpIdentity MyAngularApp MyAngularApp \
+  --url=https://localhost:44305 --serviceType=application
+```
+
+<Tip>
+After `proxy-add` writes the files it also adds a path alias to `tsconfig.base.json` (or `tsconfig.json` for non-Nx workspaces) so consumers can `import { IdentityUserService } from '@<workspace>/<target>/proxy'`.
+</Tip>
+
+### `proxy-refresh` and `proxy-remove`
+
+`proxy-refresh` reads `generate-proxy.json` and re-invokes `proxy-add` with the same parameters — used after a backend redeploy. `proxy-remove` deletes the generated module folder and updates the umbrella barrel; the schema mirrors `proxy-add`'s identification fields (`module`, `apiName`, `target`, `entryPoint`).
+
+### `proxy-index`
+
+Re-emits the `index.ts` barrel inside an entry point — used after manual file additions or as part of CI sanity checks. Inputs: `target`, `entryPoint`.
+
+### `api`
+
+A lower-level generator that splits its work into three sub-folders:
+
+| Sub-folder | Emits |
+| --- | --- |
+| `files-enum/` | `enums/` files derived from the backend type tree |
+| `files-model/` | `models.ts` (DTOs) — no service surface |
+| `files-service/` | `*.service.ts` — service surface without DTOs |
+
+It is used internally by `proxy-add` and exposed publicly for advanced use cases where teams want to keep models and services in separate libraries.
+
+### `create-lib`
+
+Scaffolds a new ABP library inside the workspace. Two template flavours:
+
+| `templateType` | Result |
+| --- | --- |
+| `module` | Classic `NgModule`-based library with `forRoot`, `forChild`, eager routing module |
+| `standalone` | Standalone-components library with `createRoutes(options)` / `provide<Name>(options)` factories |
+
+Options:
+
+| Option | Meaning |
+| --- | --- |
+| `packageName` | The npm name of the library (`@my/ng.feature`) |
+| `isSecondaryEntrypoint` | If `true`, creates a secondary entry point under an existing library |
+| `templateType` | `module` or `standalone` |
+
+The generated library mirrors the conventions documented in [`angular/overview#module-integration-model`](/angular/overview#module-integration-model).
+
+### `change-theme`
+
+```json
+"name": {
+  "enum": [1, 2, 3, 4],
+  "items": [
+    { "value": 1, "label": "Basic" },
+    { "value": 2, "label": "Lepton" },
+    { "value": 3, "label": "LeptonXLite" },
+    { "value": 4, "label": "LeptonX" }
+  ]
+}
+```
+
+The schematic edits `angular.json`'s style entries, swaps theme `npm` dependencies, and updates `app.config.ts` providers to call the right `provideTheme*Config()` function. `targetProject` must be an `application` project type (not a library). The Nx generator `@abp/nx.generators:change-theme` is the same logic exposed to Nx workspaces.
+
+### `ssr-add`
+
+```bash
+ng generate @abp/ng.schematics:ssr-add --project MyAngularApp
+```
+
+The schematic:
+
+1. Installs `@angular/ssr` dependencies (skippable with `--skipInstall`).
+2. Calls the hidden `server` sub-schematic to create the Express entry point.
+3. Wires `provideServerRendering()` and `provideClientHydration()` into the app config.
+4. Updates `package.json` scripts (`dev:ssr`, `serve:ssr`, `build:ssr`, `prerender`) and `angular.json` to add the `server` and `prerender` builders.
+
+### `ai-config`
+
+Generates configuration files for AI coding tools so they can index the ABP Angular workspace correctly. Inputs:
+
+| Option | Description |
+| --- | --- |
+| `tool` | Comma-separated list of tools — `claude`, `cursor`, `gemini`, … |
+| `targetProject` | Project to generate the AI config files into |
+| `overwrite` | Replace existing files |
+
+Output: per-tool files such as `.claude/`, `.cursor/`, `GEMINI.md` containing curated context about ABP conventions for the target project.
+
+## `@abp/nx.generators` collection
+
+`packages/generators/generators.json`:
+
+| Generator | Factory | Wraps schematic |
+| --- | --- | --- |
+| `generate-proxy` | `./src/generators/generate-proxy/generator` | `@abp/ng.schematics:proxy-add` |
+| `update-version` | `./src/generators/update-version/generator` | Bumps every `@abp/ng.*` / `@volo/ng.*` / `@volosoft/*` dependency in the workspace |
+| `change-theme` | `./src/generators/change-theme/generator` | `@abp/ng.schematics:change-theme` |
+
+### `update-version`
+
+```json
+"properties": {
+  "abpVersion":    { "type": "string", "x-prompt": "What ABP version would you like to use?" },
+  "leptonXVersion":{ "type": "string" }
+}
+```
+
+The implementation walks every `package.json` under the workspace, replaces matching `@abp/`, `@volo/`, and `@volosoft/` semver ranges with the new version, and optionally bumps the Lepton-X theme to a different version. Used in the ABP repo itself via `npm run update-version`.
+
+## Putting it together
+
+A typical lifecycle for an app team:
+
+```bash
+# 1. Spin up Angular app from the ABP CLI (separate doc — see /cli/project-creation)
+
+# 2. After backend changes, refresh all generated proxies
+nx generate @abp/nx.generators:generate-proxy identity AbpIdentity
+nx generate @abp/nx.generators:generate-proxy tenant-management AbpTenantManagement
+
+# 3. Switch to the LeptonX theme
+nx generate @abp/nx.generators:change-theme 4 MyAngularApp
+
+# 4. Enable SSR
+nx generate @abp/ng.schematics:ssr-add --project=MyAngularApp
+
+# 5. Bump every ABP package together
+nx generate @abp/nx.generators:update-version 10.2.0
+```
+
+The same set of commands is available via the Angular CLI by replacing `nx generate` with `ng generate` and pointing to the schematic id (`@abp/ng.schematics:proxy-add`, etc.).
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="C# client proxies" href="/aspnetcore/mvc-client-proxies">
+    `dotnet abp generate-proxy -t csharp` reads the same `/api/abp/api-definition` endpoint.
+  </Card>
+  <Card title="CLI overview" href="/cli/generate-proxy">
+    ABP CLI front-end for proxy generation.
+  </Card>
+  <Card title="Core RestService" href="/angular/core#restservice-and-the-api-contract">
+    Where the generated `*.service.ts` files dispatch their HTTP calls.
+  </Card>
+  <Card title="Theme switching" href="/angular/theme-basic-shared">
+    The themes targeted by `change-theme`.
+  </Card>
+</CardGroup>

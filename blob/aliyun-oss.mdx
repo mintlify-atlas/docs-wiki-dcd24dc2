@@ -1,0 +1,134 @@
+---
+title: "Aliyun OSS provider"
+sidebarTitle: "Aliyun OSS"
+description: "Volo.Abp.BlobStoring.Aliyun — AliyunBlobProvider, AliyunBlobProviderConfiguration, AssumeRole-based STS through IOssClientFactory with credentials cached in IDistributedCache, AliyunBlobNamingNormalizer."
+---
+
+The Aliyun provider package is `framework/src/Volo.Abp.BlobStoring.Aliyun/Volo/Abp/BlobStoring/Aliyun/`. It uses the **`Aliyun.OSS.SDK`** for the data plane and **`aliyun-net-sdk-sts`** for the optional Security Token Service path. Like the AWS provider, it depends on `AbpCachingModule` so STS sessions can be cached encrypted in `IDistributedCache<AliyunTemporaryCredentialsCacheItem>`.
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `AbpBlobStoringAliyunModule.cs` | `[DependsOn(AbpBlobStoringModule, AbpCachingModule)]`. |
+| `AliyunBlobContainerConfigurationExtensions.cs` | `UseAliyun(action)` and `GetAliyunConfiguration()`. |
+| `AliyunBlobProviderConfiguration.cs` | Typed view over the properties bag. |
+| `AliyunBlobProviderConfigurationNames.cs` | Bag keys (`Aliyun.AccessKeyId`, …). |
+| `AliyunBlobProvider.cs` | The `IBlobProvider`. |
+| `AliyunBlobNamingNormalizer.cs` | OSS bucket name rules (lowercase, dashes, no underscores, 3-63 chars). |
+| `IAliyunBlobNameCalculator.cs` + `DefaultAliyunBlobNameCalculator.cs` | `host/{blob}` vs. `tenants/{tenantId:D}/{blob}` object key. |
+| `IOssClientFactory.cs` + `DefaultOssClientFactory.cs` | Creates `IOss` clients either with the long-lived access pair, or with STS-issued temporary credentials cached via `IDistributedCache`. |
+| `AliyunTemporaryCredentialsCacheItem.cs` | `{ AccessKeyId, AccessKeySecret, SecurityToken, Expiration }` cache item (encrypted). |
+
+## Module
+
+```csharp
+[DependsOn(
+    typeof(AbpBlobStoringModule),
+    typeof(AbpCachingModule))]
+public class AbpBlobStoringAliyunModule : AbpModule { }
+```
+
+## `UseAliyun(...)`
+
+```csharp
+containerConfiguration.ProviderType = typeof(AliyunBlobProvider);
+containerConfiguration.NamingNormalizers.TryAdd<AliyunBlobNamingNormalizer>();
+aliyunConfigureAction(new AliyunBlobProviderConfiguration(containerConfiguration));
+```
+
+Direct sub-account configuration:
+
+```csharp
+o.Containers.ConfigureDefault(c =>
+{
+    c.UseAliyun(a =>
+    {
+        a.AccessKeyId     = config["Aliyun:AccessKeyId"];
+        a.AccessKeySecret = config["Aliyun:AccessKeySecret"];
+        a.Endpoint        = "oss-cn-hangzhou.aliyuncs.com";
+        a.ContainerName   = "myapp-blobs";
+        a.CreateContainerIfNotExists = true;
+    });
+});
+```
+
+STS / AssumeRole:
+
+```csharp
+a.UseSecurityTokenService = true;
+a.AccessKeyId     = config["Aliyun:RamUser:AccessKeyId"];     // RAM user that can AssumeRole
+a.AccessKeySecret = config["Aliyun:RamUser:AccessKeySecret"];
+a.RegionId        = "cn-hangzhou";
+a.RoleArn         = "acs:ram::1234567890:role/oss-blob-role";
+a.RoleSessionName = "blob-storing";
+a.DurationSeconds = 3600;   // 900..3600
+a.Policy          = "{ \"Statement\": [...] }";
+```
+
+## `AliyunBlobProviderConfiguration`
+
+| Property | Bag key | Type | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `AccessKeyId` | `Aliyun.AccessKeyId` | `string` | required | RAM/sub-account access key id. |
+| `AccessKeySecret` | `Aliyun.AccessKeySecret` | `string` | required | Paired secret. |
+| `Endpoint` | `Aliyun.Endpoint` | `string` | required | Region endpoint hostname (e.g. `oss-cn-hangzhou.aliyuncs.com`). |
+| `UseSecurityTokenService` | `Aliyun.UseSecurityTokenService` | `bool` | `false` | Switch to STS-issued temporary credentials. When true, the four `Role*` and `DurationSeconds`/`Policy` properties become relevant. |
+| `RegionId` | `Aliyun.RegionId` | `string` | required if STS | STS region id (`cn-hangzhou` etc.). |
+| `RoleArn` | `Aliyun.RoleArn` | `string` | required if STS | `acs:ram::<accountID>:role/<roleName>`. |
+| `RoleSessionName` | `Aliyun.RoleSessionName` | `string` | required if STS | Identifier for the temporary credentials. |
+| `DurationSeconds` | `Aliyun.DurationSeconds` | `int` | `0` | 900-3600 seconds. |
+| `Policy` | `Aliyun.Policy` | `string` | required if STS | Session policy JSON; an empty policy grants the role's full permissions. |
+| `ContainerName` | `Aliyun.ContainerName` | `string?` | `null` | Override the bucket name; falls back to `args.ContainerName`. Run through `BlobNormalizeNamingService.NormalizeContainerName`. |
+| `CreateContainerIfNotExists` | `Aliyun.CreateContainerIfNotExists` | `bool` | `false` | Create the bucket on first save if missing. |
+| `TemporaryCredentialsCacheKey` | `Aliyun.TemporaryCredentialsCacheKey` | `string?` | `Guid.NewGuid().ToString("N")` (per configuration instance) | Override to share STS sessions between containers/instances. |
+
+`AccessKeyId`/`AccessKeySecret`/`Endpoint`/`RegionId`/`RoleArn`/`RoleSessionName`/`Policy` use `GetConfiguration<string>` (throws if unset) — the others use `GetConfigurationOrDefault`.
+
+## `IOssClientFactory` strategy
+
+`DefaultOssClientFactory.GetOssClient(configuration)`:
+
+1. If `UseSecurityTokenService == false` → `return new OssClient(Endpoint, AccessKeyId, AccessKeySecret);`.
+2. Otherwise call `GetTemporaryCredentialsAsync(configuration)`:
+   - `Cache.GetAsync(configuration.TemporaryCredentialsCacheKey)` — if hit, decrypt the stored `AccessKeyId`/`AccessKeySecret`/`SecurityToken` via `IStringEncryptionService` and use them.
+   - On miss, create an `AcsClient(new DefaultProfile(RegionId, AccessKeyId, AccessKeySecret))`, send `AssumeRoleRequest { RoleArn, RoleSessionName, DurationSeconds, Policy }`, encrypt the response and `SetAsync` with `AbsoluteExpiration = response.Credentials.Expiration` (the actual expiry timestamp Aliyun returned).
+   - Build `new OssClient(Endpoint, ak, sk, securityToken)`.
+
+The cached `AliyunTemporaryCredentialsCacheItem` also stores `Expiration`, so callers can verify validity without parsing tokens.
+
+## `AliyunBlobProvider`
+
+| Method | Flow |
+| --- | --- |
+| `SaveAsync` | Resolve `objectKey = NameCalculator.Calculate(args)` and `bucket = GetContainerName(args)`. If `!OverrideExisting && exists` → `BlobAlreadyExistsException`. If `CreateContainerIfNotExists && !DoesBucketExist` → `PutBucket(bucket)`. Then `oss.PutObject(bucket, objectKey, args.BlobStream)`. |
+| `DeleteAsync` | If exists → `DeleteObject(bucket, objectKey)` → true; else false. |
+| `ExistsAsync` | `oss.DoesObjectExist(bucket, objectKey)`. |
+| `GetOrNullAsync` | If not exists → null. Else `GetObject(bucket, objectKey).Content` is buffered into a `MemoryStream` via `TryCopyToMemoryStreamAsync` (so the SDK response can be disposed). |
+
+`GetContainerName(args)` honours the configured `ContainerName` override (normalised) and otherwise uses `args.ContainerName`.
+
+## `AliyunBlobNamingNormalizer`
+
+OSS bucket name rules: lowercase letters, digits and dashes only; 3-63 chars; must start with a letter or digit. Implementation mirrors the AWS normalizer minus the dot support. Blob (object) names are returned unchanged.
+
+## `DefaultAliyunBlobNameCalculator`
+
+```csharp
+return CurrentTenant.Id == null
+    ? $"host/{args.BlobName}"
+    : $"tenants/{CurrentTenant.Id.Value:D}/{args.BlobName}";
+```
+
+## Operational notes
+
+- **Per-call client construction**. `OssClient` is small and cheap to instantiate; it owns its own connection state internally.
+- **STS expiration**. Cache TTL uses the actual `Credentials.Expiration` from STS rather than `DurationSeconds - 10s` (as in the AWS provider). This matches Aliyun's response model.
+- **`TemporaryCredentialsCacheKey`** defaults to a per-configuration GUID. Override when you want sub-second reuse across all instances of the same role/policy.
+- **Encryption at rest**. `IStringEncryptionService` encrypts the three credential fields in the cache item. Configure `AbpStringEncryptionOptions` consistently.
+
+## Cross-references
+
+- [BLOB storing overview](/blob/blob-storing-overview).
+- [AWS S3](/blob/aws-s3) — symmetric STS / temporary credential model.
+- [Distributed cache](/caching/distributed-cache) — backs the credentials cache.

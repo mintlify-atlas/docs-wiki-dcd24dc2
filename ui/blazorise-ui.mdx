@@ -1,0 +1,315 @@
+---
+title: "BlazoriseUI — ABP's Blazor component-library wrappers"
+sidebarTitle: "BlazoriseUI"
+description: "Volo.Abp.BlazoriseUI: AbpCrudPageBase generic base class, AbpExtensibleDataGrid, BlazoriseUiMessageService/NotificationService/PageProgressService, modal helpers and the IUi* service replacements every ABP-built Blazor screen depends on."
+---
+
+`Volo.Abp.BlazoriseUI` is ABP's adapter on top of the **Blazorise** component library (`https://blazorise.com`). It supplies:
+
+- Concrete impls for the abstract UI services declared in `Volo.Abp.AspNetCore.Components.Web` (`IUiMessageService`, `IUiNotificationService`, `IUiPageProgressService`) — they raise events that Blazorise modal/notification hosts subscribe to.
+- A reusable `AbpCrudPageBase<,,...>` ladder that backs every list / create / update screen in the framework's own modules (Identity, Tenant Management, Setting Management, etc.).
+- An `AbpExtensibleDataGrid<T>` wrapping `DataGrid<T>` with the framework's column / action extensibility model.
+- Supporting wrappers: `SubmitButton`, `ToolbarButton`, `EntityAction`, `EntityActions`, `PageAlert`, `UiMessageAlert`, `UiNotificationAlert`, `UiPageProgress`, plus per-type extension-property editors (`TextExtensionProperty`, `DateTimeExtensionProperty`, `LookupExtensionProperty`, etc.).
+
+Every ABP-themed Blazor stack (Server, WebAssembly, MauiBlazor) pulls this module in through `AbpAspNetCoreComponentsWebThemingModule`.
+
+## Module composition
+
+`framework/src/Volo.Abp.BlazoriseUI/AbpBlazoriseUIModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsWebModule),
+    typeof(AbpDddApplicationContractsModule),
+    typeof(AbpAuthorizationModule),
+    typeof(AbpGlobalFeaturesModule),
+    typeof(AbpFeaturesModule))]
+public class AbpBlazoriseUIModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddBlazorise(options =>
+        {
+            options.Debounce         = true;
+            options.DebounceInterval = 800;
+        });
+
+        context.Services.Replace(ServiceDescriptor.Scoped<IComponentActivator, ComponentActivator>());
+        context.Services.AddSingleton(typeof(AbpBlazorMessageLocalizerHelper<>));
+    }
+}
+```
+
+Two important moves:
+
+1. **Blazorise added with 800 ms input debounce.** Every `<TextEdit>`/`<MemoEdit>` in framework UIs uses this debounce so binding doesn't fire while the user is typing.
+2. **`IComponentActivator` is re-replaced** with Blazorise's `ComponentActivator`. Remember that `AbpAspNetCoreComponentsWebModule` already replaced the default with `ServiceProviderComponentActivator`; Blazorise's `ComponentActivator` *also* goes through DI but adds Blazorise's component-discovery shim. So `AbpAspNetCoreComponentsWebModule` runs first (its `[DependsOn]` arrow puts it earlier in the module graph), then `AbpBlazoriseUIModule` overrides on top.
+3. **`AbpBlazorMessageLocalizerHelper<T>`** is registered as a singleton — Blazorise uses it to localise its built-in validation messages through ABP's `IStringLocalizer`.
+
+## Service replacements
+
+The Blazorise module replaces the three "host-rendered" UI services from `Components.Web` with event-based versions. Each impl carries `[Dependency(ReplaceServices = true)]` and is `IScopedDependency`.
+
+### `BlazoriseUiMessageService` — `IUiMessageService`
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class BlazoriseUiMessageService : IUiMessageService, IScopedDependency
+{
+    public event EventHandler<UiMessageEventArgs>? MessageReceived;
+
+    public Task Info(string message, string? title = null, Action<UiMessageOptions>? options = null)
+    {
+        var opts = CreateDefaultOptions();
+        options?.Invoke(opts);
+        MessageReceived?.Invoke(this, new UiMessageEventArgs(UiMessageType.Info, message, title, opts));
+        return Task.CompletedTask;
+    }
+
+    // Success, Warn, Error, Confirm — same shape
+}
+```
+
+It raises `MessageReceived`; the `UiMessageAlert` component (placed in the theme layout) subscribes and shows a Blazorise `Modal` / `Alert`. So a call like `await Message.Info(L["Saved"])` from any `AbpComponentBase` triggers a re-render of the host alert.
+
+### `BlazoriseUiNotificationService` — `IUiNotificationService`
+
+Same pattern: raises `NotificationReceived`; `UiNotificationAlert` displays a toast.
+
+### `BlazoriseUiPageProgressService` — `IUiPageProgressService`
+
+Raises `ProgressChanged`; `UiPageProgress` renders the top-of-page progress bar. This is what the WASM and MauiBlazor HTTP message handlers call into during `SendAsync` to indicate request progress.
+
+`UiMessageAlert`, `UiNotificationAlert`, `UiPageProgress` are all in `Components/` and partial-classed (`.razor` + `.razor.cs`).
+
+## `AbpCrudPageBase<,,...>` — the workhorse
+
+`framework/src/Volo.Abp.BlazoriseUI/AbpCrudPageBase.cs` is a *ladder* of generic base classes — successive overloads add more type parameters and forward to the canonical 10-parameter base. The full base is:
+
+```csharp
+public abstract class AbpCrudPageBase<
+        TAppService,
+        TGetOutputDto,
+        TGetListOutputDto,
+        TKey,
+        TGetListInput,
+        TCreateInput,
+        TUpdateInput,
+        TListViewModel,
+        TCreateViewModel,
+        TUpdateViewModel>
+    : AbpComponentBase
+    where TAppService : ICrudAppService<TGetOutputDto, TGetListOutputDto, TKey, TGetListInput, TCreateInput, TUpdateInput>
+    where TGetOutputDto : IEntityDto<TKey>
+    where TGetListOutputDto : IEntityDto<TKey>
+    where TCreateInput : class
+    where TUpdateInput : class
+    where TGetListInput : new()
+    where TListViewModel : IEntityDto<TKey>
+    where TCreateViewModel : class, new()
+    where TUpdateViewModel : class, new()
+{
+    [Inject] protected TAppService AppService { get; set; } = default!;
+    [Inject] protected IStringLocalizer<AbpUiResource> UiLocalizer { get; set; } = default!;
+    [Inject] public IAbpEnumLocalizer AbpEnumLocalizer { get; set; } = default!;
+    [Inject] protected ExtensionPropertyPolicyChecker ExtensionPropertyPolicyChecker { get; set; } = default!;
+
+    protected virtual int PageSize { get; } = LimitedResultRequestDto.DefaultMaxResultCount;
+
+    protected int  CurrentPage = 1;
+    protected string  CurrentSorting = default!;
+    protected int? TotalCount;
+    protected TGetListInput GetListInput = new();
+    protected IReadOnlyList<TListViewModel> Entities = Array.Empty<TListViewModel>();
+    protected TCreateViewModel NewEntity;
+    protected TKey EditingEntityId = default!;
+    protected TUpdateViewModel EditingEntity;
+
+    protected Modal? CreateModal;
+    protected Modal? EditModal;
+    protected Validations? CreateValidationsRef;
+    protected Validations? EditValidationsRef;
+
+    protected List<BreadcrumbItem> BreadcrumbItems = new(2);
+    protected DataGridEntityActionsColumn<TListViewModel> EntityActionsColumn = default!;
+    protected EntityActionDictionary EntityActions { get; set; }
+    protected TableColumnDictionary TableColumns { get; set; }
+
+    protected string? CreatePolicyName { get; set; }
+    protected string? UpdatePolicyName { get; set; }
+    protected string? DeletePolicyName { get; set; }
+
+    public bool HasCreatePermission { get; set; }
+    public bool HasUpdatePermission { get; set; }
+    public bool HasDeletePermission { get; set; }
+}
+```
+
+### Lifecycle conventions
+
+```csharp
+protected async override Task OnInitializedAsync()
+{
+    await TrySetPermissionsAsync();
+    await TrySetEntityActionsAsync();
+    await TrySetTableColumnsAsync();
+    await InvokeAsync(StateHasChanged);
+}
+
+protected async override Task OnAfterRenderAsync(bool firstRender)
+{
+    if (firstRender)
+    {
+        await SetToolbarItemsAsync();
+        await SetBreadcrumbItemsAsync();
+    }
+    await base.OnAfterRenderAsync(firstRender);
+}
+```
+
+So an inheriting page just sets policy names + optionally overrides `MapToListViewModel`/`MapToEntityForCreation`/`MapToEntityForEditing`, and the base class handles loading, permission gating, entity-action column rendering, toolbar items, breadcrumbs, modal open/close, validation, error reporting (`HandleErrorAsync`).
+
+### Permission gating
+
+```csharp
+protected virtual async Task SetPermissionsAsync()
+{
+    if (CreatePolicyName != null) HasCreatePermission = await AuthorizationService.IsGrantedAsync(CreatePolicyName);
+    if (UpdatePolicyName != null) HasUpdatePermission = await AuthorizationService.IsGrantedAsync(UpdatePolicyName);
+    if (DeletePolicyName != null) HasDeletePermission = await AuthorizationService.IsGrantedAsync(DeletePolicyName);
+}
+```
+
+`AuthorizationService` comes from `AbpComponentBase`. The booleans drive the `Disabled` / `Visible` parameters of `EntityActions` and the toolbar's create button.
+
+### Data loading & paging
+
+```csharp
+protected virtual async Task GetEntitiesAsync()
+{
+    try
+    {
+        await UpdateGetListInputAsync();
+        var result = await AppService.GetListAsync(GetListInput);
+        Entities  = MapToListViewModel(result.Items);
+        TotalCount = (int?)result.TotalCount;
+    }
+    catch (Exception ex)
+    {
+        await HandleErrorAsync(ex);
+    }
+}
+```
+
+The `OnDataGridReadDataAsync(DataGridReadDataEventArgs<TListViewModel>)` (downstream of `AbpExtensibleDataGrid`) calls this when the user pages / sorts.
+
+### Shorter overloads
+
+The ladder gives convenience overloads — the most-used one (e.g. for a simple CRUD with no separate view-models or update DTO) is:
+
+```csharp
+public abstract class AbpCrudPageBase<TAppService, TEntityDto, TKey>
+    : AbpCrudPageBase<TAppService, TEntityDto, TKey, PagedAndSortedResultRequestDto>
+    where TAppService : ICrudAppService<TEntityDto, TKey>
+    where TEntityDto : class, IEntityDto<TKey>, new() { }
+```
+
+So a tenant-management list screen can derive from `AbpCrudPageBase<ITenantAppService, TenantDto, Guid>` and get everything for free.
+
+## `AbpExtensibleDataGrid<TItem>`
+
+`Components/AbpExtensibleDataGrid.razor.cs` is the framework's `DataGrid<T>` wrapper. It binds against:
+
+```csharp
+[Parameter] public IEnumerable<TItem> Data { get; set; } = default!;
+[Parameter] public EventCallback<DataGridReadDataEventArgs<TItem>> ReadData { get; set; }
+[Parameter] public int? TotalItems { get; set; }
+[Parameter] public bool ShowPager { get; set; }
+[Parameter] public int PageSize { get; set; }
+[Parameter] public IEnumerable<TableColumn> Columns { get; set; } = default!;
+[Parameter] public int CurrentPage { get; set; } = 1;
+[Parameter] public string? Class { get; set; }
+[Parameter] public bool Responsive { get; set; }
+[Parameter] public bool AutoGenerateColumns { get; set; }
+```
+
+The `Columns` parameter is a `TableColumn[]` from `Volo.Abp.AspNetCore.Components.Web/Extensibility/TableColumns/` — the same metadata model the MVC theme uses for its table extensibility. That lets modules contribute extra columns without forking the screen.
+
+Extension properties on `ExtraProperties[...]` are detected via:
+
+```csharp
+protected Regex ExtensionPropertiesRegex = new(@"ExtraProperties\[(.*?)\]");
+```
+
+…and rendered through the per-type editors under `Components/ObjectExtending/` (`TextExtensionProperty`, `LookupExtensionProperty`, etc.). `DataGridEntityActionsColumn<TItem>` is what shows the "…" action menu at row-end; `EntityActionDictionary` is the module-extensibility model for those actions.
+
+## Action / submit components
+
+| Component | Purpose |
+| --- | --- |
+| `SubmitButton` | `<button type="submit">` wrapper that flips an internal `Submiting` flag while the click handler runs. Parameters: `Form`, `Type`, `Color`, `PreventDefaultOnSubmit`, `Block`, `Disabled`, `SaveResourceKey` (default `"Save"`, resolved via `AbpUiResource`), `Clicked` callback. |
+| `ToolbarButton` | Toolbar-styled button with `Color`, `Icon`, `Text`, `Clicked`. |
+| `EntityAction` / `EntityActions` | Per-row action items wired to `EntityActionDictionary`. |
+| `PageAlert` | Renders `AbpComponentBase.Alerts`. |
+
+## Modal helper
+
+`AbpBlazoriseUiModalExtensions.cs`:
+
+```csharp
+public static Task CancelClosingModalWhenFocusLost(this Modal modal, ModalClosingEventArgs eventArgs)
+{
+    eventArgs.Cancel = eventArgs.CloseReason == CloseReason.FocusLostClosing;
+    return Task.CompletedTask;
+}
+```
+
+ABP screens wire this to `Modal.Closing` to prevent backdrop-clicks from discarding a half-edited form.
+
+## Localization helper
+
+`AbpBlazorMessageLocalizerHelper<T>` (singleton, registered open-generically) is used by Blazorise validators. Bind to it as `[Inject] AbpBlazorMessageLocalizerHelper<MyResource> H` and pass `H.Localize` to `<Validations>` to translate validation messages through ABP's resource-based localization.
+
+## Sizing & fluent helpers
+
+`BlazoriseFluentSizingParse.cs` parses Bootstrap-style sizes (`col-md-6`) into Blazorise's fluent sizing API. `BlazoriseExtensionPropertyPolicyChecker` filters extension-property editors based on the user's policy.
+
+## Putting it together — minimal CRUD screen
+
+```razor
+@page "/tenants"
+@inherits AbpCrudPageBase<ITenantAppService, TenantDto, Guid>
+
+<Card>
+    <CardBody>
+        <AbpExtensibleDataGrid TItem="TenantDto"
+                               Data="Entities"
+                               ReadData="OnDataGridReadAsync"
+                               TotalItems="TotalCount"
+                               ShowPager="true"
+                               PageSize="PageSize"
+                               Columns="TableColumns.Get<TenantDto>()" />
+    </CardBody>
+</Card>
+
+@code {
+    protected override async Task OnInitializedAsync()
+    {
+        CreatePolicyName = TenantManagementPermissions.Tenants.Create;
+        UpdatePolicyName = TenantManagementPermissions.Tenants.Update;
+        DeletePolicyName = TenantManagementPermissions.Tenants.Delete;
+        LocalizationResource = typeof(AbpTenantManagementResource);
+        await base.OnInitializedAsync();
+    }
+}
+```
+
+That's the entire screen — every behaviour (loading, paging, error toasts via `BlazoriseUiNotificationService`, permission gating, toolbar, breadcrumb, modal lifecycles) is inherited.
+
+## Related pages
+
+- [`/ui/blazor-components-web`](/ui/blazor-components-web) — `AbpComponentBase`, `IUiMessageService` contract.
+- [`/ui/blazor-components-server`](/ui/blazor-components-server), [`/ui/blazor-components-webassembly`](/ui/blazor-components-webassembly), [`/ui/blazor-maui`](/ui/blazor-maui) — the three hosting models that pull BlazoriseUI in.
+- [`/modules/basic-theme`](/modules/basic-theme) — places `UiMessageAlert`, `UiNotificationAlert`, `UiPageProgress` and `LayoutHook` in its layout.
+- [`/ddd/object-extending`](/ddd/object-extending) — the extra-properties model the per-type extension editors render.
+- [`/auth/permissions`](/auth/permissions) — what `CreatePolicyName` / `UpdatePolicyName` / `DeletePolicyName` resolve against.

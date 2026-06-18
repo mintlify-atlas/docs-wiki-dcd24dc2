@@ -1,0 +1,251 @@
+---
+title: "Volo.Abp.Minify — NUglify-backed JS/CSS/HTML minifiers"
+sidebarTitle: "Minify"
+description: "IMinifier / IJavascriptMinifier / ICssMinifier / IHtmlMinifier contracts, NUglifyMinifierBase, the .min/.prod pre-minified-sibling lookup, and how every ABP bundling stack (MVC, Blazor Server, WASM, MauiBlazor, CLI) consumes these services."
+---
+
+`Volo.Abp.Minify` is a thin, completely framework-agnostic abstraction over **NUglify** (`https://github.com/trullock/NUglify`, a community-maintained fork of Microsoft's Ajax Minifier). It powers every ABP bundling pipeline — the MVC `BundleManager`, the WASM/MauiBlazor in-memory bundlers, the ABP CLI `abp bundle` command — through the same three interfaces. There is no per-stack reimplementation; replacing a minifier here changes minification everywhere.
+
+## Module composition
+
+`framework/src/Volo.Abp.Minify/Volo/Abp/Minify/AbpMinifyModule.cs` is intentionally empty:
+
+```csharp
+public class AbpMinifyModule : AbpModule { }
+```
+
+All registration is done through `ITransientDependency` on the NUglify implementations. The module exists only so other modules can `[DependsOn(typeof(AbpMinifyModule))]` to express the dependency clearly.
+
+## Contracts
+
+`framework/src/Volo.Abp.Minify/Volo/Abp/Minify/IMinifier.cs`:
+
+```csharp
+public interface IMinifier
+{
+    string Minify(string source, string? fileName = null, string? originalFileName = null);
+}
+```
+
+Three derived marker interfaces specialise it by content type:
+
+| Interface | File | Marker for |
+| --- | --- | --- |
+| `IJavascriptMinifier` | `Scripts/IJavascriptMinifier.cs` | JS minifier |
+| `ICssMinifier` | `Styles/ICssMinifier.cs` | CSS minifier |
+| `IHtmlMinifier` | `Html/IHtmlMinifier.cs` | HTML minifier |
+
+Each is just `public interface IXMinifier : IMinifier {}`. The interfaces exist so a consumer can depend on the *intent* — bundlers ask for `IJavascriptMinifier` so an alternate registration (replacing JS minification but keeping CSS) is a one-line `services.Replace(...)`.
+
+### Method semantics
+
+- `source` — the raw text to minify.
+- `fileName` — used by NUglify for source-map / error messages; typically the bundle's relative path.
+- `originalFileName` — appended to the exception message if minification fails. Bundlers pass the individual contributor file (e.g. `_content/Bootstrap/dist/js/bootstrap.js`) so a faulty source is easy to identify.
+
+Returns the minified text. Throws `NUglifyException` on hard failures.
+
+## NUglify implementations
+
+`framework/src/Volo.Abp.Minify/Volo/Abp/Minify/NUglify/NUglifyMinifierBase.cs` centralises error handling:
+
+```csharp
+public abstract class NUglifyMinifierBase : IMinifier, ITransientDependency
+{
+    public string Minify(string source, string? fileName = null, string? originalFileName = null)
+    {
+        try
+        {
+            var result = UglifySource(source, fileName);
+            CheckErrors(result, originalFileName);
+            return result.Code;
+        }
+        catch (Exception e)
+        {
+            var errorMessage = "There is an error in uglifying the given source code!";
+            if (originalFileName != null)
+                errorMessage += " Original file: " + originalFileName;
+            throw new NUglifyException($"{errorMessage}{Environment.NewLine}{e.Message}", e);
+        }
+    }
+
+    private static void CheckErrors(UglifyResult result, string? originalFileName)
+    {
+        if (result.HasErrors)
+        {
+            var errorMessage = "There are some errors on uglifying the given source code!";
+            if (originalFileName != null)
+                errorMessage += " Original file: " + originalFileName;
+
+            throw new NUglifyException(
+                $"{errorMessage}{Environment.NewLine}{result.Errors.Select(e => e.ToString()).JoinAsString(Environment.NewLine)}",
+                result.Errors);
+        }
+    }
+
+    protected abstract UglifyResult UglifySource(string source, string? fileName);
+}
+```
+
+So every concrete minifier just picks the right `Uglify.X` overload:
+
+```csharp
+// NUglify/NUglifyJavascriptMinifier.cs
+public class NUglifyJavascriptMinifier : NUglifyMinifierBase, IJavascriptMinifier
+{
+    protected override UglifyResult UglifySource(string source, string? fileName)
+        => Uglify.Js(source, fileName);
+}
+
+// NUglify/NUglifyCssMinifier.cs
+public class NUglifyCssMinifier : NUglifyMinifierBase, ICssMinifier
+{
+    protected override UglifyResult UglifySource(string source, string? fileName)
+        => Uglify.Css(source, fileName);
+}
+
+// NUglify/NUglifyHtmlMinifier.cs
+public class NUglifyHtmlMinifier : NUglifyMinifierBase, IHtmlMinifier
+{
+    protected override UglifyResult UglifySource(string source, string? fileName)
+        => Uglify.Html(source, sourceFileName: fileName);
+}
+```
+
+The `[ITransientDependency]` on the base + the interface-implementation pattern means simply referencing `Volo.Abp.Minify` and depending on the module is enough to get them DI-registered as their typed contracts.
+
+## `NUglifyException`
+
+`framework/src/Volo.Abp.Minify/Volo/Abp/Minify/NUglify/NUglifyException.cs`:
+
+```csharp
+public class NUglifyException : AbpException
+{
+    public List<UglifyError>? Errors { get; set; }
+
+    public NUglifyException(string message, List<UglifyError> errors) : base(message) => Errors = errors;
+    public NUglifyException(string message, Exception innerException) : base(message, innerException) { }
+}
+```
+
+Bundlers catch this and log a warning, then **fall back to the original (un-minified) content** — see the BundlerBase fall-back below. That means a single broken file does *not* take down a whole bundle in production; it just publishes the un-minified version with a logged warning.
+
+## How bundling actually calls the minifier
+
+`framework/src/Volo.Abp.AspNetCore.Bundling/Volo/Abp/AspNetCore/Bundling/BundlerBase.cs` is the framework-agnostic bundler shared by MVC, Components.MauiBlazor.Bundling, and the CLI. It's the single integration point with `IMinifier`:
+
+```csharp
+public abstract class BundlerBase : IBundler, ITransientDependency
+{
+    private static string[] _minFileSuffixes = { "min", "prod" };
+
+    protected IMinifier Minifier { get; }
+    protected AbpBundlingOptions BundlingOptions { get; }
+
+    public BundleResult Bundle(IBundlerContext context)
+    {
+        var sb = new StringBuilder();
+        foreach (var file in context.ContentFiles)
+            sb.Append(GetFileContentConsideringMinification(context, file));
+        return new BundleResult(sb.ToString());
+    }
+}
+```
+
+The interesting part is the **sibling-file optimisation** — if the bundler is about to minify `foo.js` and a `foo.min.js` or `foo.prod.js` already exists next to it, the bundler uses the pre-minified file *as-is* and skips NUglify entirely:
+
+```csharp
+private string GetFileContentConsideringMinification(IBundlerContext context, string fileName)
+{
+    var isIgnoredForMinification = BundlingOptions.MinificationIgnoredFiles.Contains(fileName);
+    var isMinFile = IsMinFile(fileName);   // already ends in .min.js / .prod.css
+
+    if (!context.IsMinificationEnabled || isIgnoredForMinification || isMinFile)
+    {
+        return GetFileInfo(context, fileName).ReadAsString();   // raw
+    }
+
+    var minFileInfo = GetMinFileInfoOrNull(fileName);
+    if (minFileInfo != null)
+    {
+        return minFileInfo.ReadAsString();                      // pre-minified sibling
+    }
+
+    return GetAndMinifyFileContent(context, fileName);          // NUglify
+}
+
+private string GetAndMinifyFileContent(IBundlerContext context, string fileName)
+{
+    var fileContent = GetFileInfo(context, fileName).ReadAsString();
+    var nonMinifiedSize = fileContent.Length;
+
+    try
+    {
+        fileContent = Minifier.Minify(fileContent, context.BundleRelativePath, fileName);
+        Logger.LogInformation($"  > Minified {fileName} ({nonMinifiedSize} bytes -> {fileContent.Length} bytes)");
+        return fileContent;
+    }
+    catch (Exception ex)
+    {
+        Logger.LogWarning($"Unable to minify the file: {fileName}. Return file content without minification.", ex);
+    }
+    return fileContent;     // graceful fallback
+}
+```
+
+Two design decisions an agent must know about:
+
+1. **`.min` / `.prod` suffixes are recognised automatically** — `_minFileSuffixes = { "min", "prod" }`. Ship `bootstrap.min.css` in your wwwroot and the bundler uses it without running NUglify.
+2. **`AbpBundlingOptions.MinificationIgnoredFiles`** — an opt-out list. The framework adds `_content/Microsoft.AspNetCore.Components.WebAssembly.Authentication/AuthenticationService.js` to this list in `AbpAspNetCoreComponentsWebAssemblyThemingBundlingModule` because NUglify mishandles that specific file. Use it for any third-party script whose AST NUglify rejects.
+
+## Who consumes these interfaces
+
+Every bundler injects `IMinifier` via its specific marker interface:
+
+| Consumer file | Asks for | Path |
+| --- | --- | --- |
+| MVC `ScriptBundler` | `IJavascriptMinifier` | `Volo.Abp.AspNetCore.Mvc.UI.Bundling/Volo/Abp/AspNetCore/Mvc/UI/Bundling/Scripts/ScriptBundler.cs` |
+| MVC `StyleBundler` | `ICssMinifier` | `Volo.Abp.AspNetCore.Mvc.UI.Bundling/Volo/Abp/AspNetCore/Mvc/UI/Bundling/Styles/StyleBundler.cs` |
+| MauiBlazor `ScriptBundler` | `IJavascriptMinifier` | `Volo.Abp.AspNetCore.Components.MauiBlazor.Bundling/Volo/Abp/AspNetCore/Components/MauiBlazor/Bundling/Scripts/ScriptBundler.cs` |
+| MauiBlazor `StyleBundler` | `ICssMinifier` | `Volo.Abp.AspNetCore.Components.MauiBlazor.Bundling/Volo/Abp/AspNetCore/Components/MauiBlazor/Bundling/Styles/StyleBundler.cs` |
+| CLI `Volo.Abp.Cli.Core/Volo/Abp/Cli/Bundling/Scripts/ScriptBundler.cs` | `IJavascriptMinifier` | (the `abp bundle` command uses the same minifier as the runtime) |
+| CLI `Volo.Abp.Cli.Core/Volo/Abp/Cli/Bundling/Styles/StyleBundler.cs` | `ICssMinifier` | same |
+| `AbpApplicationConfigurationScriptController`, `AbpApplicationLocalizationScriptController`, `AbpServiceProxyScriptController` (in `Volo.Abp.AspNetCore.Mvc`) | `IJavascriptMinifier` | minifies the dynamically generated JS endpoints (`/Abp/ApplicationConfigurationScript`, `/Abp/ServiceProxyScript`) when caching enabled |
+
+`IHtmlMinifier` is not used by the bundling pipeline by default; it's a public hook for consumers (typical use: pre-rendering server-side HTML for caching).
+
+## Replacing the minifier
+
+NUglify is reasonable but not always desired (you may want Terser via a Node process for JS, or LightningCSS for CSS). Because the implementations are plain `[ITransientDependency]` classes, swapping is just an explicit DI replacement in your module:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.Replace(ServiceDescriptor.Transient<IJavascriptMinifier, MyTerserMinifier>());
+}
+
+public class MyTerserMinifier : IJavascriptMinifier, ITransientDependency
+{
+    public string Minify(string source, string? fileName = null, string? originalFileName = null)
+    {
+        // call out to node, jint, esbuild — your choice
+    }
+}
+```
+
+After that, every bundling pipeline (MVC, WASM, MauiBlazor, CLI) uses your impl without any further plumbing.
+
+## Common pitfalls
+
+- **Don't minify already-minified files.** NUglify will mangle source-maps and sometimes choke on certain UMD wrappers. The `.min.js` sibling detection is enabled by default — keep that intact when adding third-party libs.
+- **Add troublesome files to `MinificationIgnoredFiles`** instead of disabling bundling globally.
+- **Source maps**: NUglify can produce them via its `UglifyJsSettings`, but `NUglifyMinifierBase` deliberately does not. If you need source maps in production, replace the JS minifier.
+- **HTML minifier is opt-in.** ABP doesn't wire `IHtmlMinifier` into any pipeline; consume it directly in your code if you want HTML response minification.
+
+## Related pages
+
+- [`/aspnetcore/mvc-ui-bundling`](/aspnetcore/mvc-ui-bundling) — the full bundling pipeline that consumes these minifiers.
+- [`/ui/blazor-components-server`](/ui/blazor-components-server), [`/ui/blazor-components-webassembly`](/ui/blazor-components-webassembly), [`/ui/blazor-maui`](/ui/blazor-maui) — Blazor stacks that reuse the same minifier abstractions.
+- [`/cli/bundle-and-build`](/cli/bundle-and-build) — the `abp bundle` command (same minifier under the hood).
+- [`/ui/mvc-razor-pages`](/ui/mvc-razor-pages) — Razor stack overview.
+- [`/aspnetcore/mvc-ui-themes`](/aspnetcore/mvc-ui-themes) — `ITheme` contract for layout selection.

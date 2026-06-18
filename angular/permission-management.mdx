@@ -1,0 +1,232 @@
+---
+title: "Permission Management UI for ABP Angular Apps"
+sidebarTitle: "Permission Management"
+description: "The permission grid component, resource permission management workflow, and proxies inside @abp/ng.permission-management."
+---
+
+`@abp/ng.permission-management` ships the permission grid every other ABP UI surface opens — clicking *Permissions* on a Role, a User, a Tenant, an Edition, or an Organization Unit all funnel into the same `PermissionManagementComponent` from this package. It also ships the more recent *Resource Permission Management* flow used to grant permissions to arbitrary resources (an entity instance, a CMS Kit page, a custom subject). Source: [`npm/ng-packs/packages/permission-management/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/permission-management).
+
+## Package metadata
+
+| Field | Value |
+| --- | --- |
+| NPM name | `@abp/ng.permission-management` |
+| Secondary entry point | `@abp/ng.permission-management/proxy` |
+| Source | `packages/permission-management/src/lib/` |
+| Module class | `PermissionManagementModule` (`permission-management.module.ts`) |
+| Depends on | `@abp/ng.theme.shared` (+ `@angular/aria` peer) |
+
+There is **no routing factory**. This package contributes *components* that other modules embed inside their own modals — it is not lazy-loaded as a page.
+
+```typescript
+// permission-management.module.ts
+@NgModule({
+  declarations: [],
+  imports: [PermissionManagementComponent],
+  exports: [PermissionManagementComponent],
+})
+export class PermissionManagementModule {}
+```
+
+## The Permission grid
+
+### `PermissionManagementComponent`
+
+Located at `packages/permission-management/src/lib/components/permission-management.component.ts`. The component is `standalone` and exposes a small input/output surface:
+
+| Input | Type | Meaning |
+| --- | --- | --- |
+| `providerName` | `string` | `'R'` (role), `'U'` (user), `'T'` (tenant), `'E'` (edition), `'OU'` (organization unit) |
+| `providerKey` | `string` | The entity identifier (role name, user id, tenant id, …) |
+| `hideBadges` | `boolean` | Hides the "granted-by-role" indicators |
+| `visible` | `boolean` (modal control) | Two-way binding to open/close the embedded `ModalComponent` |
+| `entityDisplayName` | `string` | Optional title shown in the modal header |
+
+| Output | Meaning |
+| --- | --- |
+| `visibleChange` | Modal close event |
+| `permissionUpdated` | Fires when `PUT /api/permission-management/permissions` succeeds |
+
+Consumers embed it as:
+
+```html
+<abp-permission-management
+  [(visible)]="permissionsVisible"
+  [providerName]="'R'"
+  [providerKey]="selectedRole.name"
+  [entityDisplayName]="selectedRole.name"
+  (permissionUpdated)="onPermissionsUpdated()">
+</abp-permission-management>
+```
+
+Internally the component:
+
+1. Calls `PermissionsService.get(providerName, providerKey)` which returns a `GetPermissionListResultDto` tree grouped by permission group.
+2. Renders a tabbed view (one tab per group) with checkbox rows; the checkbox state is computed against `grantedProviders` to render the "granted by Role X" badge.
+3. On save, batches the diff into an `UpdatePermissionsDto` and calls `PermissionsService.update(providerName, providerKey, input)`.
+
+## Resource Permission Management
+
+A newer flow for granting permissions on *resource instances* (e.g. a single CMS Kit page). Its top-level component is `ResourcePermissionManagementComponent` at `packages/permission-management/src/lib/components/resource-permission-management/`.
+
+### Sub-components
+
+| Component | File | Role |
+| --- | --- | --- |
+| `ResourcePermissionManagementComponent` | `resource-permission-management.component.ts` | Modal host + tab orchestration |
+| `ResourcePermissionListComponent` | `resource-permission-list/` | Lists granted resources, opens the form |
+| `ResourcePermissionFormComponent` | `resource-permission-form/` | Per-resource grant editor |
+| `PermissionCheckboxListComponent` | `permission-checkbox-list/` | Hierarchical checkbox tree |
+| `ProviderKeySearchComponent` | `provider-key-search/` | Searches users/roles by name to find the `providerKey` |
+
+### `ResourcePermissionStateService`
+
+`services/resource-permission-state.service.ts` is a Signals-based store that backs the whole flow:
+
+```typescript
+@Injectable()
+export class ResourcePermissionStateService {
+  // View state
+  readonly viewMode = signal<eResourcePermissionViewModes>(eResourcePermissionViewModes.List);
+  readonly modalBusy = signal(false);
+  readonly hasResourcePermission = signal(false);
+
+  // Resource data
+  readonly resourceName = signal('');
+  readonly resourceKey = signal('');
+  readonly resourceDisplayName = signal<string | undefined>(undefined);
+
+  // Permissions data
+  readonly allResourcePermissions = signal<ResourcePermissionGrantInfoDto[]>([]);
+  readonly resourcePermissions  = signal<ResourcePermissionGrantInfoDto[]>([]);
+  readonly totalCount           = signal(0);
+  readonly permissionDefinitions = signal<ResourcePermissionDefinitionDto[]>([]);
+  readonly permissionsWithProvider = signal<ResourcePermissionWithProdiverGrantInfoDto[]>([]);
+  readonly selectedPermissions  = signal<string[]>([]);
+
+  // Provider data
+  readonly providers              = signal<ResourceProviderDto[]>([]);
+  readonly selectedProviderName   = signal('');
+  readonly selectedProviderKey    = signal('');
+
+  // Edit mode
+  readonly editProviderName = signal('');
+  readonly editProviderKey  = signal('');
+}
+```
+
+It is provided at the component level (not `root`), so each modal instance owns its own state.
+
+### `eResourcePermissionViewModes`
+
+Defined in `enums/view-modes.ts`. Drives the template `@switch`:
+
+| Value | Meaning |
+| --- | --- |
+| `List` | Browsing already-granted resources |
+| `Edit` | Editing a specific provider's grants on the resource |
+| `Add`  | Selecting a new provider (user/role) to grant access to |
+
+## Services
+
+### `ExtensionsService`
+
+`packages/permission-management/src/lib/services/extensions.service.ts` lets consumers contribute extra columns to the *resource permission list* table via `defaults/default-resource-permission-entity-props.ts` + the `PERMISSION_MANAGEMENT_RESOURCE_ENTITY_PROP_CONTRIBUTORS` token (see `tokens/extensions.token.ts`).
+
+### `PermissionsService` (proxy)
+
+`packages/permission-management/proxy/src/lib/permissions.service.ts` is the generated wrapper around `Volo.Abp.PermissionManagement.HttpApi`. Key methods:
+
+| Method | HTTP | Endpoint |
+| --- | --- | --- |
+| `get(providerName, providerKey)` | GET | `/api/permission-management/permissions` |
+| `getByGroup(groupName, providerName, providerKey)` | GET | `/api/permission-management/permissions/by-group` |
+| `update(providerName, providerKey, input)` | PUT | `/api/permission-management/permissions` |
+| `getResource(resourceName, resourceKey)` | GET | `/api/permission-management/permissions/resource` |
+| `updateResource(input)` | PUT | `/api/permission-management/permissions/resource` |
+| `deleteResource(resourceName, resourceKey, providerName, providerKey)` | DELETE | `/api/permission-management/permissions/resource` |
+| `searchProviderKey(providerName, filter, maxResultCount)` | GET | `/api/permission-management/permissions/search-provider-key` |
+
+The `apiName` is `'AbpPermissionManagement'` — mapped to a URL via `EnvironmentService` (see [`angular/core#restservice`](/angular/core#restservice-and-the-api-contract)).
+
+## DTOs
+
+`packages/permission-management/proxy/src/lib/models.ts` defines the canonical wire-types used by every theme/module that opens permissions:
+
+| DTO | Purpose |
+| --- | --- |
+| `GetPermissionListResultDto` | `{ entityDisplayName: string; groups: PermissionGroupDto[] }` |
+| `PermissionGroupDto` | One per backend permission group (`Volo.Abp.PermissionManagement.PermissionGroupDefinition`) |
+| `PermissionGrantInfoDto` | `{ name, displayName, parentName, isGranted, allowedProviders, grantedProviders }` |
+| `UpdatePermissionsDto` | The diff sent on save |
+| `ResourcePermissionGrantInfoDto` | Per-resource grant entry |
+| `ResourceProviderDto` | Provider list entry returned by `getResourceProviders` |
+| `SearchProviderKeyListResultDto` | Search-autocomplete payload |
+
+## Enums and identifiers
+
+`packages/permission-management/src/lib/enums/components.ts`:
+
+```typescript
+export enum ePermissionManagementComponents {
+  PermissionManagement = 'PermissionManagement.PermissionManagementComponent',
+  ResourcePermissionManagement = 'PermissionManagement.ResourcePermissionManagementComponent',
+}
+```
+
+Use these keys with `ReplaceableComponentsService.add({ key, component })` to substitute either UI in place across every module that opens it.
+
+## Provider name convention
+
+The `providerName` short codes match the backend `PermissionManagement` providers (`Volo.Abp.PermissionManagement.IPermissionManagementProvider`). Every caller across `@abp/ng.*` uses the same codes:
+
+| Code | Backend provider | Used by |
+| --- | --- | --- |
+| `R` | `RolePermissionManagementProvider` | Identity → Roles → Permissions |
+| `U` | `UserPermissionManagementProvider` | Identity → Users → Permissions |
+| `T` | `TenantPermissionManagementProvider` | Tenant Management → Permissions |
+| `E` | `EditionPermissionManagementProvider` | Editions UI (SaaS module) |
+| `OU` | `OrganizationUnitPermissionManagementProvider` | Identity → Organization Units → Permissions |
+| `C` | `ClientPermissionManagementProvider` | OpenIddict applications |
+
+## Flow on save
+
+```mermaid
+graph LR
+  click[User clicks Save]
+  click --> diff[Build UpdatePermissionsDto]
+  diff --> http[PermissionsService.update]
+  http --> backend[/api/permission-management/permissions]
+  backend --> emit[permissionUpdated emit]
+  emit --> close[Close modal + toast]
+```
+
+`UpdatePermissionsDto.permissions` carries a `name` + `isGranted` array; the backend resolves which provider grant rows to insert/delete. The component only sends *changed* rows so audit-log noise is minimal.
+
+## Tokens
+
+`tokens/extensions.token.ts`:
+
+| Token | Meaning |
+| --- | --- |
+| `PERMISSION_MANAGEMENT_RESOURCE_ENTITY_PROP_CONTRIBUTORS` | Contributor map for the resource-permission list table |
+| `PERMISSION_MANAGEMENT_RESOURCE_ENTITY_ACTION_CONTRIBUTORS` | Row-action contributors |
+
+Defaults are in `defaults/default-resource-permission-entity-props.ts`. They are applied by `ResourcePermissionStateService` when it first populates the list, mirroring the pattern used by Identity/Tenant Management.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Identity calls it" href="/angular/identity">
+    `UsersComponent` and `RolesComponent` open the permission grid via row actions.
+  </Card>
+  <Card title="Tenant Management calls it" href="/angular/tenant-management">
+    The Tenant row Permissions action passes `providerName: 'T'`.
+  </Card>
+  <Card title="Authorization model" href="/auth/permissions">
+    Backend permission groups and providers.
+  </Card>
+  <Card title="Permission Management module" href="/modules/permission-management">
+    Server-side application service consumed by `PermissionsService`.
+  </Card>
+</CardGroup>

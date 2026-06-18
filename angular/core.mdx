@@ -1,0 +1,290 @@
+---
+title: "Core Runtime: @abp/ng.core Internals Reference"
+sidebarTitle: "Core"
+description: "Deep dive into @abp/ng.core: CoreModule, ConfigState, EnvironmentService, RestService, interceptors, guards, replaceable components, and proxy outputs."
+---
+
+`@abp/ng.core` is the bedrock package that every other `@abp/ng.*` library imports. It has no ABP-package dependencies; its only runtime dependencies are `@abp/utils`, `just-clone`, `just-compare`, `ts-toolbelt`, and `luxon`. This page documents every folder under `packages/core/src/lib/` so coding agents can navigate, extend, or replace pieces without reverse-engineering the source.
+
+Sources in this page reference paths under [`npm/ng-packs/packages/core/src/lib/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/core/src/lib).
+
+## Module surface and bootstrap
+
+The package ships two `NgModule` classes that exist mainly for backwards compatibility — modern apps configure the runtime through the `provideAbpCore(...)` provider function.
+
+| Symbol | File | Use |
+| --- | --- | --- |
+| `BaseCoreModule` | `core.module.ts` | Declares + exports `CORE_DIRECTIVES`, `CORE_PIPES`, `CORE_COMPONENTS`. Imported by `CoreModule`. |
+| `CoreModule` | `core.module.ts` | Adds `provideHttpClient(withInterceptorsFromDi(), withXsrfConfiguration(...), withFetch())` + `provideAbpCore()`. |
+| `LocalizationModule` | `localization.module.ts` | Deprecated — re-exports `LocalizationPipe`, `AsyncLocalizationPipe`, `LazyLocalizationPipe`. |
+| `provideAbpCore(...features)` | `providers/core-module-config.provider.ts` | Modern, tree-shakable bootstrap. Accepts `withOptions`, `withCompareFunctionFactory`, `withTitleStrategy`. |
+| `provideAbpCoreChild(...)` | same file | Child-feature variant for lazy-loaded sub-applications. |
+
+```typescript
+// Recommended modern bootstrap (zoneless or zone-based)
+import { provideAbpCore, withOptions } from '@abp/ng.core';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideAbpCore(
+      withOptions({
+        environment: {
+          production: false,
+          application: { name: 'MyProjectName' },
+          oAuthConfig: { issuer: 'https://localhost:44321/', clientId: 'MyProjectName_App' },
+          apis: { default: { url: 'https://localhost:44322' } },
+        },
+      }),
+    ),
+  ],
+};
+```
+
+## Folder map
+
+Every folder under `src/lib/` and what it owns:
+
+| Folder | Contents |
+| --- | --- |
+| `abstracts/` | `AuthService`, `AuthGuard`, `AbstractNgModelComponent`, `AuthErrorFilterService`, `AbpAuthResponse`, `IAbpGuard` |
+| `clients/` | `ExternalHttpClient` (bypasses the API interceptor) |
+| `components/` | `DynamicLayoutComponent`, `ReplaceableRouteContainerComponent`, `RouterOutletComponent` |
+| `constants/` | `DEFAULT_DYNAMIC_LAYOUTS`, `DIFFERENT_LOCALES` (locale-to-NgLocale map) |
+| `core.module.ts` | Module aggregator (legacy) |
+| `directives/` | 11 directives: `permission`, `for`, `init`, `autofocus`, `caps-lock`, `debounce`, `form-submit`, `replaceable-template`, `show-password`, `stop-propagation` |
+| `enums/` | `eLayoutType`, `eMultiTenancySides` |
+| `guards/` | `PermissionGuard` (class) |
+| `handlers/` | `RoutesHandler` (drives `RoutesService` from `ApplicationConfigurationDto`) |
+| `interceptors/` | `ApiInterceptor`, `timezoneInterceptor`, `transferStateInterceptor` |
+| `localization.module.ts` | Deprecated re-export of localization pipes |
+| `models/` | `auth`, `auth-events`, `common`, `dtos`, `environment`, `localization`, `replaceable-components`, `rest`, `session`, `sort`, `utility` |
+| `pipes/` | 10 pipes: `localization`, `async-localization`, `lazy-localization`, `safe-html`, `html-encode`, `short-date`, `short-time`, `short-date-time`, `sort`, `to-injector`, `utc-to-local` |
+| `providers/` | `provideAbpCore` factory, `LocaleProvider`, `CookieLanguageProvider`, `IncludeLocalizationResourcesProvider` |
+| `proxy/` | Generated proxies for `Volo.Abp.AspNetCore.Mvc.ApplicationConfigurations`, `Volo.Abp.AspNetCore.Mvc.ApiExploring`, `Abp.MultiTenancy` |
+| `services/` | 30+ services — see [Service catalog](#service-catalog) |
+| `strategies/` | DOM strategies: `container`, `content-security`, `content`, `context`, `cross-origin`, `dom`, `loading`, `projection` |
+| `tests/` | Vitest specs |
+| `tokens/` | `CORE_OPTIONS`, `LOCALIZATIONS`, `DYNAMIC_LAYOUTS_TOKEN`, `TENANT_KEY`, `PIPE_TO_LOGIN_FN_KEY`, `CHECK_AUTHENTICATION_STATE_FN_KEY`, `HTTP_CONTEXT_*`, plus 15 more |
+| `utils/` | 23 utility modules (arrays, dates, env, forms, generators, http, internal-store, lazy-load, route, server-cookie, string, tree…) |
+| `validators/` | `age`, `credit-card`, `range`, `required`, `string-length`, `unique-character`, `url`, `username` |
+
+## Service catalog
+
+The most consumed services from `services/` are listed below. All are `@Injectable({ providedIn: 'root' })`.
+
+| Service | Responsibility |
+| --- | --- |
+| `ConfigStateService` | Holds the `ApplicationConfigurationDto` returned by `/api/abp/application-configuration`. Internal `InternalStore`. Exposes `getOne$`, `getDeep$`, `refreshAppState`. |
+| `EnvironmentService` | Holds the `Environment` object passed via `withOptions({ environment })`. Source of `apis`, `oAuthConfig`, `application.name`. |
+| `LocalizationService` | Resolves localization keys, switches languages, registers Angular locale data on demand. |
+| `RestService` | Thin wrapper around `HttpClient` that uses `EnvironmentService.getApiUrl(apiName)` and runs every error through `HttpErrorReporterService`. |
+| `SessionStateService` | Persists the current language and current tenant; backed by `LocalStorageService`. |
+| `MultiTenancyService` | Computes the multi-tenancy side from the config DTO (`Both`, `Host`, `Tenant`). |
+| `PermissionService` | Wraps `ConfigStateService` to ask `isGranted(policy)` / `getGrantedPolicy$(policy)`. |
+| `RoutesService` | Hierarchical menu store fed by `RoutesHandler` from `auth.grantedPolicies`. |
+| `ReplaceableComponentsService` | Registry for component substitution — see below. |
+| `HttpErrorReporterService` | Single Subject all 4xx/5xx errors flow into; `@abp/ng.theme.shared` subscribes. |
+| `HttpWaitService` | Counter of in-flight requests, used by the loader bar in `theme-shared`. |
+| `TimeService` / `TimezoneService` | Luxon-based formatting; used by `timezoneInterceptor`. |
+| `ListService<T>` | Reactive query-state helper: pagination, sort, filter — feeds `ngx-datatable`. |
+| `LazyLoadService` | Dynamically injects `<script>` / `<link>` tags via DOM strategies. |
+| `RouterEventsService` / `RouterWaitService` | Wrap `Router.events` with replay subjects. |
+| `TitleStrategyService` (`AbpTitleStrategy`) | Custom `TitleStrategy` resolving `route.title` through `LocalizationService`. |
+| `CookieStorageService` / `LocalStorageService` / `LocalStorageListenerService` | SSR-safe storage abstractions. |
+| `SubscriptionService` | Component-scoped `Subscription` bag for non-standalone components. |
+| `TrackByService` | `trackBy*` helpers used inside framework templates. |
+
+## RestService and the API contract
+
+`RestService.request<T, R>(...)` is the single HTTP entry point every generated proxy depends on. Its contract is small and stable:
+
+```typescript
+// packages/core/src/lib/services/rest.service.ts
+request<T, R>(
+  request: HttpRequest<T> | Rest.Request<T>,
+  config?: Rest.Config,
+  api?: string,
+): Observable<R>
+```
+
+Key behaviours:
+
+1. `api` defaults to `environment.getApiUrl(config.apiName)` — so generated services pass `apiName: 'identity'` and the URL is looked up at runtime, not at build time.
+2. `config.skipAddingHeader === true` routes the call through `ExternalHttpClient`, which is a separate `HttpClient` instance with the `ApiInterceptor` deliberately omitted (used by the OIDC discovery call).
+3. Errors are funneled into `HttpErrorReporterService.reportError(err)` unless `config.skipHandleError === true`.
+4. `params` are encoded with the optional `httpParamEncoder` from `config` (used to keep `+` characters intact in tokens).
+
+Generated proxy code looks like:
+
+```typescript
+// excerpt from packages/identity/proxy/.../identity-user.service.ts
+@Injectable({ providedIn: 'root' })
+export class IdentityUserService {
+  protected restService = inject(RestService);
+  apiName = 'AbpIdentity';
+
+  get = (id: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, IdentityUserDto>({
+      method: 'GET',
+      url: `/api/identity/users/${id}`,
+    }, config, this.apiName);
+}
+```
+
+The `apiName` value matches the backend `RemoteServiceName`. Mapping `apiName → URL` is owned exclusively by `EnvironmentService`.
+
+## Interceptors
+
+| Interceptor | Purpose |
+| --- | --- |
+| `ApiInterceptor` | Base interceptor: registers requests with `HttpWaitService`. Most apps swap this for `OAuthApiInterceptor` from `@abp/ng.oauth`. |
+| `timezoneInterceptor` | Adds the `__tenant`, `Accept-Language`, and timezone-related headers. |
+| `transferStateInterceptor` | Used by SSR — caches GET responses into `TransferState` so the browser does not refetch. |
+
+```typescript
+// Configured automatically inside provideAbpCore()
+provideHttpClient(
+  withInterceptors([timezoneInterceptor, transferStateInterceptor]),
+  withInterceptorsFromDi(),
+  withXsrfConfiguration({ cookieName: 'XSRF-TOKEN', headerName: 'RequestVerificationToken' }),
+  withFetch(),
+);
+```
+
+## Guards and route protection
+
+`@abp/ng.core` exposes guards in three forms — class-based (legacy), `CanActivateFn` functions, and DI tokens that `@abp/ng.oauth` overrides at startup.
+
+| Token / function | Behaviour |
+| --- | --- |
+| `AuthGuard` (class), `authGuard` (fn) | No-op stubs in core. Replaced by `AbpOAuthGuard` / `abpOAuthGuard` when `provideAbpOAuth()` is loaded. |
+| `asyncAuthGuard` | Async variant for routes that must wait for the OIDC callback. |
+| `PermissionGuard` (class), `permissionGuard` (fn) | Reads `route.data.requiredPolicy` (or `RoutesService.findRoute(state.url)?.requiredPolicy`) and asks `PermissionService.getGrantedPolicy$(policy)`. Redirects to login on `401`, reports a 403 via `HttpErrorReporterService` otherwise. |
+
+```typescript
+// example consumer route (from identity.routes.ts)
+{
+  path: '',
+  component: RouterOutletComponent,
+  canActivate: [authGuard, permissionGuard],
+  children: [
+    { path: 'users', data: { requiredPolicy: 'AbpIdentity.Users' }, /* ... */ },
+  ],
+}
+```
+
+## Replaceable components
+
+`ReplaceableRouteContainerComponent` is the indirection layer that turns every ABP page into a swappable slot.
+
+```typescript
+// packages/core/src/lib/models/replaceable-components.ts (simplified)
+export namespace ReplaceableComponents {
+  export interface RouteData<I = any, O = any> {
+    key: string;
+    defaultComponent: Type<any>;
+    inputs?: I;
+    outputs?: O;
+  }
+
+  export interface ReplaceableComponent { key: string; component: Type<any>; }
+}
+```
+
+A consumer overrides a component once at startup:
+
+```typescript
+// app.config.ts
+import { provideAppInitializer, inject } from '@angular/core';
+import { ReplaceableComponentsService, eIdentityComponents } from '@abp/ng.core';
+import { MyCustomUsersComponent } from './my-custom-users.component';
+
+provideAppInitializer(() => {
+  inject(ReplaceableComponentsService).add({
+    key: eIdentityComponents.Users,
+    component: MyCustomUsersComponent,
+  });
+});
+```
+
+`ReplaceableRouteContainerComponent` listens to that service and renders either the registered override or `route.data.replaceableComponent.defaultComponent`.
+
+## Localization pipeline
+
+1. `provideAbpCore(withOptions({ environment }))` registers `LocaleProvider` and `CookieLanguageProvider`.
+2. `ConfigStateService.refreshAppState()` fetches `/api/abp/application-configuration`, which embeds the localization tree if `INCUDE_LOCALIZATION_RESOURCES_TOKEN` is `true`, otherwise loads only the requested resources lazily via `AbpApplicationLocalizationService`.
+3. `LocalizationService.get(key$, ...params)` returns an `Observable<string>` resolved against the current language.
+4. The pipes `{{ 'AbpIdentity::Users' | abpLocalization }}` and `{{ 'AbpIdentity::Users' | asyncAbpLocalization }}` cover synchronous and reactive consumption.
+5. Angular's `registerLocaleData(...)` is called on the fly when the language changes — entries are looked up in `constants/different-locales.ts` so e.g. `tr-TR` maps to `@angular/common/locales/tr`.
+
+## Proxy generation output
+
+`src/lib/proxy/` holds the *runtime* proxies that the framework itself depends on (other modules ship theirs in a secondary entrypoint). For core:
+
+```
+proxy/
+├── volo/abp/
+│   ├── asp-net-core/mvc/
+│   │   ├── application-configurations/   # ApplicationConfigurationDto + service
+│   │   └── api-exploring/                # AbpApiDefinitionService
+│   └── ...
+└── pages/abp/multi-tenancy/abp-tenant.service.ts
+```
+
+`AbpApplicationConfigurationService` is the single most important generated artifact: `ConfigStateService` calls it to populate the runtime state that powers permissions, settings, features, current user, current tenant, and localization. The same `/api/abp/application-configuration` endpoint backs both the Angular and the MVC client proxies (see [`/aspnetcore/mvc-client-proxies`](/aspnetcore/mvc-client-proxies)).
+
+Generation is driven by `@abp/ng.schematics:proxy-add` and `@abp/nx.generators:generate-proxy`. The `generate-proxy.json` files in each `proxy/` directory record the parameters used last (module, source project, apiName, target).
+
+## Directives reference
+
+| Selector | Purpose |
+| --- | --- |
+| `[abpPermission]` | Hides the host element when `PermissionService.getGrantedPolicy$(input)` emits `false`. |
+| `[abpFor]` / `*abpFor` | Variant of `*ngFor` with `trackBy` helpers. |
+| `[abpInit]` | Runs a callback on `OnInit`; useful in templates. |
+| `[abpAutofocus]` | Calls `.focus()` after view init. |
+| `[abpCapsLock]` | Detects Caps Lock state for password fields. |
+| `[abpDebounce]` | Debounced `input` event emitter. |
+| `[abpFormSubmit]` | Marks all controls as dirty on submit. |
+| `[abpReplaceableTemplate]` | Allows replacing an arbitrary template (not a route) via `ReplaceableComponentsService`. |
+| `[abpShowPassword]` | Toggles password field visibility. |
+| `[abpStopPropagation]` | Calls `$event.stopPropagation()`. |
+
+## Models worth knowing
+
+`models/common.ts` declares the `ABP` namespace which contains the canonical types every other package consumes:
+
+```typescript
+export namespace ABP {
+  export interface Root { environment?: Environment; cultureNameLocaleFileMap?: Record<string, string>; /* ... */ }
+  export interface Test { id: string; }                 // generic ID guard
+  export interface Tree<T> { id: string; parentId?: string; children?: T[]; }
+  export type Action<T = unknown, R = void> = (data: T) => R;
+}
+```
+
+`models/rest.ts` defines `Rest.Config`, `Rest.Request<T>`, `Rest.Params`, the `Rest.Observe` and `Rest.ResponseType` enums — these are exactly the values generated proxies pass into `RestService`.
+
+`models/replaceable-components.ts` defines the substitution model described above.
+
+## Tokens cheat-sheet
+
+| Token | Meaning |
+| --- | --- |
+| `CORE_OPTIONS` | The `ABP.Root` object provided by `withOptions(...)`. |
+| `LOCALIZATIONS` | Multi-provider for compile-time localization contributions. |
+| `INCUDE_LOCALIZATION_RESOURCES_TOKEN` | Boolean — when `true`, the config endpoint includes the full localization tree (good for static apps). |
+| `TENANT_KEY` | Query/cookie key for tenant resolution; defaults to `__tenant`. |
+| `TITLE_STRATEGY_DISABLE_PROJECT_NAME` | When `true`, page titles do not append `– <ProjectName>`. |
+| `PIPE_TO_LOGIN_FN_KEY` | Function provided by `@abp/ng.oauth` that turns a 401 response into a login navigation. |
+| `CHECK_AUTHENTICATION_STATE_FN_KEY` | Function used by guards to verify access tokens before a route activates. |
+| `HTTP_CONTEXT_*` | Typed `HttpContextToken`s for per-request flags (skip error reporter, skip add-header, etc.). |
+| `OTHERS_GROUP` | Tree group label used by `RoutesService` for unclassified menu items. |
+| `MANAGE_PROFILE_TOKEN` | Override for the "manage profile" navigation. |
+
+## Cross-references
+
+- [`angular/oauth`](/angular/oauth) — the `@abp/ng.oauth` package overrides `AuthService`, `AuthGuard`, `ApiInterceptor`, `PIPE_TO_LOGIN_FN_KEY`, and `CHECK_AUTHENTICATION_STATE_FN_KEY` defined in core.
+- [`angular/theme-basic-shared`](/angular/theme-basic-shared) — consumes `HttpErrorReporterService`, `HttpWaitService`, `RoutesService`, `ReplaceableComponentsService`.
+- [`/aspnetcore/mvc-client-proxies`](/aspnetcore/mvc-client-proxies) — the same `/api/abp/api-definition` endpoint that drives `@abp/ng.schematics:proxy-add` also drives the C# `dotnet abp generate-proxy -t csharp`.
+- [`/auth/openid-connect`](/auth/openid-connect) — the server-side OIDC configuration consumed by `@abp/ng.oauth`.

@@ -1,0 +1,472 @@
+---
+title: "Distributed locking with IAbpDistributedLock and Medallion"
+sidebarTitle: "Distributed Locking"
+description: "IAbpDistributedLock, LocalAbpDistributedLock, MedallionAbpDistributedLock, key normalization and how outbox, inbox and job workers coordinate."
+---
+
+ABP's distributed locking is a thin, scheduler-agnostic abstraction over named, time-bounded leases. It exists so framework components — `BackgroundJobWorker`, `OutboxSender`, `InboxProcessor`, the runtime database migrator — can serialize work across multiple application instances without each picking its own coordination primitive.
+
+The contract lives in `framework/src/Volo.Abp.DistributedLocking.Abstractions/`. A real distributed implementation that bridges to [`madelson/DistributedLock`](https://github.com/madelson/DistributedLock) (the `Medallion.Threading` family of providers) lives in `framework/src/Volo.Abp.DistributedLocking/`. A Dapr-backed implementation lives in `framework/src/Volo.Abp.DistributedLocking.Dapr/`.
+
+## Topology
+
+```mermaid
+flowchart LR
+  Caller["Caller (BackgroundJobWorker, OutboxSender, ...)"] -->|TryAcquireAsync(name)| Iface[IAbpDistributedLock]
+  Iface -->|in-process| Local[LocalAbpDistributedLock]
+  Iface -->|cross-process| Medallion[MedallionAbpDistributedLock]
+  Iface -->|sidecar| Dapr[DaprAbpDistributedLock]
+  Iface -.->|tests| Null[NullAbpDistributedLock]
+  Local --> KeyedLock[Volo.Abp.Threading.KeyedLock]
+  Medallion --> IDP[IDistributedLockProvider]
+  IDP --> Redis[(Redis)]
+  IDP --> Sql[(SQL Server)]
+  IDP --> Pg[(Postgres)]
+  Dapr --> DaprSidecar[(Dapr sidecar)]
+```
+
+The abstractions module ships **only** `LocalAbpDistributedLock` as `ISingletonDependency`. Any consumer that just depends on `Volo.Abp.DistributedLocking.Abstractions` is single-process safe by default. The moment you add `Volo.Abp.DistributedLocking` (the Medallion adapter), `MedallionAbpDistributedLock` is registered with `[Dependency(ReplaceServices = true)]` and the local implementation falls out of DI.
+
+## The contract
+
+`IAbpDistributedLock` is a single method:
+
+```csharp
+public interface IAbpDistributedLock
+{
+    /// <summary>
+    /// Tries to acquire a named lock.
+    /// Returns a disposable object to release the lock.
+    /// It is suggested to use this method within a using block.
+    /// Returns null if the lock could not be handled.
+    /// </summary>
+    Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        [NotNull] string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default);
+}
+```
+
+And the handle is just an `IAsyncDisposable`:
+
+```csharp
+public interface IAbpDistributedLockHandle : IAsyncDisposable
+{
+}
+```
+
+### Semantics every caller relies on
+
+- **Try-only.** There is no blocking `AcquireAsync`. The method returns `null` if the lock is already held and the `timeout` elapsed. Callers always branch on `handle != null`.
+- **`timeout = default` is zero.** With no timeout, `TryAcquireAsync` returns instantly — either with a handle or with `null`. That zero-wait shape is exactly what periodic workers want (skip this tick if someone else owns the lock, try again on the next tick).
+- **Always wrap in `await using`.** Forgetting `await using` leaks the lease until its TTL expires, blocking other nodes. ABP's framework consumers always use the `await using (var handle = await ...)` form — and so should application code.
+- **Name is normalized.** Implementations do not call the underlying lock provider with the raw `name` — they ask `IDistributedLockKeyNormalizer` to prepend the configured prefix first.
+- **Return value identifies the holder, not the row.** The handle is the lease, not a database id. There is no way to inspect "who holds lock X" from the abstraction; you must reach into the provider if you need that.
+
+### Key normalization
+
+`AbpDistributedLockOptions` holds a single `KeyPrefix`:
+
+```csharp
+public class AbpDistributedLockOptions
+{
+    public string KeyPrefix { get; set; }
+
+    public AbpDistributedLockOptions()
+    {
+        KeyPrefix = "";
+    }
+}
+```
+
+The default normalizer just concatenates:
+
+```csharp
+public class DistributedLockKeyNormalizer : IDistributedLockKeyNormalizer, ITransientDependency
+{
+    public virtual string NormalizeKey(string name)
+    {
+        return $"{Options.KeyPrefix}{name}";
+    }
+}
+```
+
+`KeyPrefix` is the canonical way to keep multiple ABP applications sharing the same Redis or SQL Server from colliding on lock names. A common pattern:
+
+```csharp
+Configure<AbpDistributedLockOptions>(options =>
+{
+    options.KeyPrefix = $"{configuration["App:Name"]}_{hostEnvironment.EnvironmentName}_";
+});
+```
+
+Because `IDistributedLockKeyNormalizer` is a virtual transient, you can replace it to do per-tenant prefixing, hashing of overlong keys for SQL Server's 255-character `sp_getapplock` ceiling, or anything else.
+
+## In-process: `LocalAbpDistributedLock`
+
+The default implementation routes through `Volo.Abp.Threading.KeyedLock`, a static per-key `SemaphoreSlim` cache:
+
+```csharp
+public class LocalAbpDistributedLock : IAbpDistributedLock, ISingletonDependency
+{
+    public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default)
+    {
+        Check.NotNullOrWhiteSpace(name, nameof(name));
+        var key = DistributedLockKeyNormalizer.NormalizeKey(name);
+        var disposable = await KeyedLock.TryLockAsync(key, timeout, cancellationToken);
+        if (disposable == null)
+        {
+            return null;
+        }
+        return new LocalAbpDistributedLockHandle(disposable);
+    }
+}
+```
+
+`KeyedLock` is a process-local primitive — it uses ref-counted semaphores keyed by the string. That means:
+
+- It enforces mutual exclusion **within a single process**, but two replicas of the same web host will each succeed on `TryAcquireAsync` simultaneously.
+- It is safe to use in tests and small single-node deployments without any infrastructure.
+- It still respects `KeyPrefix`, so unit tests can verify the right prefix shape.
+
+`LocalAbpDistributedLockHandle` simply forwards `DisposeAsync` to the underlying `IDisposable`:
+
+```csharp
+public class LocalAbpDistributedLockHandle : IAbpDistributedLockHandle
+{
+    private readonly IDisposable _disposable;
+
+    public LocalAbpDistributedLockHandle(IDisposable disposable) { _disposable = disposable; }
+
+    public ValueTask DisposeAsync()
+    {
+        _disposable.Dispose();
+        return default;
+    }
+}
+```
+
+### `NullAbpDistributedLock`
+
+`NullAbpDistributedLock` is a never-blocks stand-in:
+
+```csharp
+public class NullAbpDistributedLock : IAbpDistributedLock
+{
+    public Task<IAbpDistributedLockHandle?> TryAcquireAsync(string name, TimeSpan timeout = default, CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult<IAbpDistributedLockHandle?>(new LocalAbpDistributedLockHandle(NullDisposable.Instance));
+    }
+}
+```
+
+It always returns a handle and is mainly used in tests where you want to disable the gating without rewriting the consumer. It is **not** auto-registered — you have to opt in via `services.Replace(ServiceDescriptor.Singleton<IAbpDistributedLock, NullAbpDistributedLock>())` or by registering it in your test module.
+
+## Cross-process: `MedallionAbpDistributedLock`
+
+Adding the `Volo.Abp.DistributedLocking` package and its module replaces the local lock with one that delegates to a `Medallion.Threading.IDistributedLockProvider`:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class MedallionAbpDistributedLock : IAbpDistributedLock, ITransientDependency
+{
+    public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default)
+    {
+        Check.NotNullOrWhiteSpace(name, nameof(name));
+        var key = DistributedLockKeyNormalizer.NormalizeKey(name);
+
+        CancellationTokenProvider.FallbackToProvider(cancellationToken);
+
+        var handle = await DistributedLockProvider.TryAcquireLockAsync(
+            key,
+            timeout,
+            CancellationTokenProvider.FallbackToProvider(cancellationToken)
+        );
+
+        if (handle == null)
+        {
+            return null;
+        }
+
+        return new MedallionAbpDistributedLockHandle(handle);
+    }
+}
+```
+
+Three implementation details that matter:
+
+1. **`IDistributedLockProvider` is not registered by ABP.** The Medallion module assumes the host registers a concrete provider (e.g. `RedisDistributedSynchronizationProvider`, `SqlDistributedSynchronizationProvider`, `PostgresDistributedSynchronizationProvider`). If you forget, DI will fail to resolve `IAbpDistributedLock` for every consumer.
+2. **The cancellation token chains through `ICancellationTokenProvider`.** This is ABP's ambient cancellation-token accessor — it lets long-running operations cooperate with the current request's `HttpContext.RequestAborted` even when the caller did not thread the token explicitly.
+3. **Handle is wrapped, not duck-typed.** `MedallionAbpDistributedLockHandle.Handle` keeps a reference to the underlying `IDistributedSynchronizationHandle`. Consumers that need provider-specific behavior (renewal, monitoring) can downcast via the extension below.
+
+```csharp
+public static class AbpDistributedLockHandleExtensions
+{
+    public static IDistributedSynchronizationHandle ToDistributedSynchronizationHandle(
+        this IAbpDistributedLockHandle handle)
+    {
+        return handle.As<MedallionAbpDistributedLockHandle>().Handle;
+    }
+}
+```
+
+Use it sparingly — calling it on a `LocalAbpDistributedLockHandle` will throw, so it is only safe in code paths that have explicitly declared a Medallion dependency.
+
+### Picking a provider
+
+Medallion ships separate NuGet packages per backend, each registering an implementation of `IDistributedLockProvider`. Pair them with the ABP module:
+
+<CardGroup cols={3}>
+  <Card title="Redis" icon="database">
+    `DistributedLock.Redis` — `RedisDistributedSynchronizationProvider` over `IConnectionMultiplexer` from StackExchange.Redis. TTL based, with automatic renewal while the handle is held.
+  </Card>
+  <Card title="SQL Server" icon="server">
+    `DistributedLock.SqlServer` — `SqlDistributedSynchronizationProvider` over a connection string. Uses `sp_getapplock`, so the lock is session-scoped; held until handle dispose.
+  </Card>
+  <Card title="Postgres" icon="elephant">
+    `DistributedLock.Postgres` — `PostgresDistributedSynchronizationProvider` over a Npgsql connection string. Backed by `pg_advisory_lock`, session-scoped.
+  </Card>
+</CardGroup>
+
+A canonical Redis wiring:
+
+```csharp
+[DependsOn(typeof(AbpDistributedLockingModule))]
+public class MyHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        context.Services.AddSingleton<IConnectionMultiplexer>(
+            ConnectionMultiplexer.Connect(configuration["Redis:Configuration"]));
+
+        context.Services.AddSingleton<IDistributedLockProvider>(sp =>
+            new RedisDistributedSynchronizationProvider(
+                sp.GetRequiredService<IConnectionMultiplexer>().GetDatabase()));
+    }
+}
+```
+
+A SQL Server wiring is similar but uses a connection string:
+
+```csharp
+context.Services.AddSingleton<IDistributedLockProvider>(_ =>
+    new SqlDistributedSynchronizationProvider(configuration.GetConnectionString("Default")!));
+```
+
+<Note>
+`Volo.Abp.DistributedLocking` does **not** pin a particular Medallion provider — only the abstractions. You pick the provider package; ABP just adapts it to `IAbpDistributedLock`.
+</Note>
+
+### Choosing between providers
+
+| Provider   | Lock lifetime           | Renewal | Cross-DC | Notes                                          |
+| ---------- | ----------------------- | ------- | -------- | ---------------------------------------------- |
+| Redis      | TTL with auto-extend    | Yes     | Limited  | Fastest. Needs careful TTL when GC pauses occur. |
+| SQL Server | Session-scoped applock  | N/A     | No       | Survives long pauses. Lock dies if the SQL connection dies. |
+| Postgres   | Session advisory lock   | N/A     | No       | Same shape as SQL Server.                       |
+| Dapr       | TTL per `StoreName`     | No      | Sidecar  | Cross-language; depends on Dapr component.      |
+
+The session-scoped backends (SQL Server, Postgres) are safer for long-held leases because a stalled process loses the lock as soon as its connection drops. Redis is safer for very high-frequency, short-lived leases because the round-trip is cheap. ABP framework consumers themselves only hold the lock for one polling cycle, so any of the three is acceptable.
+
+## Dapr-backed: `DaprAbpDistributedLock`
+
+`framework/src/Volo.Abp.DistributedLocking.Dapr/Volo/Abp/DistributedLocking/Dapr/DaprAbpDistributedLock.cs` plugs the same abstraction into the Dapr distributed-lock building block:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class DaprAbpDistributedLock : IAbpDistributedLock, ITransientDependency
+{
+    public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default)
+    {
+        name = DistributedLockKeyNormalizer.NormalizeKey(name);
+
+        var daprClient = await DaprClientFactory.CreateAsync();
+        var lockResponse = await daprClient.Lock(
+            DistributedLockDaprOptions.StoreName,
+            name,
+            DistributedLockDaprOptions.Owner ?? Guid.NewGuid().ToString(),
+            (int)DistributedLockDaprOptions.DefaultExpirationTimeout.TotalSeconds,
+            cancellationToken);
+
+        if (lockResponse == null || !lockResponse.Success)
+        {
+            return null;
+        }
+
+        return new DaprAbpDistributedLockHandle(lockResponse);
+    }
+}
+```
+
+`AbpDistributedLockDaprOptions` controls the sidecar interaction:
+
+```csharp
+public class AbpDistributedLockDaprOptions
+{
+    public string StoreName { get; set; } = default!;
+    public string? Owner { get; set; }
+    public TimeSpan DefaultExpirationTimeout { get; set; }
+
+    public AbpDistributedLockDaprOptions()
+    {
+        DefaultExpirationTimeout = TimeSpan.FromMinutes(2);
+    }
+}
+```
+
+- `StoreName` is the Dapr component name (e.g. `mylockstore`) configured in your Dapr resources.
+- `Owner` defaults to a fresh `Guid` per acquisition, which is what Dapr's contract wants ("only the owner can release"). Setting it explicitly is only useful for tests.
+- `DefaultExpirationTimeout` is **not** a `TryAcquireAsync` timeout — it is the TTL that the Dapr sidecar applies to the lock so a crashed owner can never block forever. Two minutes is plenty for the framework's per-poll consumers; raise it for long-running custom workflows.
+
+<Warning>
+The Dapr adapter ignores the `timeout` parameter — Dapr's `TryLock` is a single attempt. Callers that pass a timeout will get the same zero-wait behavior they would get with `default`. If you really need a bounded wait, retry around the call.
+</Warning>
+
+## Who acquires what, and when
+
+The framework itself uses `IAbpDistributedLock` in a handful of well-known places. Knowing the lock names helps when debugging stalled queues or planning your prefix scheme.
+
+### `BackgroundJobWorker`
+
+`framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/BackgroundJobWorker.cs` is the in-process consumer for ABP's database-backed background jobs. Its `DoWorkAsync` opens with:
+
+```csharp
+protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext)
+{
+    await using (var handler = await DistributedLock.TryAcquireAsync(
+        WorkerOptions.DistributedLockName, cancellationToken: StoppingToken))
+    {
+        if (handler != null)
+        {
+            var store = workerContext.ServiceProvider.GetRequiredService<IBackgroundJobStore>();
+            var waitingJobs = await store.GetWaitingJobsAsync(WorkerOptions.ApplicationName, WorkerOptions.MaxJobFetchCount);
+            // ...
+        }
+    }
+}
+```
+
+- The lock name comes from `AbpBackgroundJobWorkerOptions.DistributedLockName` (defaults to `AbpBackgroundJobs`).
+- The timeout is the default (zero) — if another instance already holds the lock, this tick is skipped and the worker waits for `Timer.Period`.
+- Multiple replicas can be deployed safely: only one drains `IBackgroundJobStore` per cycle.
+
+When you replace this worker with the Hangfire, Quartz or TickerQ scheduler, the lock is no longer consulted — those schedulers do their own coordination. See `/background/background-jobs` for the wiring details.
+
+### `OutboxSender`
+
+`framework/src/Volo.Abp.EventBus/Volo/Abp/EventBus/Distributed/OutboxSender.cs` is the distributed-event-bus outbox drain. The lock name is dynamic:
+
+```csharp
+public virtual Task StartAsync(OutboxConfig outboxConfig, CancellationToken cancellationToken = default)
+{
+    OutboxConfig = outboxConfig;
+    Outbox = (IEventOutbox)ServiceProvider.GetRequiredService(outboxConfig.ImplementationType);
+    DistributedLockName = $"AbpOutbox_{OutboxConfig.DatabaseName}";
+    Timer.Start(cancellationToken);
+    return Task.CompletedTask;
+}
+
+protected virtual async Task RunAsync()
+{
+    await using (var handle = await DistributedLock.TryAcquireAsync(DistributedLockName, cancellationToken: StoppingToken))
+    {
+        if (handle != null)
+        {
+            // drain the outbox table for this database
+        }
+    }
+}
+```
+
+The `AbpOutbox_{DatabaseName}` naming means that if your application has multiple outboxes (one per microservice database), each gets its own lock. Two replicas of the same service will share one lock and exactly one will drain per cycle. See `/eventbus/distributed-event-bus` and `/flows/distributed-event-publish` for the full transactional-outbox flow.
+
+### `InboxProcessor`
+
+The mirror on the consumer side, `InboxProcessor`, also uses a database-scoped lock name (e.g. `AbpInbox_{DatabaseName}`) so multiple replicas of the consumer do not redeliver the same incoming event.
+
+### Runtime database migrator
+
+`EfCoreRuntimeDatabaseMigratorBase` and `EfCoreDatabaseMigrationEventHandlerBase` (under `framework/src/Volo.Abp.EntityFrameworkCore/`) take the lock before running migrations so that, in a multi-pod deployment, the first pod to win the lock applies the schema change and the others observe it complete. This is why the runtime migrator is safe to call from every replica's startup hook.
+
+## Manual usage from application code
+
+The intended call shape mirrors what the framework itself uses:
+
+```csharp
+public class RebuildSearchIndexService : ITransientDependency
+{
+    protected IAbpDistributedLock DistributedLock { get; }
+
+    public RebuildSearchIndexService(IAbpDistributedLock distributedLock)
+    {
+        DistributedLock = distributedLock;
+    }
+
+    public async Task RebuildAsync(CancellationToken cancellationToken)
+    {
+        await using var handle = await DistributedLock.TryAcquireAsync(
+            "SearchIndexRebuild",
+            timeout: TimeSpan.FromSeconds(5),
+            cancellationToken: cancellationToken);
+
+        if (handle == null)
+        {
+            // Another instance is already rebuilding — skip this run.
+            return;
+        }
+
+        await DoExpensiveRebuildAsync(cancellationToken);
+    }
+}
+```
+
+Patterns worth lifting from framework code:
+
+- **Always `await using`.** Even on the happy path, `await using` keeps the `DisposeAsync` await in the right place for `MedallionAbpDistributedLockHandle`, which can do non-trivial work when releasing.
+- **Short timeouts.** A timeout above a few seconds is rare in framework code. If you find yourself wanting a long timeout, you almost certainly want a queue (background jobs) instead.
+- **Re-check state after acquiring.** The lock guarantees only that two callers are not inside the section at the same time. It does not guarantee that the work needs to be done; re-read state once you own the lock.
+
+### Cross-thread re-entry inside the same process
+
+`LocalAbpDistributedLock` is built on `SemaphoreSlim`. It is **not** re-entrant — a task that already holds the lock for key X cannot acquire it again from the same call stack without deadlocking. The Medallion providers vary: Redis-backed handles are also non-reentrant, while SQL Server `sp_getapplock` is per-session and is effectively non-reentrant from the consumer's point of view. Treat the contract as never reentrant and you will not be surprised when you swap providers.
+
+## Gotchas for coding agents
+
+<AccordionGroup>
+  <Accordion title="Missing IDistributedLockProvider gives a startup failure">
+    The Medallion module only registers `MedallionAbpDistributedLock`; the underlying `IDistributedLockProvider` is your responsibility. Forgetting it means every consumer that takes `IAbpDistributedLock` will fail to construct.
+  </Accordion>
+  <Accordion title="The handle is null, not throwing">
+    `TryAcquireAsync` returns `null` on contention. Code that expects an exception will silently skip the protected section. Always branch on `handle != null` (this is what `BackgroundJobWorker`, `OutboxSender` and `InboxProcessor` all do).
+  </Accordion>
+  <Accordion title="LocalAbpDistributedLock does not coordinate across replicas">
+    Running two pods of the same service with `Volo.Abp.DistributedLocking.Abstractions` only means both pods will drain the outbox / job queue independently. Reference the Medallion (or Dapr) module before going to production.
+  </Accordion>
+  <Accordion title="Dapr ignores timeout">
+    `DaprAbpDistributedLock` issues a single `daprClient.Lock` call. A non-zero `timeout` is silently dropped. If you need a bounded wait, wrap the call in a retry loop.
+  </Accordion>
+  <Accordion title="KeyPrefix and tenants">
+    `AbpDistributedLockOptions.KeyPrefix` is global. If your application is multi-tenant and tenant-scoped locks matter, replace `IDistributedLockKeyNormalizer` to include the current tenant id in the key.
+  </Accordion>
+  <Accordion title="Renewal behavior is provider-specific">
+    Redis renews automatically as long as the handle is alive; SQL Server / Postgres rely on the connection being open. Long-running work inside the lock should pick the provider deliberately, not assume the abstraction smooths over the difference.
+  </Accordion>
+</AccordionGroup>
+
+## Related references
+
+- `/background/background-jobs` — `BackgroundJobWorker` and `AbpBackgroundJobWorkerOptions.DistributedLockName`.
+- `/eventbus/distributed-event-bus` — `OutboxSender`, `InboxProcessor` and the boxes options that drive their cadence.
+- `/flows/distributed-event-publish` — the end-to-end transactional-outbox flow that the outbox lock protects.
+- `/background/tickerq`, `/background/hangfire`, `/background/quartz` — alternative job schedulers that **do not** consult `IAbpDistributedLock` because the scheduler owns coordination.

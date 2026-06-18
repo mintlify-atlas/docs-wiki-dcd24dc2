@@ -1,72 +1,56 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "ABP Framework",
+  "theme": "maple",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#ba4395",
+    "light": "#ffffff",
+    "dark": "#7a2c61"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
+  "favicon": "https://media.brand.dev/861559e5-617f-43f0-a53d-ded6f1e1fc91.png",
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "https://media.brand.dev/2662d8ba-e84e-4dd7-a4d1-0228c7be0941.svg",
+    "dark": "https://media.brand.dev/2662d8ba-e84e-4dd7-a4d1-0228c7be0941.svg"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/abpframework/abp"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/abpframework/abp"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Wiki",
+        "groups": [
+          { "group": "Overview", "pages": ["index", "overview/architecture", "overview/repository-layout", "overview/solution-structure", "overview/build-and-tooling", "overview/glossary"] },
+          { "group": "Core & Modularity", "pages": ["core/overview", "core/volo-abp-core", "core/modularity-system", "core/dependency-injection", "core/dynamic-proxy-and-aspects", "core/exception-handling", "core/threading-and-async", "core/reflection-and-collections", "core/options-and-static-definitions", "core/virtual-file-system", "core/logging-and-tracing"] },
+          { "group": "Domain-Driven Design Layer", "pages": ["ddd/overview", "ddd/domain-shared", "ddd/domain", "ddd/entities-and-aggregates", "ddd/repositories", "ddd/domain-services", "ddd/value-objects-and-specifications", "ddd/application-contracts", "ddd/application-services", "ddd/dtos-and-object-mapping", "ddd/object-extending"] },
+          { "group": "Data Access", "pages": ["data/overview", "data/volo-abp-data", "data/unit-of-work", "data/entity-framework-core", "data/ef-core-providers", "data/mongodb", "data/dapper", "data/memory-db", "data/data-seeding-and-migrations", "data/data-filtering", "data/connection-strings"] },
+          { "group": "ASP.NET Core Integration", "pages": ["aspnetcore/overview", "aspnetcore/volo-abp-aspnetcore", "aspnetcore/mvc-integration", "aspnetcore/mvc-ui-bootstrap", "aspnetcore/mvc-ui-bundling", "aspnetcore/mvc-ui-themes", "aspnetcore/mvc-ui-widgets", "aspnetcore/mvc-client-proxies", "aspnetcore/mvc-newtonsoft", "aspnetcore/mvc-multitenancy", "aspnetcore/signalr", "aspnetcore/serilog", "aspnetcore/swashbuckle", "aspnetcore/test-base"] },
+          { "group": "Authentication & Authorization", "pages": ["auth/overview", "auth/authorization", "auth/permissions", "auth/jwt-bearer", "auth/oauth", "auth/openid-connect", "auth/identity-model", "auth/security-and-claims", "auth/ldap", "auth/gdpr"] },
+          { "group": "Multi-Tenancy", "pages": ["multitenancy/overview", "multitenancy/tenant-resolution", "multitenancy/current-tenant", "multitenancy/connection-string-resolver", "multitenancy/aspnetcore-integration", "multitenancy/mvc-ui"] },
+          { "group": "Event Bus & Messaging", "pages": ["eventbus/overview", "eventbus/local-event-bus", "eventbus/distributed-event-bus", "eventbus/rabbitmq", "eventbus/kafka", "eventbus/azure-service-bus", "eventbus/dapr-integration", "eventbus/rebus-integration"] },
+          { "group": "Background Jobs & Workers", "pages": ["background/overview", "background/background-jobs", "background/background-workers", "background/hangfire", "background/quartz", "background/rabbitmq-jobs", "background/tickerq", "background/distributed-locking"] },
+          { "group": "Caching & Storage", "pages": ["caching/overview", "caching/distributed-cache", "caching/redis", "blob/blob-storing-overview", "blob/azure-blob", "blob/aws-s3", "blob/google-cloud-storage", "blob/aliyun-oss", "blob/bunny-cdn", "blob/minio", "blob/file-system", "blob/memory"] },
+          { "group": "Cross-Cutting Concerns", "pages": ["crosscut/auditing", "crosscut/validation", "crosscut/fluent-validation", "crosscut/features", "crosscut/global-features", "crosscut/settings", "crosscut/localization", "crosscut/multilingual-objects", "crosscut/serialization-and-json", "crosscut/guids", "crosscut/timing"] },
+          { "group": "Text Templating & Imaging", "pages": ["texttemplating/overview", "texttemplating/razor", "texttemplating/scriban", "imaging/overview", "imaging/imagesharp", "imaging/skiasharp", "imaging/magicknet"] },
+          { "group": "Communication", "pages": ["comm/emailing", "comm/mailkit", "comm/sms", "comm/sms-aliyun", "comm/sms-tencent-cloud", "comm/http-client", "comm/remote-services"] },
+          { "group": "AI & Integrations", "pages": ["ai/abstractions", "ai/implementation", "integrations/dapr", "integrations/autofac", "integrations/automapper", "integrations/mapperly", "integrations/castle-core"] },
+          { "group": "UI Stacks", "pages": ["ui/overview", "ui/navigation-menus", "ui/mvc-razor-pages", "ui/blazor-components-web", "ui/blazor-components-server", "ui/blazor-components-webassembly", "ui/blazor-maui", "ui/blazorise-ui", "ui/maui-client", "ui/minify"] },
+          { "group": "Application Modules", "pages": ["modules/overview", "modules/identity", "modules/account", "modules/openiddict", "modules/identityserver", "modules/permission-management", "modules/setting-management", "modules/feature-management", "modules/tenant-management", "modules/audit-logging", "modules/background-jobs-module", "modules/blob-storing-database", "modules/cms-kit", "modules/blogging", "modules/docs", "modules/users", "modules/virtual-file-explorer", "modules/basic-theme", "modules/client-simulation"] },
+          { "group": "Angular UI (npm/ng-packs)", "pages": ["angular/overview", "angular/core", "angular/account", "angular/identity", "angular/permission-management", "angular/setting-management", "angular/feature-management", "angular/tenant-management", "angular/cms-kit", "angular/components", "angular/oauth", "angular/schematics-and-generators", "angular/theme-basic-shared"] },
+          { "group": "CLI & Tooling", "pages": ["cli/overview", "cli/commands", "cli/project-creation", "cli/install-libs", "cli/bundle-and-build", "cli/generate-proxy", "cli/login-and-licensing", "cli/mcp-and-translate", "cli/cli-core", "tools/changelog-generator", "tools/localization-key-synchronizer"] },
+          { "group": "Solution Templates", "pages": ["templates/overview", "templates/app", "templates/app-nolayers", "templates/module", "templates/console", "templates/maui", "templates/wpf"] },
+          { "group": "Key Flows", "pages": ["flows/application-startup", "flows/module-loading-lifecycle", "flows/http-request-lifecycle", "flows/unit-of-work-flow", "flows/distributed-event-publish", "flows/background-job-execution", "flows/multi-tenant-request", "flows/authentication-flow", "flows/data-seeding-flow", "flows/dynamic-c-sharp-client-proxy"] },
+          { "group": "Build, Test & Deploy", "pages": ["ops/build-scripts", "ops/test-base", "ops/perf-and-distevents", "ops/deploy-scripts", "ops/nuget-and-packaging", "ops/npm-publish-pipeline"] }
+        ]
+      }
+    ]
   }
 }

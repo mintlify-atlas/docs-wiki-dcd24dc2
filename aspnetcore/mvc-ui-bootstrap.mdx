@@ -1,0 +1,232 @@
+---
+title: "ASP.NET Core MVC UI — Bootstrap 5 tag helper library"
+sidebarTitle: "MVC UI Bootstrap"
+description: "Volo.Abp.AspNetCore.Mvc.UI.Bootstrap tag helper catalog — alert, card, modal, tab, form, nav and the AbpTagHelper service base classes."
+---
+
+`framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/` ships a complete Bootstrap 5 component library implemented as ASP.NET Core tag helpers. Every tag helper splits into a thin descriptor class (`AbpXxxTagHelper`) and a service class (`AbpXxxTagHelperService`) that owns the markup-generation logic so it can be DI-resolved, intercepted and unit-tested. The module is `AbpAspNetCoreMvcUiBootstrapModule` and depends on `AbpAspNetCoreMvcUiModule`. It adds the assembly to the virtual file system so layouts can embed the bundled CSS/JS without any disk I/O.
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreMvcUiModule))]
+public class AbpAspNetCoreMvcUiBootstrapModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAspNetCoreMvcUiBootstrapModule>(
+                "Volo.Abp.AspNetCore.Mvc.UI.Bootstrap");
+        });
+    }
+}
+```
+
+The embedded prefix matters — the module's `wwwroot` folder is mapped under `/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/wwwroot/...` in the virtual file system, which is what bundle contributors reference.
+
+## Tag helper base classes
+
+All Bootstrap tag helpers descend from primitives in `TagHelpers/`:
+
+| Type | File | Role |
+| --- | --- | --- |
+| `AbpTagHelper<TTagHelper, TService>` | `TagHelpers/AbpTagHelper.cs` | Holds the `TService` and forwards `ProcessAsync` to it. |
+| `AbpTagHelperService<TTagHelper>` | `TagHelpers/AbpTagHelperService.cs` | Base for the markup logic; resolves `HttpContextAccessor`, `IUrlHelperFactory`, `IUrlEncoder`, etc. |
+| `IAbpTagHelperService<TTagHelper>` | `TagHelpers/IAbpTagHelperService.cs` | Marker for DI registration. |
+| `AbpTagHelperLocalizer` / `IAbpTagHelperLocalizer` | `TagHelpers/AbpTagHelperLocalizer.cs` | Resolves the `IStringLocalizer` for a tag helper's view context (used by `<abp-input asp-for>` label generation). |
+| `TagBuilderExtensions` | `TagHelpers/TagBuilderExtensions.cs` | `AddCssClass`, `RemoveCssClass`, conditional attribute helpers. |
+| `FontIconType` / `HtmlHeadingType` enums | `TagHelpers/` | Strongly typed icon and heading levels. |
+
+This split means a downstream module can `services.Replace<AbpAlertTagHelperService>` to override rendering globally — a common need when applying corporate themes.
+
+## Component catalog
+
+Each folder under `TagHelpers/` ships one or more `<abp-*>` tag helpers. The table lists the top-level helper(s); compound components include their child helpers.
+
+| Folder | Tag helpers | Key options |
+| --- | --- | --- |
+| `Alert/` | `<abp-alert>` (`AbpAlertTagHelper`), `<abp-alert-header>`, `<abp-alert-link>` | `AlertType` (`Default/Primary/Success/Info/Warning/Danger`), `Dismissible` |
+| `Badge/` | `<abp-badge>` | Color, badge style (pill / rounded), icon |
+| `Blockquote/` | `<abp-blockquote>` | Cite, footer, alignment |
+| `Border/` | `<abp-border>` | Border color/style/rounded radius |
+| `Breadcrumb/` | `<abp-breadcrumb>`, `<abp-breadcrumb-item>` | Active flag, link |
+| `Button/` | `<abp-button>` | `ButtonType`, `BusyText`, `Disabled`, `Icon`, `IconType`, `Spinner` |
+| `Card/` | `<abp-card>`, `<abp-card-header>`, `<abp-card-body>`, `<abp-card-footer>`, `<abp-card-image>`, `<abp-card-title>`, `<abp-card-text>` | Layout flavours (`Header`, `Image`, `Overlay`) |
+| `Carousel/` | `<abp-carousel>`, `<abp-carousel-item>` | Controls, indicators, interval |
+| `Collapse/` | `<abp-collapse>` | Trigger id, default state |
+| `Dropdown/` | `<abp-dropdown>`, `<abp-dropdown-button>`, `<abp-dropdown-item>`, `<abp-dropdown-divider>` | Direction (`Up`, `Start`, `End`), split, auto-close |
+| `Extensions/` | helpers consumed by other tag helpers | Internal — not directly used |
+| `Figure/` | `<abp-figure>` | Caption position, responsive image |
+| `Form/` | `<abp-input>`, `<abp-select>`, `<abp-radio-input>`, `<abp-form-content>`, `<abp-dynamicform>`, `<abp-validation-attribute>` | DataAnnotations integration; honours `[DisabledInput]`, `[ReadOnlyInput]`, `[Placeholder]`, `[InputInfoText]`, `[SelectItems]`, `[DisplayOrder]`, `[DynamicFormIgnore]`, `[FormControlSize]`, `[TextArea]` from same folder |
+| `Form/DatePicker/` | `<abp-datepicker>` | Wraps the Bootstrap datepicker plugin |
+| `Grid/` | `<abp-row>`, `<abp-column>` | Column sizes for xs/sm/md/lg/xl/xxl breakpoints |
+| `ListGroup/` | `<abp-list-group>`, `<abp-list-group-item>` | Flush, numbered, active, disabled |
+| `Modal/` | `<abp-modal>`, `<abp-modal-header>`, `<abp-modal-body>`, `<abp-modal-footer>` | `AbpModalSize` (`Default`, `Small`, `Large`, `XLarge`), `ButtonsAlign`, scrollable, centered |
+| `Nav/` | `<abp-nav>`, `<abp-nav-item>` | Pills/tabs variant, vertical |
+| `Pagination/` | `<abp-pagination>` | Bound to `IPagedResult`-style model |
+| `Popover/` | `<abp-popover>` | Trigger, content, placement |
+| `ProgressBar/` | `<abp-progressbar>` | Striped, animated, value/max |
+| `Tab/` | `<abp-tabs>`, `<abp-tab>` | Type (`Tab`, `Pill`), vertical, default active |
+| `Table/` | `<abp-table>` | Striped, bordered, hover, responsive |
+| `Tooltip/` | `<abp-tooltip>` | Trigger, placement, html |
+| `Utils/` | shared helpers | `BootstrapColor` enum, color/string converters |
+
+## Form-control attributes
+
+The attributes inside `TagHelpers/Form/` modify how the input/select tag helpers render bound model properties. They are POCO `Attribute` classes consumed reflectively by `AbpInputTagHelperService` / `AbpSelectTagHelperService` / `AbpDynamicformTagHelperService`:
+
+| Attribute | Effect on rendered control |
+| --- | --- |
+| `[DisabledInput]` | Adds `disabled` attribute. |
+| `[ReadOnlyInput]` with `AbpReadonlyInputType` | Adds `readonly` and (optionally) class to mimic disabled appearance. |
+| `[Placeholder("…")]` | Sets `placeholder` (auto-localised through `AbpTagHelperLocalizer`). |
+| `[InputInfoText("…")]` | Appends a Bootstrap `.form-text` block below the control. |
+| `[SelectItems(typeof(MyEnum))]` | Bridges enum → option list for `<abp-select>`. |
+| `[DisplayOrder(int)]` | Reorders properties inside `<abp-dynamicform>`. |
+| `[DynamicFormIgnore]` | Skips a property in `<abp-dynamicform>`. |
+| `[FormControlSize(AbpFormControlSize.Small)]` | Adds `.form-control-sm` / `-lg`. |
+| `[TextArea(Rows = 4)]` | Switches `<input>` to `<textarea>`. |
+| `AbpRadioButton` / `AbpRadioInputTagHelper` | Renders horizontal/vertical radio groups from enums. |
+
+## `<abp-modal>` example
+
+```html
+<abp-modal size="Large" centered="true" scrollable="true">
+  <abp-modal-header title="@L["EditBook"]" />
+  <abp-modal-body>
+    <form method="post">
+      <abp-input asp-for="Book.Name" />
+      <abp-input asp-for="Book.PublishDate" />
+      <abp-select asp-for="Book.Type" />
+    </form>
+  </abp-modal-body>
+  <abp-modal-footer buttons-align="Right"
+                    buttons="@(AbpModalButtons.Cancel | AbpModalButtons.Save)" />
+</abp-modal>
+```
+
+The service classes (`AbpModalTagHelperService`, `AbpModalHeaderTagHelperService`, …) translate this into Bootstrap 5 modal markup with the correct ARIA attributes and `data-bs-*` toggles. `AbpModalButtons` is a `[Flags]` enum in `Modal/AbpModalButtons.cs`.
+
+## `<abp-card>` layout flavours
+
+```html
+<abp-card flavor="Image">
+  <abp-card-image src="/img/cover.png" />
+  <abp-card-body>
+    <abp-card-title size="H5">@Model.Title</abp-card-title>
+    <abp-card-text>@Model.Summary</abp-card-text>
+    <abp-button button-type="Primary" text="@L["Read"]" />
+  </abp-card-body>
+</abp-card>
+```
+
+`AbpCardTagHelperService` inspects the `flavor` to switch between header-only, image-top, and overlay arrangements. The internal HtmlHeadingType enum (`TagHelpers/HtmlHeadingType.cs`) drives `<abp-card-title size="H5">`.
+
+## Localisation pipeline
+
+`AbpTagHelperLocalizer.GetLocalizerOrNull(...)` looks at:
+
+1. The view's `RazorPage.ViewContext.ActionContext.ActionDescriptor.ControllerTypeInfo`/`PageTypeInfo` to determine the owning module.
+2. `AbpMvcDataAnnotationsLocalizationOptions.AssemblyResources` to find the right `LocalizationResource`.
+3. Falls back to the default resource via `IStringLocalizerFactory.CreateDefaultOrNull()`.
+
+This lets `<abp-input asp-for="Book.PublishDate">` automatically pull its label, placeholder, and help text from the module's resource without any per-page configuration.
+
+## Microsoft RazorTagHelpers override
+
+`Microsoft/AspNetCore/Razor/TagHelpers/` contains a single override (`InputTagHelper` overlay) that bridges the stock `<input asp-for>` to the ABP localisation pipeline — important for plain Razor pages that don't use `<abp-input>` but still want localised validation messages.
+
+## Authoring custom tag helpers
+
+The recommended pattern is:
+
+```csharp
+public class MyAlertTagHelper : AbpTagHelper<MyAlertTagHelper, MyAlertTagHelperService>
+{
+    public string Severity { get; set; } = "info";
+
+    public MyAlertTagHelper(MyAlertTagHelperService tagHelperService)
+        : base(tagHelperService) { }
+}
+
+public class MyAlertTagHelperService : AbpTagHelperService<MyAlertTagHelper>
+{
+    public override Task ProcessAsync(TagHelperContext context, TagHelperOutput output)
+    {
+        output.TagName = "div";
+        output.Attributes.SetAttribute("class", $"alert alert-{TagHelper.Severity}");
+        return Task.CompletedTask;
+    }
+}
+```
+
+Register the service as `ITransientDependency` (the conventional registrar in `AbpAspNetCoreMvcModule` handles this automatically).
+
+## `Microsoft/AspNetCore/Razor/TagHelpers/` overrides (full list)
+
+The `Microsoft/AspNetCore/Razor/TagHelpers/` folder contains overrides that hook into stock ASP.NET Core tag helpers so plain `<input>`, `<select>` and `<form>` markup still benefits from ABP conventions (anti-forgery cookie naming, localised validation messages, nonce-aware script tags). These override types are registered via MVC's `ITagHelperComponent` infrastructure rather than as drop-in replacements — they coexist with the stock helpers.
+
+## Forms ↔ DTO attribute matrix
+
+Annotating a DTO once drives both the tag-helper rendering and the application-configuration metadata served by `/api/abp/application-configuration` (which Angular & Blazor clients consume). The matrix below shows the practical effect:
+
+| DTO annotation | `<abp-input>` rendering | Angular / Blazor client | Validation |
+| --- | --- | --- | --- |
+| `[Required]` | Adds `required` attribute + label asterisk | Form validator | Server `ModelState.IsValid == false` returns 400 with localised error. |
+| `[StringLength(N)]` | `maxlength="N"` | Char count widget | Server-side `StringLengthAttribute`. |
+| `[EmailAddress]` | `type="email"` | Email field | DataAnnotation validator. |
+| `[DataType(DataType.Password)]` | `type="password"` | Password field | — |
+| `[DataType(DataType.MultilineText)]` | `<textarea>` | Multiline | — |
+| `[Display(Name = "Foo")]` | Label override | Field label | — |
+| `[ReadOnlyInput]` | `readonly` | Read-only field | Bypasses model binding for the property. |
+| `[DisabledInput]` | `disabled` | Disabled field | — |
+| `[Placeholder("...")]` | `placeholder=` (localised) | Placeholder | — |
+| `[InputInfoText("...")]` | `.form-text` block | Help text | — |
+| `[SelectItems(typeof(Enum))]` | `<select>` from enum | Dropdown | Restricts to enum values. |
+| `[TextArea(Rows = N)]` | `<textarea rows="N">` | Multiline | — |
+| `[FormControlSize(AbpFormControlSize.Small/Large)]` | `.form-control-sm/-lg` | Visual size | — |
+| `[DynamicFormIgnore]` | Skipped by `<abp-dynamicform>` | Skipped | — |
+| `[DisplayOrder(N)]` | Reorders fields | Reorders fields | — |
+
+## TagHelper service replacement examples
+
+To re-style every modal globally:
+
+```csharp
+public class CompanyModalTagHelperService : AbpModalTagHelperService
+{
+    public CompanyModalTagHelperService(HtmlEncoder htmlEncoder, IUrlHelperFactory urlHelperFactory)
+        : base(htmlEncoder, urlHelperFactory) { }
+
+    public override Task ProcessAsync(TagHelperContext context, TagHelperOutput output)
+    {
+        // Add company branding class
+        output.Attributes.SetAttribute("data-company-modal", "true");
+        return base.ProcessAsync(context, output);
+    }
+}
+
+// In the company-theme module:
+context.Services.Replace(
+    ServiceDescriptor.Transient<AbpModalTagHelperService, CompanyModalTagHelperService>());
+```
+
+The split between tag-helper descriptor and service makes that replacement clean: nothing else changes.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="UI bundling" href="/aspnetcore/mvc-ui-bundling">
+    `BootstrapStyleContributor` / `BootstrapScriptContributor` ship Bootstrap 5 assets.
+  </Card>
+  <Card title="UI themes" href="/aspnetcore/mvc-ui-themes">
+    Themes that pick up these tag helpers via layout selection.
+  </Card>
+  <Card title="UI widgets" href="/aspnetcore/mvc-ui-widgets">
+    `WidgetAttribute` for re-usable composite components.
+  </Card>
+  <Card title="Razor pages" href="/ui/mvc-razor-pages">
+    Razor Pages base classes that integrate with these helpers.
+  </Card>
+</CardGroup>

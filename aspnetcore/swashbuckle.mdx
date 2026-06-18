@@ -1,0 +1,292 @@
+---
+title: "Swashbuckle integration — OpenAPI for ABP services"
+sidebarTitle: "Swashbuckle"
+description: "AddAbpSwaggerGen, OAuth/OIDC helpers, document and schema filters and Swagger UI wiring that align Swashbuckle with ABP conventional controllers."
+---
+
+`framework/src/Volo.Abp.Swashbuckle/` is ABP's adapter over [Swashbuckle.AspNetCore](https://github.com/domaindrivendev/Swashbuckle.AspNetCore). It ships three things: extension methods (`AddAbpSwaggerGen`, `AddAbpSwaggerGenWithOAuth`, `AddAbpSwaggerGenWithOidc`) that pre-configure schema mapping for ABP types (`IRemoteStreamContent`) and (optionally) install OAuth2/OIDC security definitions; filters (`AbpSwashbuckleDocumentFilter`, `AbpSwashbuckleEnumSchemaFilter`) that trim noise out of the generated OpenAPI document; and a UI extension (`UseAbpSwaggerUI`) that injects ABP's CSRF-aware Swagger UI customisation script. Together they make the Swagger UI work cleanly with conventional controllers generated from `IApplicationService` interfaces, OpenIddict-based auth, and anti-forgery-protected endpoints.
+
+## Module
+
+`Volo/Abp/Swashbuckle/AbpSwashbuckleModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpAspNetCoreMvcModule))]
+public class AbpSwashbuckleModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpSwashbuckleModule>();
+        });
+    }
+}
+```
+
+The virtual file system entry exposes the assembly's `wwwroot/ui/abp.js` and `wwwroot/ui/abp.swagger.js` files — the JS shims injected into Swagger UI's `index.html`.
+
+## Top-level service-collection extensions
+
+`Microsoft/Extensions/DependencyInjection/AbpSwaggerGenServiceCollectionExtensions.cs`:
+
+### `AddAbpSwaggerGen`
+
+```csharp
+public static IServiceCollection AddAbpSwaggerGen(
+    this IServiceCollection services,
+    Action<SwaggerGenOptions>? setupAction = null)
+{
+    return services.AddSwaggerGen(options =>
+    {
+        Func<OpenApiSchema> remoteStreamContentSchemaFactory = () => new OpenApiSchema()
+        {
+            Type = JsonSchemaType.String,
+            Format = "binary"
+        };
+
+        options.MapType<RemoteStreamContent>(remoteStreamContentSchemaFactory);
+        options.MapType<IRemoteStreamContent>(remoteStreamContentSchemaFactory);
+
+        setupAction?.Invoke(options);
+    });
+}
+```
+
+The two `MapType` calls teach Swashbuckle that ABP's `IRemoteStreamContent` / `RemoteStreamContent` map to OpenAPI `string`+`format: binary` — i.e. a file. Without these, the swagger document would render the type as a complex object with no useful body schema, and "Try it out" wouldn't produce a file upload widget.
+
+### `AddAbpSwaggerGenWithOAuth`
+
+Adds an OAuth2 security definition + global requirement on top of `AddAbpSwaggerGen`:
+
+```csharp
+public static IServiceCollection AddAbpSwaggerGenWithOAuth(
+    this IServiceCollection services,
+    string authority,
+    Dictionary<string, string> scopes,
+    Action<SwaggerGenOptions>? setupAction = null,
+    string authorizationEndpoint = "/connect/authorize",
+    string tokenEndpoint = "/connect/token")
+```
+
+Default endpoints align with OpenIddict (`/connect/authorize`, `/connect/token`). The method:
+
+1. Builds `authorizationUrl` and `tokenUrl` from `authority`.
+2. Calls `AddAbpSwaggerGen()` for the file-stream mapping.
+3. Adds an `oauth2` security definition with `AuthorizationCode` flow.
+4. Adds a global security requirement so every operation prompts for an OAuth token.
+
+### `AddAbpSwaggerGenWithOidc`
+
+Adds an OpenID Connect security definition (preferred for new apps). Accepts `flows` array (`AbpSwaggerOidcFlows` constants), `scopes`, and an optional `discoveryEndpoint`. The method also writes three custom values into `SwaggerUIOptions.ConfigObject.AdditionalItems` (`oidcSupportedFlows`, `oidcSupportedScopes`, `oidcDiscoveryEndpoint`) which the injected `abp.swagger.js` reads to drive the auth modal.
+
+```csharp
+services.AddAbpSwaggerGenWithOidc(
+    authority: "https://localhost:44322",
+    scopes: new[] { "MyApp" },
+    flows: new[] { AbpSwaggerOidcFlows.AuthorizationCode },
+    discoveryEndpoint: "https://localhost:44322"
+);
+```
+
+`AbpSwaggerOidcFlows` (`Volo/Abp/Swashbuckle/AbpSwaggerOidcFlows.cs`):
+
+| Constant | Value |
+| --- | --- |
+| `AuthorizationCode` | `"authorization_code"` |
+| `Implicit` | `"implicit"` |
+| `Password` | `"password"` |
+| `ClientCredentials` | `"client_credentials"` |
+
+`AddAbpSwaggerGenWithOidc.RemoveTenantPlaceholders` strips `{tenant}.` / `{0}.` / `{tenantName}.` placeholders from the discovery URL so multi-tenant hosts using `MultiTenantUrlProvider` still produce a valid public discovery endpoint for Swagger UI.
+
+## Document filter — pruning the document
+
+`Volo/Abp/Swashbuckle/AbpSwashbuckleDocumentFilter.cs` removes paths/tags that originate from ABP framework controllers (areas like `Abp/*`), giving consumers a document scoped to *application* APIs:
+
+- `ActionUrlPrefixes` defaults to `["Volo."]` — paths whose backing controller's `DisplayName` does not contain a `Volo.` prefix are kept; everything else (the framework-internal endpoints) is pruned. `DisplayName` looks like `Volo.Abp.AspNetCore.Mvc.ApplicationConfigurations.AbpApplicationConfigurationController.GetAsync (Volo.Abp.AspNetCore.Mvc.Contracts)` — i.e. starts with `Volo.`.
+- The filter normalises route templates by stripping route constraints (`:regex(...)`, `:int`, …) so the remaining path keys cleanly map to OpenAPI paths.
+- It also trims orphan tags from `swaggerDoc.Tags`.
+
+Enable via `HideAbpEndpoints()`:
+
+```csharp
+services.AddAbpSwaggerGen(options =>
+{
+    options.HideAbpEndpoints();         // adds AbpSwashbuckleDocumentFilter
+    options.CustomAbpSchemaIds();       // see below
+    options.UserFriendlyEnums();        // adds AbpSwashbuckleEnumSchemaFilter
+});
+```
+
+## Schema filter — enums
+
+`Volo/Abp/Swashbuckle/AbpSwashbuckleEnumSchemaFilter.cs`:
+
+```csharp
+public void Apply(IOpenApiSchema schema, SchemaFilterContext context)
+{
+    if (schema is OpenApiSchema openApiScheme && context.Type.IsEnum)
+    {
+        openApiScheme.Enum?.Clear();
+        openApiScheme.Type = JsonSchemaType.String;
+        openApiScheme.Format = null;
+        foreach (var name in Enum.GetNames(context.Type))
+            openApiScheme.Enum?.Add(JsonNode.Parse($"\"{name}\"")!);
+    }
+}
+```
+
+Replaces numeric enum representations with their string names — what most generated clients want for readability.
+
+## Schema id customisation
+
+`AbpSwaggerGenOptionsExtensions.CustomAbpSchemaIds`:
+
+```csharp
+public static void CustomAbpSchemaIds(this SwaggerGenOptions options)
+{
+    string SchemaIdSelector(Type modelType)
+    {
+        if (!modelType.IsConstructedGenericType)
+            return modelType.FullName!.Replace("[]", "Array");
+
+        var prefix = modelType.GetGenericArguments()
+            .Select(SchemaIdSelector)
+            .Aggregate((p, c) => p + c);
+
+        return modelType.FullName!.Split('`').First() + "Of" + prefix;
+    }
+    options.CustomSchemaIds(SchemaIdSelector);
+}
+```
+
+Solves the common clash where two modules expose a `PagedResultDto<TDto>` — each gets a fully-qualified schema id like `Volo.Abp.Application.Dtos.PagedResultDtoOfMyAppBookDto`.
+
+## Other extension methods
+
+| Method | File | Effect |
+| --- | --- | --- |
+| `HideAbpEndpoints` | `AbpSwaggerGenOptionsExtensions.cs` | Add `AbpSwashbuckleDocumentFilter`. |
+| `UserFriendlyEnums` | same | Add `AbpSwashbuckleEnumSchemaFilter`. |
+| `CustomAbpSchemaIds` | same | Schema-id strategy above. |
+| `AbpAppPath(SwaggerUIOptions, string appPath)` | `AbpSwaggerUIOptionsExtensions.cs` | Injects `<script>` into Swagger UI head that sets `abp.appPath` — needed for the CSRF cookie endpoint when Swagger UI runs under a sub-path. |
+
+## Swagger UI integration
+
+`Microsoft/AspNetCore/Builder/AbpSwaggerUIBuilderExtensions.cs`:
+
+```csharp
+public static IApplicationBuilder UseAbpSwaggerUI(
+    this IApplicationBuilder app,
+    Action<SwaggerUIOptions>? setupAction = null)
+{
+    var resolver = app.ApplicationServices.GetService<ISwaggerHtmlResolver>();
+    return app.UseSwaggerUI(options =>
+    {
+        options.InjectJavascript("ui/abp.js");
+        options.IndexStream = () => resolver?.Resolver();
+        setupAction?.Invoke(options);
+    });
+}
+```
+
+`SwaggerHtmlResolver` (`Volo/Abp/Swashbuckle/SwaggerHtmlResolver.cs`) reads the stock Swashbuckle `index.html` from its embedded resources and rewrites it to also `<script src="ui/abp.swagger.js">`. That second script is what triggers the auth modal helpers (especially for OIDC) and fetches an anti-forgery cookie before any `POST` "Try it out" request.
+
+### `AbpSwashbuckleController`
+
+`Volo/Abp/Swashbuckle/AbpSwashbuckleController.cs`:
+
+```csharp
+[Area("Abp"), Route("Abp/Swashbuckle/[action]"), DisableAuditing, RemoteService(false),
+ ApiExplorerSettings(IgnoreApi = true)]
+public class AbpSwashbuckleController : AbpController
+{
+    [HttpGet]
+    public virtual void SetCsrfCookie() => AntiForgeryManager.SetCookie();
+}
+```
+
+`/Abp/Swashbuckle/SetCsrfCookie` is hit by `abp.swagger.js` at page load to issue a `XSRF-TOKEN` cookie, after which the `Try it out` requests carry the matching `RequestVerificationToken` header. Without this, `AbpAutoValidateAntiforgeryTokenAttribute` rejects every state-changing call from Swagger UI.
+
+## Canonical wiring
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    var configuration = context.Services.GetConfiguration();
+    var hostingEnvironment = context.Services.GetHostingEnvironment();
+
+    context.Services.AddAbpSwaggerGenWithOidc(
+        configuration["AuthServer:Authority"]!,
+        scopes: new[] { "MyApp" },
+        flows: new[] { AbpSwaggerOidcFlows.AuthorizationCode },
+        discoveryEndpoint: configuration["AuthServer:MetadataAddress"],
+        setupAction: options =>
+        {
+            options.SwaggerDoc("v1", new OpenApiInfo { Title = "MyApp API", Version = "v1" });
+            options.DocInclusionPredicate((docName, description) => true);
+            options.HideAbpEndpoints();
+            options.UserFriendlyEnums();
+            options.CustomAbpSchemaIds();
+        });
+}
+
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+    app.UseSwagger();
+    app.UseAbpSwaggerUI(options =>
+    {
+        options.SwaggerEndpoint("/swagger/v1/swagger.json", "MyApp API");
+        options.OAuthClientId("MyApp_Swagger");
+        options.OAuthScopes("MyApp");
+    });
+}
+```
+
+## How conventional controllers appear
+
+`AbpAspNetCoreMvcModule.AbpServiceConvention` rewrites the controller name (`BookAppService` → `Book`) and applies HTTP verbs by method-name prefix. Without `AbpSwashbuckleDocumentFilter`, the document would include:
+
+- Every framework controller under `Abp/` area (`AbpApplicationConfiguration`, `AbpLanguages`, `AbpServiceProxyScript`, …).
+- The auto-mounted SignalR negotiate endpoint.
+- Health-check endpoints.
+
+With `HideAbpEndpoints()` the document scopes itself to controllers whose backing type lives outside the `Volo.*` namespace tree — exactly the application's own services.
+
+## Multi-version APIs
+
+`AbpAspNetCoreMvcModule` already ships `AbpApiVersioningAbstractionsModule`. Combine with `AddSwaggerGen` document-per-version:
+
+```csharp
+options.SwaggerDoc("v1", new OpenApiInfo { Title = "MyApp v1", Version = "v1" });
+options.SwaggerDoc("v2", new OpenApiInfo { Title = "MyApp v2", Version = "v2" });
+options.DocInclusionPredicate((docName, apiDesc) =>
+{
+    var versions = apiDesc.ActionDescriptor.GetApiVersionModel()?.SupportedApiVersions
+                                ?? new List<ApiVersion>();
+    return versions.Any(v => $"v{v.MajorVersion}" == docName);
+});
+```
+
+`AbpServiceConvention` honours `ConventionalControllerSetting.ApiVersions` and produces version-aware routes.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="MVC integration" href="/aspnetcore/mvc-integration">
+    `AbpServiceConvention` produces the routes documented here.
+  </Card>
+  <Card title="Authorization" href="/auth/authorization">
+    Policies enforced on `Authorize`-annotated endpoints.
+  </Card>
+  <Card title="OAuth" href="/auth/oauth">
+    OAuth flows referenced by `AddAbpSwaggerGenWithOAuth`.
+  </Card>
+  <Card title="OpenID Connect" href="/auth/openid-connect">
+    OIDC variant used by modern templates.
+  </Card>
+</CardGroup>

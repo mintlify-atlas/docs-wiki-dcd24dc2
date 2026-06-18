@@ -1,0 +1,176 @@
+---
+title: "Multi-lingual objects (Volo.Abp.MultiLingualObjects)"
+description: "Entity translation pattern with IMultiLingualObject<T>, IObjectTranslation, and the culture-fallback resolver in MultiLingualObjectManager."
+---
+
+`Volo.Abp.MultiLingualObjects` is a tiny but opinionated helper for the *row-translation* pattern: each aggregate root has a child collection of translation entities, one per culture, and `MultiLingualObjectManager` picks the right translation for the current `CultureInfo.CurrentUICulture` with a configurable fallback chain that ends at `Abp.Localization.DefaultLanguage`. It is intentionally separate from `Volo.Abp.Localization` — that subsystem localizes *strings*, this one localizes *data*.
+
+Source: `framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/`.
+
+## Module
+
+`AbpMultiLingualObjectsModule` depends on `AbpLocalizationModule`. It contains no `ConfigureServices` override — services register through `ITransientDependency`.
+
+## The model
+
+### `IObjectTranslation`
+
+```csharp
+public interface IObjectTranslation
+{
+    string Language { get; set; }
+}
+```
+
+Implement it on the translation entity. `Language` should be a culture name (e.g. `"en"`, `"tr-TR"`).
+
+### `IMultiLingualObject<TTranslation>`
+
+```csharp
+public interface IMultiLingualObject<TTranslation>
+    where TTranslation : class, IObjectTranslation
+{
+    ICollection<TTranslation> Translations { get; set; }
+}
+```
+
+Implement it on the aggregate root.
+
+### Canonical shape
+
+```csharp
+public class Book : AggregateRoot<Guid>, IMultiLingualObject<BookTranslation>
+{
+    public string AuthorName { get; set; }
+    public DateTime PublishDate { get; set; }
+    public ICollection<BookTranslation> Translations { get; set; }
+}
+
+public class BookTranslation : Entity, IObjectTranslation
+{
+    public string Language { get; set; }
+    public string Title { get; set; }
+    public string Description { get; set; }
+}
+```
+
+The framework does not require a particular base class for either side — just the two interfaces. In EF Core configure `BookTranslation` as an owned collection with `(BookId, Language)` as the key.
+
+## `IMultiLingualObjectManager`
+
+```csharp
+public interface IMultiLingualObjectManager
+{
+    Task<TTranslation?> GetTranslationAsync<TMultiLingual, TTranslation>(
+        TMultiLingual multiLingual,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TMultiLingual : IMultiLingualObject<TTranslation>
+        where TTranslation : class, IObjectTranslation;
+
+    Task<TTranslation?> GetTranslationAsync<TTranslation>(
+        IEnumerable<TTranslation> translations,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TTranslation : class, IObjectTranslation;
+
+    Task<List<TTranslation?>> GetBulkTranslationsAsync<TTranslation>(
+        IEnumerable<IEnumerable<TTranslation>> translationsCombined,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TTranslation : class, IObjectTranslation;
+
+    Task<List<(TMultiLingual entity, TTranslation? translation)>> GetBulkTranslationsAsync<TMultiLingual, TTranslation>(
+        IEnumerable<TMultiLingual> multiLinguals,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TMultiLingual : IMultiLingualObject<TTranslation>
+        where TTranslation : class, IObjectTranslation;
+}
+```
+
+`MultiLingualObjectManager : ITransientDependency` is the only implementation.
+
+### Resolution algorithm (single object)
+
+For one translation collection and a target `culture` (defaults to `CultureInfo.CurrentUICulture.Name`):
+
+1. Exact match on `Language == culture`.
+2. If `fallbackToParentCultures`, walk the `CultureInfo.CurrentUICulture.Parent` chain up to depth `MaxCultureFallbackDepth = 5`, matching case-insensitively on `culture.Name`. (Note: the parent walk uses `CurrentUICulture.Parent`, not `targetCulture.Parent` — the assumption is that the requested culture and the current UI culture are the same; pass `culture = currentUiCulture.Name` to keep them aligned when calling from a non-request context.)
+3. If still null, read `Abp.Localization.DefaultLanguage` from `ISettingProvider` and try `Language == defaultLanguage`.
+4. As a last resort return the first translation in the collection (whichever order EF Core gave you).
+5. If the collection is empty or null, return `null`.
+
+### Bulk paths
+
+`GetBulkTranslationsAsync` is a single-`ISettingProvider`-call optimization: it processes each entity's translations independently, only fetches `Abp.Localization.DefaultLanguage` *once* and only if some entity needed the default-language fallback. The overload that takes `IEnumerable<TMultiLingual>` wraps each entity together with its resolved translation in a `(entity, translation)` tuple, preserving the input order.
+
+## Typical use in an application service
+
+```csharp
+public class BookAppService : ApplicationService
+{
+    private readonly IRepository<Book, Guid> _repo;
+    private readonly IMultiLingualObjectManager _mlom;
+
+    public BookAppService(IRepository<Book, Guid> repo, IMultiLingualObjectManager mlom)
+    {
+        _repo = repo;
+        _mlom = mlom;
+    }
+
+    public async Task<BookDto> GetAsync(Guid id)
+    {
+        var book = await _repo.GetAsync(id, includeDetails: true);
+        var t = await _mlom.GetTranslationAsync<Book, BookTranslation>(book);
+
+        return new BookDto
+        {
+            Id = book.Id,
+            AuthorName = book.AuthorName,
+            Title = t?.Title,
+            Description = t?.Description
+        };
+    }
+
+    public async Task<List<BookDto>> ListAsync()
+    {
+        var books = await _repo.GetListAsync(includeDetails: true);
+        var pairs = await _mlom.GetBulkTranslationsAsync<Book, BookTranslation>(books);
+
+        return pairs.Select(p => new BookDto
+        {
+            Id = p.entity.Id,
+            AuthorName = p.entity.AuthorName,
+            Title = p.translation?.Title,
+            Description = p.translation?.Description
+        }).ToList();
+    }
+}
+```
+
+`includeDetails: true` is critical — without it, `Translations` is not loaded and the resolver returns `null`.
+
+## File-by-file enumeration
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpMultiLingualObjectsModule.cs` | module | Depends on `AbpLocalizationModule`. |
+| `IObjectTranslation.cs` | interface | `string Language { get; set; }` — the only requirement for a translation entity. |
+| `IMultiLingualObject.cs` | interface | `ICollection<TTranslation> Translations { get; set; }`. |
+| `IMultiLingualObjectManager.cs` | service contract | Single + bulk getters. |
+| `MultiLingualObjectManager.cs` | `ITransientDependency` | The resolver. Holds `ISettingProvider` to read the default language; constant `MaxCultureFallbackDepth = 5`; private `GetTranslationBasedOnCulturalRecursive` walks `culture.Parent` until depth or `culture.Name` becomes blank. |
+
+## What this module does *not* do
+
+- **Persist translations.** That's plain EF Core / MongoDB mapping in your domain.
+- **Manage the supported cultures.** The set of allowed languages is `AbpLocalizationOptions.Languages`; this resolver does not consult it.
+- **Translate strings.** That's `IStringLocalizer` / `IStringLocalizerFactory`. Use that for resource keys, this one for row data.
+- **Cache the per-request lookup.** Each call re-reads `Abp.Localization.DefaultLanguage` through `ISettingProvider`; the bulk overloads batch that call into one.
+
+## Related
+
+- `/crosscut/localization` — string localization (the *other* axis).
+- `/ddd/entities-and-aggregates` — how translation child collections are usually modeled.
+- `/data/entity-framework-core` — owned-collection mappings.
+- `/crosscut/settings` — `Abp.Localization.DefaultLanguage` is read from settings.

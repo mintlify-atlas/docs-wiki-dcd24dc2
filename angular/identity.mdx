@@ -1,0 +1,240 @@
+---
+title: "Identity UI: @abp/ng.identity Users and Roles"
+sidebarTitle: "Identity"
+description: "Routes, components, services, and generated proxies inside @abp/ng.identity for managing users, roles, claims, and permissions."
+---
+
+`@abp/ng.identity` is the Angular UI for the [Identity backend module](/modules/identity). It exposes two routed pages — Users and Roles — both built around the extensible table/form primitives from `@abp/ng.components`, and it consumes the proxy services in `@abp/ng.identity/proxy` that wrap the `Volo.Abp.Identity.HttpApi` endpoints. The package depends on `@abp/ng.components`, `@abp/ng.permission-management`, and `@abp/ng.theme.shared`.
+
+Sources in this page reference paths under [`npm/ng-packs/packages/identity/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/identity).
+
+## Package metadata
+
+| Field | Value |
+| --- | --- |
+| NPM name | `@abp/ng.identity` |
+| Secondary entry point | `@abp/ng.identity/proxy` |
+| Source | `packages/identity/src/lib/` |
+| Proxy source | `packages/identity/proxy/src/lib/proxy/` |
+| Module class | `IdentityModule` |
+| Routes factory | `createRoutes(options: IdentityConfigOptions)` |
+| Providers factory | `provideIdentity(options: IdentityConfigOptions)` |
+
+## Lazy-load configuration
+
+```typescript
+// app.routes.ts (consumer)
+export const APP_ROUTES: Routes = [
+  {
+    path: 'identity',
+    loadChildren: () =>
+      import('@abp/ng.identity').then(m =>
+        m.createRoutes({
+          entityActionContributors: { /* … */ },
+          toolbarActionContributors: { /* … */ },
+        }),
+      ),
+  },
+];
+```
+
+`createRoutes` (in `packages/identity/src/lib/identity.routes.ts`) produces:
+
+| Path | Component slot | Required policy | Title |
+| --- | --- | --- | --- |
+| `''` → `roles` | redirect | — | — |
+| `roles` | `eIdentityComponents.Roles` → `RolesComponent` | `AbpIdentity.Roles` | `AbpIdentity::Roles` |
+| `users` | `eIdentityComponents.Users` → `UsersComponent` | `AbpIdentity.Users` | `AbpIdentity::Users` |
+
+The top-level route guards are `[authGuard, permissionGuard]` and the resolver is `identityExtensionsResolver`.
+
+## Component anatomy
+
+### `UsersComponent`
+
+`packages/identity/src/lib/components/users/users.component.ts` is built around the framework primitives:
+
+| Imported primitive | Used for |
+| --- | --- |
+| `ListService<T>` (`@abp/ng.core`) | Paged-list state for the user table |
+| `ExtensibleTableComponent` (`@abp/ng.components/extensible`) | Renders columns from `EXTENSIONS_IDENTIFIER` |
+| `ExtensibleFormComponent` | Renders create/edit forms from the same identifier |
+| `ModalComponent` (`@abp/ng.theme.shared`) | Hosts the create/edit/permissions/claims drawers |
+| `PermissionManagementComponent` (`@abp/ng.permission-management`) | The permissions grid opened from the row action |
+| `ConfirmationService`, `ToasterService` (`@abp/ng.theme.shared`) | Delete confirmation + success toasts |
+| `IdentityUserService` (`@abp/ng.identity/proxy`) | CRUD calls (`get`, `getList`, `create`, `update`, `delete`, `updateRoles`, …) |
+| `IdentityRoleDto`, `IdentityUserDto`, `GetIdentityUsersInput` | Strongly-typed DTOs |
+
+The row context-menu pattern is the same in every ABP module: define a `<ng-template let-data #actionsTemplate>` filled with `<button>`s, then declare `<abp-extensible-table #table [data]="..." [actionsTemplate]="actionsTemplate">`.
+
+### `RolesComponent`
+
+`packages/identity/src/lib/components/roles/roles.component.ts` mirrors `UsersComponent` but with `IdentityRoleService` and the role-specific extension identifier. Each row exposes:
+
+- *Edit* — opens the extensible form modal.
+- *Permissions* — opens `PermissionManagementComponent` with `providerName: 'R'`, `providerKey: role.name`.
+- *Delete* — confirmation + `delete(id)`.
+
+## Generated proxies
+
+`packages/identity/proxy/src/lib/proxy/`:
+
+```
+identity/
+├── identity-role.service.ts        # IdentityRoleService (CRUD, getAllList)
+├── identity-user-lookup.service.ts # IdentityUserLookupService (find by id/username)
+├── identity-user.service.ts        # IdentityUserService (CRUD, updateRoles, getRoles, lockUser, …)
+├── models.ts                       # DTOs: IdentityRoleDto, IdentityUserDto, GetIdentityUsersInput, IdentityUserCreateDto, IdentityUserUpdateDto, IdentityRoleCreateDto, IdentityUserClaimDto, …
+└── index.ts
+users/
+├── models.ts                       # Lookup DTOs (UserData, UserLookupRequestInput)
+└── index.ts
+```
+
+These map one-to-one onto the C# application-service surface in `Volo.Abp.Identity.IIdentityUserAppService` / `IIdentityRoleAppService`. The same `/api/identity/users` endpoints are also surfaced by the [Identity module backend](/modules/identity) and by the C# client proxies in [`/aspnetcore/mvc-client-proxies`](/aspnetcore/mvc-client-proxies).
+
+```typescript
+// IdentityUserService excerpt (real signatures from proxy/identity/identity-user.service.ts)
+@Injectable({ providedIn: 'root' })
+export class IdentityUserService {
+  apiName = 'AbpIdentity';
+  protected restService = inject(RestService);
+
+  create = (input: IdentityUserCreateDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, IdentityUserDto>({
+      method: 'POST', url: '/api/identity/users', body: input,
+    }, config, this.apiName);
+
+  getList = (input: GetIdentityUsersInput, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, PagedResultDto<IdentityUserDto>>({
+      method: 'GET', url: '/api/identity/users', params: input,
+    }, config, this.apiName);
+
+  updateRoles = (id: string, input: IdentityUserUpdateRolesDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, void>({
+      method: 'PUT', url: `/api/identity/users/${id}/roles`, body: input,
+    }, config, this.apiName);
+}
+```
+
+## Extension contributors
+
+`IdentityConfigOptions` accepts five contributor maps (one per extension surface):
+
+```typescript
+export interface IdentityConfigOptions {
+  entityActionContributors?: EntityActionContributors;
+  toolbarActionContributors?: ToolbarActionContributors;
+  entityPropContributors?: EntityPropContributors;
+  createFormPropContributors?: CreateFormPropContributors;
+  editFormPropContributors?: EditFormPropContributors;
+}
+```
+
+`provideIdentity(options)` wires each into a DI token (`IDENTITY_ENTITY_ACTION_CONTRIBUTORS`, etc.), which `identityExtensionsResolver` reads before activating the route. Identifiers live in `packages/identity/src/lib/enums/`:
+
+| Enum | Values |
+| --- | --- |
+| `eIdentityComponents` | `Users`, `Roles` |
+| `IdentityActions` | Row action keys (`Edit`, `Permissions`, `ManageClaims`, `Lock`, `Unlock`, …) |
+| `IdentityPropName` | Stable column keys (`userName`, `email`, `name`, …) |
+
+Sample contributor (add a custom toolbar button):
+
+```typescript
+import {
+  ToolbarAction,
+  ToolbarActionContributors,
+} from '@abp/ng.components/extensible';
+import { eIdentityComponents } from '@abp/ng.identity';
+
+const exportUsers = new ToolbarAction({
+  text: 'AbpIdentity::Export',
+  action: data => downloadCsv(data),
+});
+
+const toolbarActionContributors: ToolbarActionContributors = {
+  [eIdentityComponents.Users]: [actionList => actionList.addTail(exportUsers)],
+};
+```
+
+## Tokens, resolvers, guards
+
+| Symbol | File | Purpose |
+| --- | --- | --- |
+| `IDENTITY_ENTITY_ACTION_CONTRIBUTORS` | `tokens/extensions.token.ts` | Row-action contributors per page key |
+| `IDENTITY_TOOLBAR_ACTION_CONTRIBUTORS` | same | Toolbar buttons |
+| `IDENTITY_ENTITY_PROP_CONTRIBUTORS` | same | Table columns |
+| `IDENTITY_CREATE_FORM_PROP_CONTRIBUTORS` | same | Create form fields |
+| `IDENTITY_EDIT_FORM_PROP_CONTRIBUTORS` | same | Edit form fields |
+| `identityExtensionsResolver` | `resolvers/identity-extensions.resolver.ts` | Calls `ExtensionsService.applyExtensions` before activation |
+| `IdentityExtensionsGuard` | `guards/extensions.guard.ts` | Legacy class form of the resolver |
+
+## Defaults
+
+`packages/identity/src/lib/defaults/` holds the default `EntityProp`, `FormProp`, and `EntityAction` lists. They are loaded by `ExtensionsService` and merged with the contributor output, then exposed on the route's `data` object so `ExtensibleTableComponent` / `ExtensibleFormComponent` can read them via `EXTENSIONS_IDENTIFIER`.
+
+## DTOs cheat-sheet
+
+`packages/identity/proxy/src/lib/proxy/identity/models.ts` defines the wire types:
+
+| DTO | Used for |
+| --- | --- |
+| `IdentityUserDto` | Row record (id, userName, name, surname, email, phoneNumber, lockoutEnabled, …) |
+| `IdentityUserCreateDto` | POST body for *Create user* |
+| `IdentityUserUpdateDto` | PUT body for *Update user* |
+| `IdentityUserUpdateRolesDto` | `{ roleNames: string[] }` body for *Update roles* |
+| `IdentityRoleDto` | Role row record |
+| `IdentityRoleCreateDto` / `IdentityRoleUpdateDto` | Bodies for Create/Update role |
+| `IdentityUserClaimDto` | Claim row for the *Manage Claims* modal |
+| `GetIdentityUsersInput` / `GetIdentityRolesInput` | Query parameters: `filter`, `skipCount`, `maxResultCount`, `sorting`, `roleId` |
+
+The `IdentityUserLookupService` exposes a smaller `UserData` model used by row pickers in other modules (e.g. Audit Logging).
+
+## Component substitution
+
+```typescript
+// Replace the bundled UsersComponent
+import { provideAppInitializer, inject } from '@angular/core';
+import { ReplaceableComponentsService } from '@abp/ng.core';
+import { eIdentityComponents } from '@abp/ng.identity';
+import { MyUsersComponent } from './my-users.component';
+
+provideAppInitializer(() => {
+  inject(ReplaceableComponentsService).add({
+    key: eIdentityComponents.Users,
+    component: MyUsersComponent,
+  });
+});
+```
+
+`ReplaceableRouteContainerComponent` (declared in the `users` route's `data.replaceableComponent`) will render `MyUsersComponent` for `/identity/users` from then on. Combine with `provideIdentity({ entityPropContributors })` if you only need to alter columns — the full component swap is for genuinely different UX.
+
+## Tokens reference
+
+| Token | File | Purpose |
+| --- | --- | --- |
+| `IDENTITY_ENTITY_ACTION_CONTRIBUTORS` | `tokens/extensions.token.ts` | Per-page row-action contributors |
+| `IDENTITY_TOOLBAR_ACTION_CONTRIBUTORS` | same | Per-page toolbar contributors |
+| `IDENTITY_ENTITY_PROP_CONTRIBUTORS` | same | Column contributors |
+| `IDENTITY_CREATE_FORM_PROP_CONTRIBUTORS` | same | Create-form field contributors |
+| `IDENTITY_EDIT_FORM_PROP_CONTRIBUTORS` | same | Edit-form field contributors |
+
+`provideIdentity(options)` writes the option fields into the matching tokens. `identityExtensionsResolver` reads them at route activation, merges with the defaults under `defaults/`, and exposes the merged `PropList`s on `route.snapshot.data['extensions']` — the contract that `ExtensibleTableComponent` and `ExtensibleFormComponent` consume.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Permission grid" href="/angular/permission-management">
+    The Permissions row-action opens `PermissionManagementComponent`.
+  </Card>
+  <Card title="Extensible primitives" href="/angular/components">
+    `ExtensibleTableComponent` / `ExtensibleFormComponent` and the `EntityProp` / `FormProp` model.
+  </Card>
+  <Card title="Identity backend" href="/modules/identity">
+    The application services behind `IdentityUserService` / `IdentityRoleService`.
+  </Card>
+  <Card title="Proxy generation" href="/aspnetcore/mvc-client-proxies">
+    Same `/api/abp/api-definition` source drives the C# and TypeScript proxies.
+  </Card>
+</CardGroup>

@@ -1,0 +1,253 @@
+---
+title: "Setting Management UI: Tabs, Email, Time Zone Editors"
+sidebarTitle: "Setting Management"
+description: "Inside @abp/ng.setting-management: the tab host page, default Email and Time Zone tabs, SettingTabsService, and contributor APIs."
+---
+
+`@abp/ng.setting-management` is the Angular UI for the Setting Management module. It renders a single `/setting-management` page that displays settings grouped into tabs (Email, Time Zone, and any application-contributed tab). The package is designed as a pure host — backend modules ship the actual editors, and the host hooks them in through `SettingTabsService.add(...)`. Sources: [`npm/ng-packs/packages/setting-management/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/setting-management).
+
+## Package layout
+
+The package ships three secondary entry points:
+
+| Entry point | Source | Purpose |
+| --- | --- | --- |
+| `@abp/ng.setting-management` | `src/lib/` | Routed page + module class |
+| `@abp/ng.setting-management/config` | `config/src/lib/` | `SettingTabsService`, default Email + Time-Zone tab contributions |
+| `@abp/ng.setting-management/proxy` | `proxy/src/lib/proxy/` | Generated `EmailSettingsService`, `TimeZoneSettingsService` |
+
+## Lazy-load configuration
+
+```typescript
+// app.routes.ts
+{
+  path: 'setting-management',
+  loadChildren: () =>
+    import('@abp/ng.setting-management').then(m => m.createRoutes()),
+},
+```
+
+`createRoutes()` (in `src/lib/setting-management.routes.ts`) produces:
+
+| Path | Component slot | Required policy | Title |
+| --- | --- | --- | --- |
+| `''` | `eSettingManagementComponents.SettingManagement` → `SettingManagementComponent` | `AbpAccount.SettingManagement` | `AbpSettingManagement::Settings` |
+
+The route is wrapped with `[authGuard]` and renders inside `ReplaceableRouteContainerComponent`, so the host page is replaceable by registering against `eSettingManagementComponents.SettingManagement`.
+
+## The host page
+
+`packages/setting-management/src/lib/components/setting-management.component.ts` is a small Signals-friendly component that:
+
+1. Injects `SettingTabsService` from `@abp/ng.setting-management/config`.
+2. Subscribes to `settingTabsService.visible$` to receive the filtered tab list (each tab declares a `requiredPolicy`).
+3. Renders Angular ARIA's `Tabs` / `TabList` / `Tab` / `TabPanel` primitives, projecting each tab's component via `<ng-container *ngComponentOutlet="selected.component">`.
+
+```typescript
+@Component({
+  selector: 'abp-setting-management',
+  templateUrl: './setting-management.component.html',
+  imports: [NgComponentOutlet, PageComponent, LocalizationPipe, PermissionDirective,
+            ForDirective, Tabs, TabList, Tab, TabPanel],
+})
+export class SettingManagementComponent implements OnDestroy, OnInit {
+  private settingTabsService = inject(SettingTabsService);
+  settings: ABP.Tab[] = [];
+  selected!: ABP.Tab;
+
+  ngOnInit() {
+    this.subscription.add(
+      this.settingTabsService.visible$.subscribe(settings => {
+        this.settings = settings;
+        if (!this.selected) this.selected = this.settings[0];
+      }),
+    );
+  }
+}
+```
+
+## `SettingTabsService`
+
+The tab registry is exposed by `@abp/ng.setting-management/config`:
+
+```typescript
+// packages/setting-management/config/src/lib/services/settings-tabs.service.ts
+@Injectable({ providedIn: 'root' })
+export class SettingTabsService extends AbstractNavTreeService<ABP.Tab> {}
+```
+
+`AbstractNavTreeService` lives in `@abp/ng.core` and offers `add(items[])`, `patch(name, item)`, `remove(name)`, and the reactive `visible$` observable that respects `requiredPolicy`. The shape of an entry:
+
+```typescript
+interface ABP.Tab {
+  name: string;            // Localization key, e.g. 'AbpEmailing::Menu:EmailingSettings'
+  order?: number;
+  parentName?: string;
+  requiredPolicy?: string; // Policy gate
+  component: Type<any>;    // The editor to render in the panel
+}
+```
+
+Applications and modules contribute via an `APP_INITIALIZER`:
+
+```typescript
+provideAppInitializer(() => {
+  const tabs = inject(SettingTabsService);
+  tabs.add([
+    {
+      name: 'MyApp::Notifications',
+      order: 50,
+      requiredPolicy: 'MyApp.Settings.Notifications',
+      component: NotificationsSettingsComponent,
+    },
+  ]);
+});
+```
+
+## Default tabs
+
+The `config` entry point also ships two ready-made editors:
+
+| Folder | Component | Backed by |
+| --- | --- | --- |
+| `config/src/lib/components/email-setting-group/` | `EmailSettingsComponent` | `EmailSettingsService` (proxy) |
+| (registered by providers) | `TimeZoneSettingsComponent` | `TimeZoneSettingsService` (proxy) |
+
+They are registered in `config/src/lib/providers/` and read/write settings using the generated services described next.
+
+## Generated proxies
+
+`packages/setting-management/proxy/src/lib/proxy/`:
+
+```
+email-settings.service.ts       # Volo.Abp.SettingManagement.EmailSettingsAppService
+time-zone-settings.service.ts   # Volo.Abp.SettingManagement.TimeZoneSettingsAppService
+volo/                           # Settings provider mapping helpers
+models.ts                       # EmailSettingsDto, UpdateEmailSettingsDto, TimezoneDto, …
+```
+
+`EmailSettingsService` typical surface:
+
+```typescript
+@Injectable({ providedIn: 'root' })
+export class EmailSettingsService {
+  apiName = 'AbpSettingManagement';
+  protected restService = inject(RestService);
+
+  get = (config?: Partial<Rest.Config>) =>
+    this.restService.request<any, EmailSettingsDto>({
+      method: 'GET', url: '/api/setting-management/emailing',
+    }, config, this.apiName);
+
+  update = (input: UpdateEmailSettingsDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, void>({
+      method: 'POST', url: '/api/setting-management/emailing', body: input,
+    }, config, this.apiName);
+
+  sendTestEmail = (input: SendTestEmailInput, config?: Partial<Rest.Config>) =>
+    this.restService.request<any, void>({
+      method: 'POST', url: '/api/setting-management/emailing/send-test-email', body: input,
+    }, config, this.apiName);
+}
+```
+
+`apiName = 'AbpSettingManagement'` matches the backend `RemoteServiceName`. Both proxies were generated by `nx g @abp/ng.schematics:proxy-add --module setting-management --apiName AbpSettingManagement`.
+
+## Adding a custom setting tab end-to-end
+
+```typescript
+// 1. The editor component
+@Component({
+  selector: 'my-notification-settings',
+  standalone: true,
+  imports: [ReactiveFormsModule, LocalizationPipe],
+  templateUrl: './notification-settings.component.html',
+})
+export class NotificationSettingsComponent { /* … */ }
+
+// 2. Register the tab
+import { provideAppInitializer, inject } from '@angular/core';
+import { SettingTabsService } from '@abp/ng.setting-management/config';
+
+provideAppInitializer(() => {
+  inject(SettingTabsService).add([{
+    name: 'MyApp::Menu:NotificationSettings',
+    order: 100,
+    requiredPolicy: 'MyApp.Settings.Notifications',
+    component: NotificationSettingsComponent,
+  }]);
+});
+
+// 3. Inside the editor, persist via the standard backend settings endpoint
+// (Either reuse Volo.Abp.SettingManagement.SettingAppService directly, or
+//  call a custom application service.)
+```
+
+## Module class (legacy)
+
+`SettingManagementModule.forChild()` is kept for non-standalone consumers. It only imports `SettingManagementRoutingModule` + the component. No providers are registered by `forChild` — all configuration goes through `SettingTabsService` / the `/config` entry point.
+
+## Email tab in detail
+
+`packages/setting-management/config/src/lib/components/email-setting-group/` is a reactive-form editor backed by `EmailSettingsService`. The default fields, in order:
+
+| Field | Setting key |
+| --- | --- |
+| Default from address | `Abp.Mailing.DefaultFromAddress` |
+| Default from display name | `Abp.Mailing.DefaultFromDisplayName` |
+| SMTP host | `Abp.Mailing.Smtp.Host` |
+| SMTP port | `Abp.Mailing.Smtp.Port` |
+| SMTP user name | `Abp.Mailing.Smtp.UserName` |
+| SMTP password | `Abp.Mailing.Smtp.Password` |
+| Domain | `Abp.Mailing.Smtp.Domain` |
+| Use default credentials | `Abp.Mailing.Smtp.UseDefaultCredentials` |
+| Enable SSL | `Abp.Mailing.Smtp.EnableSsl` |
+| Send test email | (uses `sendTestEmail` action) |
+
+The component exposes a *Send test email* button which calls `EmailSettingsService.sendTestEmail(...)` with a recipient + subject + body — handy for verifying configuration end-to-end before relying on background notifications.
+
+## How the page renders
+
+```mermaid
+graph LR
+  init[ngOnInit]
+  init --> sub[Subscribe to visible$]
+  sub --> list[Filter by requiredPolicy]
+  list --> render[Render tabs]
+  click[User selects tab]
+  click --> outlet[Switch ngComponentOutlet]
+  outlet --> editor[Editor component\nNgComponentOutlet]
+  editor --> save[Editor POSTs to backend]
+```
+
+The host page is dumb on purpose — adding a new editor never requires editing `SettingManagementComponent`. The contract is `ABP.Tab.component` + `SettingTabsService.add(...)`.
+
+## Replacing the host page
+
+```typescript
+provideAppInitializer(() => {
+  inject(ReplaceableComponentsService).add({
+    key: eSettingManagementComponents.SettingManagement,
+    component: MySettingManagementComponent,
+  });
+});
+```
+
+`ReplaceableRouteContainerComponent` will render `MySettingManagementComponent` for `/setting-management` from then on.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Settings runtime" href="/crosscut/settings">
+    The backend setting providers exposed by these editors.
+  </Card>
+  <Card title="Setting Management module" href="/modules/setting-management">
+    Server-side application service and built-in setting groups.
+  </Card>
+  <Card title="Emailing module" href="/comm/emailing">
+    The setting keys edited by the Email tab.
+  </Card>
+  <Card title="Tabs primitive" href="/angular/core">
+    `AbstractNavTreeService` and `ABP.Tab` types live in `@abp/ng.core`.
+  </Card>
+</CardGroup>

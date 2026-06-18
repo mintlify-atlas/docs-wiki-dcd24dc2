@@ -1,0 +1,94 @@
+---
+title: "Validation (Volo.Abp.Validation)"
+description: "Pluggable IObjectValidator pipeline, DataAnnotations contributor, the [UnitOfWork]-style ValidationInterceptor, and AbpValidationException."
+---
+
+`Volo.Abp.Validation` validates *objects* (DTOs) and *method invocations*. It is a contributor pipeline: `IObjectValidator` enumerates registered `IObjectValidationContributor`s, collects `ValidationResult`s, and throws `AbpValidationException` if any are produced. `ValidationInterceptor` runs the same pipeline for every public method on every class that implements `IValidationEnabled` — application services are validated automatically.
+
+Source: `framework/src/Volo.Abp.Validation/Volo/Abp/Validation/` and `framework/src/Volo.Abp.Validation.Abstractions/Volo/Abp/Validation/`.
+
+## Modules
+
+`AbpValidationAbstractionsModule` (in `Volo.Abp.Validation.Abstractions`) ships only `AbpValidationException`, `IHasValidationErrors`, and `ValidationHelper.EmailRegEx` / `IsValidEmailAddress(string)`. Application contracts depend on this so they can throw validation errors without pulling the interceptor.
+
+`AbpValidationModule` (in `Volo.Abp.Validation`) depends on `AbpValidationAbstractionsModule` and `AbpLocalizationModule`. In `PreConfigureServices` it:
+
+1. Hooks `ValidationInterceptorRegistrar.RegisterIfNeeded` into `IServiceCollection.OnRegistered` so types implementing `IValidationEnabled` are wrapped with `ValidationInterceptor`.
+2. Scans every registered type for `IObjectValidationContributor` and adds it to `AbpValidationOptions.ObjectValidationContributors`.
+
+In `ConfigureServices` it embeds `AbpValidationResource` localization files into the virtual file system and adds the English-default resource to `AbpLocalizationOptions.Resources`.
+
+## `AbpValidationOptions`
+
+| Property | Type | Role |
+| --- | --- | --- |
+| `IgnoredTypes` | `List<Type>` | `DataAnnotationObjectValidationContributor` does not recurse into instances assignable to these types. |
+| `ObjectValidationContributors` | `ITypeList<IObjectValidationContributor>` | The ordered pipeline. Auto-filled by the module. |
+
+## File-by-file enumeration
+
+### `Volo.Abp.Validation.Abstractions`
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpValidationException.cs` | `AbpValidationException : AbpException, IHasLogLevel, IHasValidationErrors, IExceptionWithSelfLogging` | `IList<ValidationResult> ValidationErrors`. `LogLevel = Warning` by default. `Log(ILogger)` writes one line per error, formatting member names in parentheses. |
+| `IHasValidationErrors.cs` | interface | Lets exception handlers detect any kind of validation error without coupling to the exception type. |
+| `ValidationHelper.cs` | static | `EmailRegEx` (the W3C "valid e-mail address" regex) and `IsValidEmailAddress(string)`. |
+| `AbpValidationAbstractionsModule.cs` | empty module | dependency marker. |
+
+### `Volo.Abp.Validation`
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpValidationModule.cs` | module | See above. |
+| `AbpValidationOptions.cs` | options | See table above. |
+| `IObjectValidator.cs` / `ObjectValidator.cs` | `IObjectValidator, ITransientDependency` | The entry point. `ValidateAsync(obj, name, allowNull)` calls `GetErrorsAsync` and throws `AbpValidationException` if any errors are returned. `GetErrorsAsync` opens a new `IServiceScope`, resolves every `IObjectValidationContributor` in the configured order, and aggregates their errors into a fresh `ObjectValidationContext`. |
+| `IObjectValidationContributor.cs` | interface | Single method `Task AddErrorsAsync(ObjectValidationContext context)`. Implementations must add `ValidationResult`s to `context.Errors`. |
+| `ObjectValidationContext.cs` | `ObjectValidationContext` | `object ValidatingObject` + `List<ValidationResult> Errors`. |
+| `DataAnnotationObjectValidationContributor.cs` | `IObjectValidationContributor, ITransientDependency` | The built-in contributor. Recursively walks every public property up to `MaxRecursiveParameterValidationDepth = 8`; for each property it runs every `ValidationAttribute` through `IAttributeValidationResultProvider` (default: `DefaultAttributeValidationResultProvider`); if the object implements `System.ComponentModel.DataAnnotations.IValidatableObject`, it also calls `Validate(new ValidationContext(...))`. Properties marked `[DisableValidation]` are skipped. Items of `IEnumerable` (except `IQueryable`) are recursed; primitive enumerable items break the loop. |
+| `IAttributeValidationResultProvider.cs` / `DefaultAttributeValidationResultProvider.cs` | per-attribute hook | Lets you replace how a `ValidationAttribute` is executed (e.g. localize default messages). The default just calls `validationAttribute.GetValidationResult(value, context)`. |
+| `IMethodInvocationValidator.cs` / `MethodInvocationValidator.cs` | `IMethodInvocationValidator, ITransientDependency` | Validates `MethodInvocationValidationContext.Parameters` against `ParameterValues`. Disabled when the method has `[DisableValidation]` (unless `[EnableValidation]` is also present) or the type does. For each parameter it calls `IObjectValidator.GetErrorsAsync(value, parameterInfo.Name, allowNulls)` where `allowNulls` is true for optional, `out`, nullable, or primitive parameters. Throws `AbpValidationException` with all collected errors. |
+| `MethodInvocationValidationContext.cs` | `MethodInvocationValidationContext : AbpValidationResult` | `TargetObject`, `Method`, `ParameterValues`, computed `Parameters` (`method.GetParameters()`). |
+| `AbpValidationResult.cs` / `IAbpValidationResult.cs` | `AbpValidationResult : IAbpValidationResult` | Just holds `List<ValidationResult> Errors`. Base class for `MethodInvocationValidationContext`. |
+| `HasValidationErrorsExtensions.cs` | extensions | Helpers to add errors from any `IHasValidationErrors` source. |
+| `ValidationInterceptor.cs` | `ValidationInterceptor : AbpInterceptor, ITransientDependency` | `InterceptAsync` calls `_methodInvocationValidator.ValidateAsync(new MethodInvocationValidationContext(target, method, args))` *before* `invocation.ProceedAsync()`. |
+| `ValidationInterceptorRegistrar.cs` | static | Registers the interceptor when the implementation type implements `IValidationEnabled` and is not in `DynamicProxyIgnoreTypes`. |
+| `IValidationEnabled.cs` | marker | Implemented by `ApplicationService` and `RemoteService` so they get auto-validated. |
+| `EnableValidationAttribute.cs` / `DisableValidationAttribute.cs` | attributes | Opt in/out at method or class level. `[DisableValidation]` on a property tells `DataAnnotationObjectValidationContributor` to skip recursion into it. |
+| `Localization/AbpValidationResource.cs` | localization resource | Holds the default error strings for the built-in attributes. |
+| `StringValues/*.cs` | `IStringValueType` hierarchy | `FreeTextStringValueType`, `ToggleStringValueType`, `SelectionStringValueType`, `NumericValueValidator`, `StringValueValidator`, `BooleanValueValidator`, `AlwaysValidValueValidator`, `ValueValidatorBase`, `StringValueTypeBase`, attribute decoration. Used by `FeatureDefinition.ValueType` and `SettingDefinition` UIs to describe how a value should be rendered/validated. Not part of the object-validation pipeline. |
+
+## Validation flow
+
+1. A request hits `MyAppService.CreateAsync(MyDto input)`.
+2. `MyAppService : ApplicationService` implements `IValidationEnabled`, so the registrar has wired `ValidationInterceptor`.
+3. `ValidationInterceptor.InterceptAsync` builds a `MethodInvocationValidationContext` and calls `IMethodInvocationValidator.ValidateAsync`.
+4. `MethodInvocationValidator` short-circuits when `Parameters.Length == 0`, the method isn't public, or it sees `[DisableValidation]`. Otherwise it iterates parameters and calls `IObjectValidator.GetErrorsAsync(value, name, allowNulls)`.
+5. `ObjectValidator` creates an `ObjectValidationContext` and invokes every `IObjectValidationContributor`. The built-in `DataAnnotationObjectValidationContributor` runs `ValidationAttribute`s and any `IValidatableObject.Validate` on the DTO recursively.
+6. If `FluentObjectValidationContributor` is registered (see `/crosscut/fluent-validation`), it asks DI for `IValidator<MyDto>` and adds FluentValidation errors.
+7. Errors are aggregated into the `MethodInvocationValidationContext.Errors`. If any are present, `AbpValidationException("Method arguments are not valid! ...", errors)` is thrown before the method runs.
+8. The exception is caught by `AbpExceptionFilter` / `AbpExceptionHandlingMiddleware`, formatted into a `RemoteServiceErrorResponse` with the localized messages, and returned as HTTP 400.
+
+## Throwing manually
+
+```csharp
+throw new AbpValidationException(
+    "Custom validation failed!",
+    new List<ValidationResult>
+    {
+        new ValidationResult("Username already exists.", new[] { nameof(input.UserName) })
+    });
+```
+
+Because `AbpValidationException : IExceptionWithSelfLogging`, the framework logs each member error at `LogLevel.Warning` when the exception bubbles out.
+
+## Localizing messages
+
+Pass `ErrorMessageResourceType` / `ErrorMessageResourceName` to your DataAnnotations attributes, or implement a custom `IAttributeValidationResultProvider` that resolves the message through `IStringLocalizer`. The default exception handler picks them up.
+
+## Related
+
+- `/crosscut/fluent-validation` — the FluentValidation contributor.
+- `/core/exception-handling` — how `AbpValidationException` is rendered to clients.
+- `/core/dynamic-proxy-and-aspects` — how `ValidationInterceptor` is attached via `AbpInterceptor`.
+- `/ddd/application-services` — `ApplicationService` implements `IValidationEnabled` and `IUnitOfWorkEnabled`.

@@ -1,0 +1,265 @@
+---
+title: "Dynamic HTTP client proxies: Volo.Abp.Http.Client"
+sidebarTitle: "HTTP Client proxies"
+description: "AddHttpClientProxies, IHttpClientProxy<T>, DynamicHttpProxyInterceptor and the named-HttpClient + IRemoteServiceConfigurationProvider plumbing that calls remote ABP services as if they were local interfaces."
+---
+
+`framework/src/Volo.Abp.Http.Client/` ships ABP's _dynamic_ HTTP client proxies — DI-registered implementations of any `IRemoteService`-derived interface that are actually Castle `IInterceptor` proxies translating method calls into HTTP requests against a remote ABP endpoint. This is the engine behind `dotnet abp generate-proxy` (which generates _static_ counterparts) and the only thing you need at runtime to call another ABP host's application services.
+
+See also the static-proxy counterpart in [`AddStaticHttpClientProxies`](/aspnetcore/mvc-client-proxies) and the request lifecycle in [Dynamic C# client proxy flow](/flows/dynamic-c-sharp-client-proxy).
+
+## Module
+
+```csharp
+[DependsOn(
+    typeof(AbpHttpModule),
+    typeof(AbpCastleCoreModule),
+    typeof(AbpThreadingModule),
+    typeof(AbpMultiTenancyModule),
+    typeof(AbpValidationModule),
+    typeof(AbpExceptionHandlingModule),
+    typeof(AbpRemoteServicesModule),
+    typeof(AbpEventBusModule))]
+public class AbpHttpClientModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient();
+        context.Services.AddTransient(typeof(DynamicHttpProxyInterceptorClientProxy<>));
+
+        Configure<AbpHttpClientProxyingOptions>(options =>
+        {
+            options.QueryStringConverts.Add(typeof(ExtraPropertyDictionary), typeof(ExtraPropertyDictionaryToQueryString));
+            options.FormDataConverts.Add(typeof(ExtraPropertyDictionary), typeof(ExtraPropertyDictionaryToFormData));
+        });
+    }
+}
+```
+
+Three things to note:
+
+- It pulls in [`AbpRemoteServicesModule`](./remote-services), which is where `AbpRemoteServiceOptions` and `IRemoteServiceConfigurationProvider` live.
+- `services.AddHttpClient()` calls Microsoft.Extensions.Http's bootstrap — `IHttpClientFactory` is then available to be used by the per-remote-service named clients we'll see below.
+- `AbpHttpClientProxyingOptions` registers two built-in converters that know how to turn ABP's `ExtraPropertyDictionary` (used on extensible DTOs) into query-string fragments or form-data. You can add `QueryStringConverts[typeof(MyType)] = typeof(MyConverter)` to support custom types in URL/form serialization.
+
+## Registering proxies
+
+The entry point is `ServiceCollectionHttpClientProxyExtensions` (in the `Microsoft.Extensions.DependencyInjection` namespace, by convention). Three overloads, but the headline is:
+
+```csharp
+public static IServiceCollection AddHttpClientProxies(
+    this IServiceCollection services,
+    Assembly assembly,
+    string remoteServiceConfigurationName = RemoteServiceConfigurationDictionary.DefaultName,
+    bool asDefaultServices = true,
+    ApplicationServiceTypes applicationServiceTypes = ApplicationServiceTypes.All);
+```
+
+Usage in a `ConfigureServices`:
+
+```csharp
+context.Services.AddHttpClientProxies(
+    typeof(MyServiceApplicationContractsModule).Assembly,
+    remoteServiceConfigurationName: "MyService");
+```
+
+What this does, per matching interface (`IsSuitableForClientProxying`):
+
+1. **Filter.** An interface is "suitable" iff: public, non-generic, derives from `IRemoteService`. `ApplicationServiceTypes.ApplicationServices` / `IntegrationServices` further filters by `[IntegrationService]`.
+2. **Ensure the named `HttpClient` exists.** `AddHttpClientFactory(services, remoteServiceConfigurationName)` calls `services.AddHttpClient(name, ...)` with the **remote-service name as the client name**. This is the conventional `IHttpClientFactory` integration — there is no other naming scheme.
+3. **Register the proxy config.** Adds `options.HttpClientProxies[serviceType] = new HttpClientProxyConfig(serviceType, remoteServiceConfigurationName)` so the interceptor can look up which remote endpoint a service belongs to.
+4. **Register the interceptor.** `services.AddTransient(typeof(DynamicHttpProxyInterceptor<>).MakeGenericType(serviceType))`.
+5. **Create the DI registration for the interface itself.** Two flavors depending on `asDefaultServices`:
+   - `true` (default): `services.AddTransient(serviceType, sp => ProxyGenerator.CreateInterfaceProxyWithoutTarget(...))`. Whoever asks for `IUserAppService` gets the HTTP proxy.
+   - `false`: skip the direct registration, only register `IHttpClientProxy<TService>` (next step). Useful when the same process hosts the real implementation _and_ wants to call the remote version side-by-side.
+6. **Always register `IHttpClientProxy<TService>`.** A lightweight wrapper exposing the proxied service via `.Service`:
+
+   ```csharp
+   public interface IHttpClientProxy<out TRemoteService>
+   {
+       TRemoteService Service { get; }
+   }
+   ```
+
+   This is the explicit handle you inject when you want to call the remote service in a host that _also_ has a local implementation.
+
+The proxy itself is created by `ProxyGeneratorInstance.CreateInterfaceProxyWithoutTarget(type, validationInterceptor, dynamicHttpProxyInterceptor)`. Two interceptors are chained: ABP's validation interceptor first (so input DTOs get validated client-side before the HTTP call), then the HTTP proxy interceptor.
+
+## The named `HttpClient`
+
+`AddHttpClientFactory` calls `services.AddHttpClient(name, configure)` exactly once per remote-service name (tracked via `AbpHttpClientBuilderOptions.ConfiguredProxyClients`, a `HashSet<string>`). The configure delegate runs every registered `AbpHttpClientBuilderOptions.ProxyClientActions`, the handler delegate runs `ProxyClientHandlerActions`, and the resulting `IHttpClientBuilder` is passed through `ProxyClientBuildActions`.
+
+The handler is configured like this:
+
+```csharp
+.ConfigurePrimaryHttpMessageHandler(provider =>
+{
+    var handler = new HttpClientHandler();
+    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Create("BROWSER")))
+        handler.UseCookies = false;
+    foreach (var handlerAction in preOptions.ProxyClientHandlerActions)
+        handlerAction(remoteServiceConfigurationName, provider, handler);
+    return handler;
+});
+```
+
+The conditional `UseCookies = false` is deliberate: on non-Blazor-WASM hosts ABP turns off the `HttpClientHandler` cookie container so that auth state isn't leaked between calls. On Blazor WebAssembly (`BROWSER` OS platform), it leaves the browser's fetch cookies in play.
+
+To customize the handler globally (e.g. proxy, certificate validation), use a **pre-configure** action — these run while options are still mutable, before the first `AddHttpClient` call:
+
+```csharp
+context.Services.PreConfigure<AbpHttpClientBuilderOptions>(options =>
+{
+    options.ProxyClientHandlerActions.Add((name, sp, handler) =>
+    {
+        handler.ServerCertificateCustomValidationCallback = ...;
+    });
+
+    options.ProxyClientActions.Add((name, sp, client) =>
+    {
+        client.Timeout = TimeSpan.FromSeconds(30);
+    });
+});
+```
+
+The triple `(string remoteServiceName, IServiceProvider sp, HttpClient client)` signature lets the action condition on which remote service it's for.
+
+### Resolving the client at call time
+
+`DynamicHttpProxyInterceptor<TService>.GetActionApiDescriptionModel` is what fetches the named client:
+
+```csharp
+var clientConfig        = ClientOptions.HttpClientProxies.GetOrDefault(typeof(TService))
+                            ?? throw new AbpException(...);
+var remoteServiceConfig = await RemoteServiceConfigurationProvider
+                              .GetConfigurationOrDefaultAsync(clientConfig.RemoteServiceName);
+var client              = HttpClientFactory.Create(clientConfig.RemoteServiceName);
+
+return await ApiDescriptionFinder.FindActionAsync(
+    client, remoteServiceConfig.BaseUrl, typeof(TService), invocation.Method);
+```
+
+The chain: `HttpClientProxyConfig` (from `AbpHttpClientOptions.HttpClientProxies`) gives the remote-service name → `IRemoteServiceConfigurationProvider` gives the `BaseUrl` (and any other named keys) → `IProxyHttpClientFactory.Create(name)` (default: thin wrapper over `IHttpClientFactory.CreateClient(name)`) returns the configured `HttpClient`. The `BaseUrl` is _not_ set on the `HttpClient.BaseAddress` — it's passed as a separate argument to `IApiDescriptionFinder.FindActionAsync`, because the proxy needs to combine it with each action's API-description path at request time.
+
+## `DynamicHttpProxyInterceptor<TService>`
+
+```csharp
+public class DynamicHttpProxyInterceptor<TService> : AbpInterceptor, ITransientDependency
+{
+    public override async Task InterceptAsync(IAbpMethodInvocation invocation)
+    {
+        var context = new ClientProxyRequestContext(
+            await GetActionApiDescriptionModel(invocation),
+            invocation.ArgumentsDictionary,
+            typeof(TService));
+
+        if (invocation.Method.ReturnType.GenericTypeArguments.IsNullOrEmpty())
+        {
+            await InterceptorClientProxy.CallRequestAsync(context);
+        }
+        else
+        {
+            var returnType = invocation.Method.ReturnType.GenericTypeArguments[0];
+            var result = (Task)CallRequestAsyncMethod
+                .MakeGenericMethod(returnType)
+                .Invoke(this, new object[] { context })!;
+            invocation.ReturnValue = await GetResultAsync(result, returnType);
+        }
+    }
+}
+```
+
+The flow:
+
+1. Build a `ClientProxyRequestContext` from the intercepted method invocation. The `ActionApiDescriptionModel` is fetched via `IApiDescriptionFinder` — which itself calls the remote host's `/api/abp/api-definition` endpoint (cached) to discover routes, parameters, and binding rules. This is why the dynamic proxy "just knows" how to route any method.
+2. Branch on whether the return type is `Task` (void result, just call `CallRequestAsync`) or `Task<T>` (call the generic `CallRequestAsync<T>` via reflection, then unwrap `.Result`).
+3. Delegate the actual HTTP work to `DynamicHttpProxyInterceptorClientProxy<TService> : ClientProxyBase<TService>` — the shared base class with the static-proxy implementation. So dynamic and static proxies share the same request-pipeline below the API-discovery layer.
+
+`AbpInterceptor` is wrapped in `AbpAsyncDeterminationInterceptor<>` by the proxy registration (see step 5 above) — that adapter is the Castle bridge that decides whether the intercepted call is sync or async and routes through `InterceptAsync` vs the sync path.
+
+## `IHttpClientProxy<TService>`
+
+Two ways to consume a proxied service:
+
+```csharp
+// 1. As if it were a local service (when asDefaultServices: true)
+public class MyService(IUserAppService userService)
+{
+    public Task<UserDto> Get(Guid id) => userService.GetAsync(id); // hits HTTP
+}
+
+// 2. Explicitly, when you also have a local IUserAppService implementation in the same host
+public class MyService(IHttpClientProxy<IUserAppService> proxy)
+{
+    public Task<UserDto> GetFromRemote(Guid id) => proxy.Service.GetAsync(id);
+}
+```
+
+`HttpClientProxy<TRemoteService>` is the implementation:
+
+```csharp
+public class HttpClientProxy<TRemoteService> : IHttpClientProxy<TRemoteService>
+{
+    public TRemoteService Service { get; }
+    public HttpClientProxy(TRemoteService service) => Service = service;
+}
+```
+
+The `service` here is the same Castle dynamic proxy registered in step 5, so behaviour is identical to the direct injection — `IHttpClientProxy<T>` is just a way to ask for the proxy by name when DI conflicts force it.
+
+## `AbpHttpClientOptions` vs `AbpHttpClientBuilderOptions`
+
+Two options classes — easy to confuse:
+
+| | `AbpHttpClientOptions` | `AbpHttpClientBuilderOptions` |
+| --- | --- | --- |
+| Lifecycle | Regular `IOptions`. | _Pre-configured_ only — consumed during `AddHttpClient` registration, not at request time. |
+| Holds | `HttpClientProxies: Dictionary<Type, HttpClientProxyConfig>` (which interfaces map to which remote-service name) and per-remote-service `ProxyHttpClientPreSendActions`. | `ProxyClientActions` (mutate `HttpClient`), `ProxyClientHandlerActions` (mutate `HttpClientHandler`), `ProxyClientBuildActions` (mutate `IHttpClientBuilder`), and the internal `ConfiguredProxyClients` set. |
+| Configure with | `services.Configure<AbpHttpClientOptions>(...)`. | `services.PreConfigure<AbpHttpClientBuilderOptions>(...)`. |
+
+The "pre-configure" requirement on `AbpHttpClientBuilderOptions` is real: `AddHttpClientFactory` calls `services.ExecutePreConfiguredActions<AbpHttpClientBuilderOptions>()`, which only runs `PreConfigure` actions registered _before_ the first `AddHttpClientProxies` call. Regular `Configure` blocks won't be observed.
+
+## Pre-send actions
+
+`AbpHttpClientOptions.AddPreSendAction(remoteServiceName, action)` registers a callback the request pipeline runs immediately before sending each `HttpRequestMessage`:
+
+```csharp
+Configure<AbpHttpClientOptions>(options =>
+{
+    options.AddPreSendAction("MyService", (proxyConfig, requestContext, httpClient) =>
+    {
+        // mutate httpClient or grab data from requestContext.ActionApiDescription
+    });
+});
+```
+
+The signature is `Action<HttpClientProxyConfig, ClientProxyRequestContext, HttpClient>`. Useful for last-mile concerns (custom headers per remote, trace propagation) that depend on _which method_ is being called — something `ProxyClientActions` (which fire at handler-build time) can't see.
+
+## Authentication
+
+The proxy pipeline delegates to `IRemoteServiceHttpClientAuthenticator.Authenticate(RemoteServiceHttpClientAuthenticateContext)` before sending. The default in `Volo.Abp.Http.Client` is `NullRemoteServiceHttpClientAuthenticator` (no-op). The IdentityModel packages replace it:
+
+- **`Volo.Abp.Http.Client.IdentityModel`** registers `IdentityModelRemoteServiceHttpClientAuthenticator`, which calls `IIdentityModelAuthenticationService.TryAuthenticateAsync(httpClient, identityClientName)`. The identity-client name is `RemoteServiceConfiguration.GetIdentityClient()` (falling back to the remote-service name).
+- **`Volo.Abp.Http.Client.IdentityModel.Web`** further replaces it with `HttpContextIdentityModelRemoteServiceHttpClientAuthenticator`, which prefers the current `HttpContext`'s access token (cookie auth flow) before falling back to client-credentials.
+
+See [Server-to-Server tokens: IdentityModel](/auth/identity-model) for the full token-acquisition pipeline.
+
+## Convention summary
+
+When you call `AddHttpClientProxies(assembly, "MyService")`:
+
+| Convention | Value |
+| --- | --- |
+| `IHttpClientFactory` client name | `"MyService"` (same as the remote-service config name) |
+| `RemoteServiceConfiguration` lookup key | `AbpRemoteServiceOptions.RemoteServices["MyService"]` |
+| Base URL source | `RemoteServiceConfiguration.BaseUrl` for that key, or the `Default` config if missing |
+| Per-request URL | `BaseUrl` + path resolved by `ApiDescriptionFinder` from `/api/abp/api-definition` |
+| Validation | Runs client-side via the chained `ValidationInterceptor` before the HTTP call |
+| Cookies | Disabled on the primary handler except on Blazor WASM (`BROWSER` OS platform) |
+
+## See also
+
+- [Remote services configuration](./remote-services) — where the `BaseUrl` comes from
+- [Server-to-Server tokens: IdentityModel](/auth/identity-model) — how outbound HTTP gets an access token
+- [MVC client-side proxies (static)](/aspnetcore/mvc-client-proxies)
+- [Dynamic C# client proxy flow](/flows/dynamic-c-sharp-client-proxy)

@@ -1,0 +1,165 @@
+---
+title: "Timing (Volo.Abp.Timing)"
+description: "IClock-driven DateTime normalization, AbpClockOptions.Kind (UTC vs Local), per-request timezone via ICurrentTimezoneProvider, and the Windows/IANA TZ mapping."
+---
+
+`Volo.Abp.Timing` centralizes "what time is it right now, in what `DateTimeKind`, and in which timezone is the caller?" Every audit-log timestamp, every `IHasCreationTime.CreationTime` stamp, every JSON `DateTime` read by the ABP converters goes through `IClock`. The two configuration knobs are `AbpClockOptions.Kind` (UTC, Local, or Unspecified) and `ICurrentTimezoneProvider.TimeZone` (an `AsyncLocal<string?>` set per request from the user's profile / settings / claim).
+
+Source: `framework/src/Volo.Abp.Timing/Volo/Abp/Timing/`.
+
+## Module
+
+`AbpTimingModule` depends on `AbpLocalizationModule` and `AbpSettingsModule`. In `ConfigureServices` it embeds the `AbpTimingResource` localization files (`/Volo/Abp/Timing/Localization`) and adds the English-default resource. `TimingSettingProvider` (auto-discovered as `ISettingDefinitionProvider`) registers a single setting:
+
+| Name | Default | Visible to clients |
+| --- | --- | --- |
+| `Abp.Timing.TimeZone` (from `TimingSettingNames.TimeZone`) | `""` | `true` |
+
+That setting is read by the ASP.NET Core integration (or whatever runtime layer you use) to populate `ICurrentTimezoneProvider.TimeZone` per request.
+
+## `AbpClockOptions`
+
+```csharp
+public class AbpClockOptions
+{
+    public DateTimeKind Kind { get; set; }   // default: Unspecified
+}
+```
+
+| `Kind` | `Clock.Now` | `Clock.SupportsMultipleTimezone` | Normalize |
+| --- | --- | --- | --- |
+| `Unspecified` | `DateTime.Now` | `false` | No-op. |
+| `Local` | `DateTime.Now` | `false` | UTC → Local via `ToLocalTime()`. |
+| `Utc` | `DateTime.UtcNow` | `true` | Local → UTC via `ToUniversalTime()`. Enables timezone conversion. |
+
+Set `Kind = DateTimeKind.Utc` in `ConfigureServices` for new applications:
+
+```csharp
+Configure<AbpClockOptions>(options =>
+{
+    options.Kind = DateTimeKind.Utc;
+});
+```
+
+`SupportsMultipleTimezone` is the gate that enables `ConvertToUserTime` / `ConvertToUtc` — it is only `true` when `Kind == Utc`. With `Unspecified` or `Local`, the timezone-aware conversions are no-ops.
+
+## `IClock` / `Clock`
+
+```csharp
+public interface IClock
+{
+    DateTime Now { get; }
+    DateTimeKind Kind { get; }
+    bool SupportsMultipleTimezone { get; }
+    DateTime Normalize(DateTime dateTime);
+    DateTime ConvertToUserTime(DateTime utcDateTime);
+    DateTimeOffset ConvertToUserTime(DateTimeOffset dateTimeOffset);
+    DateTime ConvertToUtc(DateTime dateTime);
+}
+```
+
+`Clock : IClock, ITransientDependency`:
+
+- `Now` — `DateTime.UtcNow` if `Kind == Utc`, else `DateTime.Now`.
+- `Kind` — directly from options.
+- `Normalize(dt)`:
+  - If `Kind == Unspecified` or `dt.Kind == Kind`, return as-is.
+  - If `Kind == Local` and `dt.Kind == Utc`, `dt.ToLocalTime()`.
+  - If `Kind == Utc` and `dt.Kind == Local`, `dt.ToUniversalTime()`.
+  - Otherwise `DateTime.SpecifyKind(dt, Kind)` (i.e. `Unspecified → Kind`, no shift).
+- `ConvertToUserTime(utcDateTime)` — only if `SupportsMultipleTimezone`, the input is `Utc`, and `ICurrentTimezoneProvider.TimeZone` is set. Returns `TimeZoneInfo.ConvertTime(utc, GetTimeZoneInfo(tz))`.
+- `ConvertToUserTime(dateTimeOffset)` — same with `DateTimeOffset` (no kind requirement, just the timezone).
+- `ConvertToUtc(dateTime)` — only if `SupportsMultipleTimezone`, the input isn't already `Utc`, and the timezone is set. Strips `Kind` (`SpecifyKind(dt, Unspecified)`) and calls `TimeZoneInfo.ConvertTimeToUtc(stripped, GetTimeZoneInfo(tz))`.
+
+## `ICurrentTimezoneProvider`
+
+```csharp
+public interface ICurrentTimezoneProvider
+{
+    string? TimeZone { get; set; }
+}
+```
+
+`CurrentTimezoneProvider : ISingletonDependency` wraps an `AsyncLocal<string?>`. You set it once per request (usually in middleware after authenticating the user, by reading `Abp.Timing.TimeZone` from `ISettingProvider`). The value can be a Windows id (`"W. Europe Standard Time"`) or an IANA id (`"Europe/Berlin"`) — `TZConvertTimezoneProvider.GetTimeZoneInfo` resolves both via the `TimeZoneConverter` library.
+
+`IClientTimezoneProvider` is the dual seam for SPAs / clients that want to override based on the browser; the ASP.NET Core integration ships a default implementation. See `/aspnetcore/mvc-integration`.
+
+## `ITimezoneProvider`
+
+```csharp
+public interface ITimezoneProvider
+{
+    List<NameValue> GetWindowsTimezones();
+    List<NameValue> GetIanaTimezones();
+    string WindowsToIana(string windowsTimeZoneId);
+    string IanaToWindows(string ianaTimeZoneName);
+    TimeZoneInfo GetTimeZoneInfo(string windowsOrIanaTimeZoneId);
+}
+```
+
+`TZConvertTimezoneProvider : ITransientDependency` uses the `TimeZoneConverter` package:
+
+- `GetWindowsTimezones()` — `TZConvert.KnownWindowsTimeZoneIds` sorted.
+- `GetIanaTimezones()` — `TZConvert.KnownIanaTimeZoneNames` filtered to those that contain `/` excluding the `Etc/*` zone, plus `"UTC"`.
+- `WindowsToIana` / `IanaToWindows` — TZ id translation.
+- `GetTimeZoneInfo(id)` — works for either flavour.
+
+`TimeZoneHelper` adds two utilities used by the management UI:
+
+- `GetTimezones(List<NameValue>)` — sorts by display name, enriches each with `(+hh:mm)` UTC offset, filters out invalid ids.
+- `TryCreateNameValueWithOffset(NameValue)` — tries `TZConvert.GetTimeZoneInfo`; returns `null` if it fails (instead of throwing).
+- `GetTimezoneOffset(TimeZoneInfo)` — `"+02:00"` / `"-05:00"` formatter for `BaseUtcOffset`.
+
+`TimeZoneConsts` holds well-known constants (UTC's Windows/IANA ids, etc.).
+
+## `[DisableDateTimeNormalization]`
+
+```csharp
+[AttributeUsage(AttributeTargets.Class | AttributeTargets.Property | AttributeTargets.Parameter)]
+public class DisableDateTimeNormalizationAttribute : Attribute
+{
+}
+```
+
+When applied to a class, property, or parameter, signals downstream consumers to **skip** normalization. The JSON converters (`Volo.Abp.Json.SystemTextJson.JsonConverters.AbpDateTimeConverter` and the Newtonsoft equivalent) honour it via `ReflectionHelper.GetAttributesOfMemberOrDeclaringType<DisableDateTimeNormalizationAttribute>` and leave the `DateTime` untouched. Use it for properties that are already meant to be `Unspecified` (e.g. business dates, calendar entries) — see `/crosscut/serialization-and-json`.
+
+## EF Core integration
+
+`Volo.Abp.EntityFrameworkCore` reads the same `AbpClockOptions.Kind` and `[DisableDateTimeNormalization]` attributes through value converters. For each `DateTime` / `DateTime?` property on every entity, `AbpDbContext.ConfigureValueConverter` (called from `OnModelCreating`) registers an `AbpDateTimeValueConverter` that runs `IClock.Normalize` on the way in and out of the database — so a row written with `Kind == Local` will come back stamped `Kind == Utc` when the application is configured for UTC. Properties / classes marked with `[DisableDateTimeNormalization]` are skipped. See `/data/entity-framework-core`.
+
+## Putting it together
+
+1. Configure UTC for new applications:
+   ```csharp
+   Configure<AbpClockOptions>(o => o.Kind = DateTimeKind.Utc);
+   ```
+2. In the HTTP request pipeline, after auth, read `Abp.Timing.TimeZone` from `ISettingProvider` and assign `ICurrentTimezoneProvider.TimeZone = tz`. The ASP.NET Core integration does this in `AbpCurrentTimezoneMiddleware` automatically.
+3. Stamp `CreationTime = Clock.Now` (the `AuditPropertySetter` does this for you on `IHasCreationTime` entities).
+4. In the UI layer, render with `Clock.ConvertToUserTime(utcDateTime)`.
+5. Persist back through `Clock.ConvertToUtc(userDateTime)` before saving.
+
+## File-by-file enumeration
+
+| File | Role |
+| --- | --- |
+| `AbpTimingModule.cs` | Embeds the timing localization resource; depends on `AbpLocalizationModule` + `AbpSettingsModule`. |
+| `AbpClockOptions.cs` | `DateTimeKind Kind` (default `Unspecified`). |
+| `IClock.cs` / `Clock.cs` | The clock; `ITransientDependency`. Implements `Now`, `Normalize`, `ConvertToUserTime`, `ConvertToUtc`. |
+| `ICurrentTimezoneProvider.cs` / `CurrentTimezoneProvider.cs` | `AsyncLocal<string?>` per-flow timezone holder. `ISingletonDependency`. |
+| `IClientTimezoneProvider.cs` | Dual seam for the client side. |
+| `CurrentTimezoneProviderExtensions.cs` | `Use(string?)` helper that pushes a value and returns an `IDisposable` to pop it. |
+| `ITimezoneProvider.cs` / `TZConvertTimezoneProvider.cs` | Static catalog + Windows↔IANA conversion via `TimeZoneConverter`. |
+| `TimeZoneHelper.cs` | Display-name + offset formatting. |
+| `TimeZoneConsts.cs` | Constants (`UtcWindowsId = "UTC"`, …). |
+| `DisableDateTimeNormalizationAttribute.cs` | Opt-out marker honoured by the JSON converters and EF Core value converters. |
+| `TimingSettingNames.cs` | `"Abp.Timing.TimeZone"`. |
+| `TimingSettingProvider.cs` | `SettingDefinitionProvider` that registers the timezone setting. |
+| `Localization/AbpTimingResource.cs` | Localization resource for the setting display name. |
+
+## Related
+
+- `/crosscut/serialization-and-json` — `AbpDateTimeConverter` (STJ + Newtonsoft) consumes `IClock`, `ICurrentTimezoneProvider`, and `AbpJsonOptions`.
+- `/data/entity-framework-core` — `AbpDateTimeValueConverter` integration.
+- `/crosscut/auditing` — `AuditPropertySetter` stamps `CreationTime`/`LastModificationTime`/`DeletionTime` via `IClock`.
+- `/crosscut/settings` — the timezone setting `Abp.Timing.TimeZone`.
+- `/aspnetcore/mvc-integration` — `AbpCurrentTimezoneMiddleware` reads the setting and pushes it into `ICurrentTimezoneProvider`.

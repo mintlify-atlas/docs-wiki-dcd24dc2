@@ -1,0 +1,205 @@
+---
+title: "Settings (Volo.Abp.Settings)"
+description: "Layered configuration values: ISettingProvider, SettingDefinition catalog, the Default/Configuration/Global/User value-provider chain, encryption, and the ISettingStore seam."
+---
+
+`Volo.Abp.Settings` is the layered configuration subsystem. A *setting* is a named string value (booleans, numbers, JSON blobs — anything that round-trips to text) resolved through an ordered chain of `ISettingValueProvider`s. The chain is `Default → Configuration → Global → Tenant → User` (most specific wins). The catalog is built from `ISettingDefinitionProvider`s; the persistence of overridden values is delegated to `ISettingStore`, replaced by the `Setting Management` module for DB-backed CRUD — see `/modules/setting-management`.
+
+Source: `framework/src/Volo.Abp.Settings/Volo/Abp/Settings/`.
+
+## Module
+
+`AbpSettingsModule` depends on `AbpLocalizationAbstractionsModule`, `AbpSecurityModule`, `AbpDataModule`. In `PreConfigureServices` it scans every registered type for `ISettingDefinitionProvider` and adds them to `AbpSettingOptions.DefinitionProviders`. In `ConfigureServices` it registers the four built-in value providers in the canonical order:
+
+```csharp
+options.ValueProviders.Add<DefaultValueSettingValueProvider>();
+options.ValueProviders.Add<ConfigurationSettingValueProvider>();
+options.ValueProviders.Add<GlobalSettingValueProvider>();
+options.ValueProviders.Add<UserSettingValueProvider>();
+```
+
+`TenantSettingValueProvider` is added by `AbpSettingManagementModule` (which depends on multi-tenancy) — see `/modules/setting-management`.
+
+## `AbpSettingOptions`
+
+| Property | Type | Role |
+| --- | --- | --- |
+| `DefinitionProviders` | `ITypeList<ISettingDefinitionProvider>` | Static catalog. Auto-filled. |
+| `ValueProviders` | `ITypeList<ISettingValueProvider>` | Resolution chain. Order matters — see below. |
+| `DeletedSettings` | `HashSet<string>` | Names hidden from `SettingDefinitionManager.GetAllAsync()`. |
+| `ReturnOriginalValueIfDecryptFailed` | `bool` (default `true`) | When you change `IsEncrypted` of an existing setting to `true`, old plaintext values can't decrypt; instead of throwing, the original value is returned. |
+
+## Defining settings
+
+Subclass `SettingDefinitionProvider` (`ISettingDefinitionProvider, ITransientDependency`):
+
+```csharp
+public class MySettingDefinitionProvider : SettingDefinitionProvider
+{
+    public override void Define(ISettingDefinitionContext context)
+    {
+        context.Add(
+            new SettingDefinition(
+                name: "MyApp.Email.SmtpHost",
+                defaultValue: "localhost",
+                displayName: L("Settings:SmtpHost"),
+                isVisibleToClients: false),
+            new SettingDefinition(
+                name: "MyApp.Email.SmtpPassword",
+                isEncrypted: true,
+                isVisibleToClients: false));
+    }
+}
+```
+
+### `SettingDefinition`
+
+| Property | Type | Notes |
+| --- | --- | --- |
+| `Name` | `string` | Unique identifier. |
+| `DefaultValue` | `string?` | Read by `DefaultValueSettingValueProvider`. |
+| `DisplayName` / `Description` | `ILocalizableString` | Management-UI metadata. |
+| `IsVisibleToClients` | `bool` (default `false`) | Whether the SPA gets to read it through the public proxy. Be careful with secrets. |
+| `Providers` | `List<string>` | Whitelist of provider names. Empty means all. |
+| `IsInherited` | `bool` (default `true`) | UI hint — currently unenforced (`SettingProvider` contains a `TODO: How to implement setting.IsInherited?`). |
+| `IsEncrypted` | `bool` (default `false`) | If true, `GlobalSettingValueProvider` / `UserSettingValueProvider` results pass through `ISettingEncryptionService.Decrypt`. |
+| `Properties` | `Dictionary<string, object>` | Bag for extra UI metadata; `WithProperty(key, value)` is a fluent setter. |
+
+`SettingDefinitionContext.Add(params SettingDefinition[])` keys by `Name`; later overrides win.
+
+## Resolving values
+
+### `ISettingProvider`
+
+```csharp
+public interface ISettingProvider
+{
+    Task<string?> GetOrNullAsync(string name);
+    Task<List<SettingValue>> GetAllAsync(string[] names);
+    Task<List<SettingValue>> GetAllAsync();
+}
+```
+
+`SettingProvider : ISettingProvider, ITransientDependency` implements `GetOrNullAsync` by:
+
+1. Looking up the `SettingDefinition` via `ISettingDefinitionManager`.
+2. Reversing the configured `ISettingValueProviderManager.Providers` (so the **last** provider added wins).
+3. If `setting.Providers` is non-empty, filter the chain to that whitelist.
+4. Iterating providers; returning the first non-`null` value from `GetOrNullAsync(setting)`.
+5. If `setting.IsEncrypted` and a non-null value came back, run it through `ISettingEncryptionService.Decrypt(setting, value)`.
+
+`GetAllAsync(names)` follows the same logic but in one round trip per provider, removing names that already have a value before moving to the next-lower provider. `GetAllAsync()` enumerates the catalog and calls `GetOrNullAsync(name)` for each.
+
+`SettingProviderExtensions`:
+
+- `IsTrueAsync(name)` — case-insensitive `"true"` check.
+- `GetAsync<T>(name, defaultValue)` where `T : struct` — uses `value.To<T>()`.
+
+### Provider chain (in add order; reversed at lookup)
+
+| Provider | `Name` | Source |
+| --- | --- | --- |
+| `DefaultValueSettingValueProvider` | `"D"` | `setting.DefaultValue`. |
+| `ConfigurationSettingValueProvider` | `"C"` | `IConfiguration["Settings:" + name]`. **Note**: directly implements `ISettingValueProvider` (no `ISettingStore` dependency). |
+| `GlobalSettingValueProvider` | `"G"` | `ISettingStore.GetOrNullAsync(name, "G", null)`. Tenant/host-wide values. |
+| `TenantSettingValueProvider` | `"T"` (in `Volo.Abp.SettingManagement`) | `ISettingStore.GetOrNullAsync(name, "T", currentTenantId.ToString())`. |
+| `UserSettingValueProvider` | `"U"` | `ISettingStore.GetOrNullAsync(name, "U", currentUser.Id.ToString())`. Returns `null` early if `CurrentUser.Id == null`. |
+
+Because the lookup *reverses* the list, **User overrides Tenant overrides Global overrides Configuration overrides Default** — exactly the expected layering.
+
+### `ISettingStore`
+
+```csharp
+public interface ISettingStore
+{
+    Task<string?> GetOrNullAsync(string name, string? providerName, string? providerKey);
+    Task<List<SettingValue>> GetAllAsync(string[] names, string? providerName, string? providerKey);
+}
+```
+
+`NullSettingStore` (`[Dependency(TryRegister = true)] ISingletonDependency`) returns `null` / empty values — it is the default. `SettingManagementStore` from the `Volo.Abp.SettingManagement.*` modules replaces it and reads/writes from the database with caching.
+
+### `SettingValueProviderManager`
+
+`ISingletonDependency`. Resolves every type in `AbpSettingOptions.ValueProviders` once (lazily) and throws if two providers share the same `Name`. `Providers` is a `List<ISettingValueProvider>` (note: the **features** equivalent exposes `IReadOnlyList`).
+
+## Encryption
+
+`ISettingEncryptionService` (`SettingEncryptionService : ITransientDependency`) delegates to `IStringEncryptionService` from `Volo.Abp.Security.Encryption`:
+
+```csharp
+string? Encrypt(SettingDefinition settingDefinition, string? plainValue);
+string? Decrypt(SettingDefinition settingDefinition, string? encryptedValue);
+```
+
+`Decrypt` is wrapped in `try/catch`. If decryption fails and `AbpSettingOptions.ReturnOriginalValueIfDecryptFailed == true` (default), the original ciphertext is returned with a warning log. Otherwise the exception is logged and `string.Empty` is returned. This is the migration path when you flip `IsEncrypted` on an existing setting.
+
+Encryption only happens when `SettingProvider` writes through the management module (the `ISettingManager` in `Volo.Abp.SettingManagement.Domain`). The built-in `SettingProvider` only decrypts — it never re-encrypts on read.
+
+## Definition lookup
+
+### `SettingDefinitionManager`
+
+`ISettingDefinitionManager, ISingletonDependency`. Combines:
+
+- `IStaticSettingDefinitionStore` — `StaticSettingDefinitionStore` builds a `Dictionary<string, SettingDefinition>` from every `ISettingDefinitionProvider` and caches it via `IStaticDefinitionCache<SettingDefinition, Dictionary<string, SettingDefinition>>` (see `/core/options-and-static-definitions`).
+- `IDynamicSettingDefinitionStore` — `NullDynamicSettingDefinitionStore` is the default; the `Setting Management` module replaces it to read DB-stored definitions.
+
+Static settings *win* over dynamic ones with the same name. `StaticSettingDefinitionChangedEvent` (distributed) lets caches across nodes invalidate when a static definition is mutated.
+
+## File-by-file enumeration
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpSettingsModule.cs` | module | See above. |
+| `AbpSettingOptions.cs` | options | See table above. |
+| `ISettingProvider.cs` / `SettingProvider.cs` | reader | The public entry point; orchestrates provider chain + decryption. |
+| `SettingProviderExtensions.cs` | extensions | `IsTrueAsync`, `GetAsync<T>`. |
+| `SettingValue.cs` | DTO | `[Serializable] : NameValue<string?>`. |
+| `ISettingDefinitionManager.cs` / `SettingDefinitionManager.cs` | catalog | Combines static + dynamic stores. |
+| `ISettingDefinitionContext.cs` / `SettingDefinitionContext.cs` | builder | `Add(params SettingDefinition[])`, `GetOrNull`, `GetAll`. |
+| `ISettingDefinitionProvider.cs` / `SettingDefinitionProvider.cs` | extension point | Override `Define(context)`. |
+| `SettingDefinition.cs` | definition | See table above. |
+| `IStaticSettingDefinitionStore.cs` / `StaticSettingDefinitionStore.cs` | static cache | Build-from-providers once, then cache. |
+| `IDynamicSettingDefinitionStore.cs` / `NullDynamicSettingDefinitionStore.cs` | dynamic catalog | Replaced by the management module. |
+| `StaticSettingDefinitionChangedEvent.cs` | distributed event | Sent to invalidate caches across nodes. |
+| `ISettingValueProvider.cs` / `SettingValueProvider.cs` | provider base | Single `Name` + `GetOrNullAsync` / `GetAllAsync`. |
+| `ISettingValueProviderManager.cs` / `SettingValueProviderManager.cs` | manager | Lazy resolve, duplicate-name detection. |
+| `DefaultValueSettingValueProvider.cs` | `"D"` | `setting.DefaultValue`. |
+| `ConfigurationSettingValueProvider.cs` | `"C"` | `IConfiguration["Settings:" + name]`. **Doesn't take an `ISettingStore`** — implements `ISettingValueProvider` directly. |
+| `GlobalSettingValueProvider.cs` | `"G"` | Store query with `null` provider key. |
+| `UserSettingValueProvider.cs` | `"U"` | Store query with `CurrentUser.Id`. |
+| `ISettingStore.cs` / `NullSettingStore.cs` | store seam | Replaced by `SettingManagementStore`. |
+| `ISettingEncryptionService.cs` / `SettingEncryptionService.cs` | crypto | Wraps `IStringEncryptionService` with the migration-safe `ReturnOriginalValueIfDecryptFailed` branch. |
+
+## Configuration mapping
+
+`ConfigurationSettingValueProvider` expects an `IConfiguration` key in the form `Settings:My.Setting.Name`, e.g.
+
+```jsonc
+// appsettings.json
+{
+  "Settings": {
+    "MyApp.Email.SmtpHost": "smtp.contoso.com"
+  }
+}
+```
+
+Because the `:` separator collides with .NET configuration paths, names that already contain `:` survive — the lookup is literal string concatenation.
+
+## Writing settings
+
+The base subsystem only *reads*. To mutate values, depend on the `Setting Management` module which contributes:
+
+- `ISettingManager` — high-level write API (`SetGlobalAsync`, `SetForTenantAsync`, `SetForUserAsync`, `SetForCurrentTenantAsync`, …).
+- `SettingManagementStore` — `ISettingStore` implementation backed by a repository + distributed cache.
+- `TenantSettingValueProvider` — adds the `"T"` layer to the chain.
+
+See `/modules/setting-management`.
+
+## Related
+
+- `/modules/setting-management` — DB persistence, write API, admin UI.
+- `/core/options-and-static-definitions` — how `IStaticDefinitionCache` is shared with permissions/features.
+- `/multitenancy/current-tenant` — feeds `TenantSettingValueProvider`.
+- `/auth/security-and-claims` — `IStringEncryptionService` and its key configuration.

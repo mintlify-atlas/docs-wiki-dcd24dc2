@@ -1,0 +1,152 @@
+---
+title: "Azure Blob Storage provider"
+sidebarTitle: "Azure Blob"
+description: "Volo.Abp.BlobStoring.Azure — AzureBlobProvider, AzureBlobProviderConfiguration, AzureBlobNamingNormalizer, UseAzure(...) extension, and per-tenant blob name calculation. Wraps Azure.Storage.Blobs.BlobClient."
+---
+
+The Azure provider package is `framework/src/Volo.Abp.BlobStoring.Azure/Volo/Abp/BlobStoring/Azure/`. It depends only on `AbpBlobStoringModule` and on the official **`Azure.Storage.Blobs`** SDK (a `BlobServiceClient` is constructed per call from the container's connection string).
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `AbpBlobStoringAzureModule.cs` | Empty `[DependsOn(typeof(AbpBlobStoringModule))]` module — relies on conventional registration to pick up `AzureBlobProvider`, `DefaultAzureBlobNameCalculator`, and `AzureBlobNamingNormalizer`. |
+| `AzureBlobContainerConfigurationExtensions.cs` | `UseAzure(action)` — sets `ProviderType`, adds `AzureBlobNamingNormalizer`, runs `action(AzureBlobProviderConfiguration)`. Also exposes `GetAzureConfiguration()`. |
+| `AzureBlobProviderConfiguration.cs` | Typed view over the `BlobContainerConfiguration` properties bag. |
+| `AzureBlobProviderConfigurationNames.cs` | The three dotted property keys (`Azure.ConnectionString`, `Azure.ContainerName`, `Azure.CreateContainerIfNotExists`). |
+| `AzureBlobProvider.cs` | The `IBlobProvider` implementation. |
+| `AzureBlobNamingNormalizer.cs` | Lowercases the container name and strips characters outside `[a-z0-9-]`, collapses runs of dashes, trims dashes at start/end, pads to ≥3 chars, truncates to 63. Blob names are passed through. |
+| `IAzureBlobNameCalculator.cs` + `DefaultAzureBlobNameCalculator.cs` | Computes the blob's name under the container — `host/{blobName}` or `tenants/{tenantId:D}/{blobName}`. |
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule))]
+public class AbpBlobStoringAzureModule : AbpModule { }
+```
+
+No `ConfigureServices` body — the provider, the name calculator and the normaliser are all `ITransientDependency` and get registered through `AbpAutoServiceRegistrar` conventional scanning.
+
+## `UseAzure(...)` extension
+
+```csharp
+public static BlobContainerConfiguration UseAzure(
+    this BlobContainerConfiguration containerConfiguration,
+    Action<AzureBlobProviderConfiguration> azureConfigureAction)
+{
+    containerConfiguration.ProviderType = typeof(AzureBlobProvider);
+    containerConfiguration.NamingNormalizers.TryAdd<AzureBlobNamingNormalizer>();
+    azureConfigureAction(new AzureBlobProviderConfiguration(containerConfiguration));
+    return containerConfiguration;
+}
+```
+
+Use it from `AbpBlobStoringOptions`:
+
+```csharp
+Configure<AbpBlobStoringOptions>(o =>
+{
+    o.Containers.Configure<ProfilePhotosContainer>(c =>
+    {
+        c.UseAzure(az =>
+        {
+            az.ConnectionString          = config["Azure:Blob:ConnectionString"];
+            az.ContainerName             = "profile-photos";
+            az.CreateContainerIfNotExists = true;
+        });
+    });
+});
+```
+
+## `AzureBlobProviderConfiguration`
+
+| Property | Bag key | Type | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `ConnectionString` | `Azure.ConnectionString` | `string` | required | Full Azure Storage connection string. Used to construct `new BlobServiceClient(connectionString)` on every call. |
+| `ContainerName` | `Azure.ContainerName` | `string?` | `null` | Override the Azure container name. If null, `BlobContainerConfiguration` container name is used. When set, it is fed through `BlobNormalizeNamingService.NormalizeContainerName` (lowercases, strips invalid chars, etc.). |
+| `CreateContainerIfNotExists` | `Azure.CreateContainerIfNotExists` | `bool` | `false` | When `true`, `SaveAsync` calls `blobContainerClient.CreateIfNotExistsAsync()` before uploading. Off by default to keep prod deployments explicit. |
+
+The getters/setters delegate to `BlobContainerConfiguration.GetConfiguration<T>` / `SetConfiguration(name, value)` over the keys in `AzureBlobProviderConfigurationNames`. Reading `ConnectionString` throws `AbpException` if unset; reading the other two falls back to defaults.
+
+## `DefaultAzureBlobNameCalculator`
+
+```csharp
+public virtual string Calculate(BlobProviderArgs args)
+{
+    return CurrentTenant.Id == null
+        ? $"host/{args.BlobName}"
+        : $"tenants/{CurrentTenant.Id.Value.ToString("D")}/{args.BlobName}";
+}
+```
+
+Result is used as the **blob name** inside the Azure container — i.e. the path under the container. Every multi-tenant container therefore lays out:
+
+```
+{azure-container}/host/<blob>                                 ← when running outside a tenant
+{azure-container}/tenants/{tenantId:D}/<blob>                 ← within a tenant
+```
+
+Replace `IAzureBlobNameCalculator` to change the layout (e.g. for per-environment prefixes).
+
+## `AzureBlobProvider`
+
+The four `IBlobProvider` methods, transcribed:
+
+| Method | Flow |
+| --- | --- |
+| `SaveAsync` | `blobName = NameCalculator.Calculate(args)`. If `!OverrideExisting && BlobExistsAsync` → throw `BlobAlreadyExistsException`. If `CreateContainerIfNotExists` → `blobContainerClient.CreateIfNotExistsAsync()`. Then `GetBlobClient(args, blobName).UploadAsync(args.BlobStream, overwrite: true)`. |
+| `DeleteAsync` | If `BlobExistsAsync` → `DeleteIfExistsAsync()`. Returns whether the deletion happened. |
+| `ExistsAsync` | `BlobExistsAsync(args, blobName)` — first check the container exists, then `blobClient.ExistsAsync()`. |
+| `GetOrNullAsync` | Returns `null` if the blob does not exist; otherwise `blobClient.OpenReadAsync(cancellationToken)` — a streaming read from Azure. |
+
+```csharp
+protected virtual BlobContainerClient GetBlobContainerClient(BlobProviderArgs args)
+{
+    var configuration = args.Configuration.GetAzureConfiguration();
+    var blobServiceClient = new BlobServiceClient(configuration.ConnectionString);
+    return blobServiceClient.GetBlobContainerClient(GetContainerName(args));
+}
+```
+
+`GetContainerName(args)` honours `AzureBlobProviderConfiguration.ContainerName` when set, normalising it; otherwise it uses `args.ContainerName` (which `BlobContainer` already ran through naming normalisation before constructing the args).
+
+<Warning>
+  `SaveAsync` always calls `UploadAsync(stream, overwrite: true)`. The `BlobAlreadyExistsException` is therefore enforced **client-side** by checking existence first, not by the Azure SDK's `IfNoneMatch: "*"` precondition. In high-concurrency scenarios two writers can both pass the existence check; the second `UploadAsync` will silently overwrite. If you need strict create-once semantics, write a custom provider that uses `BlobClient.UploadAsync` with `BlobRequestConditions { IfNoneMatch = ETag.All }`.
+</Warning>
+
+## `AzureBlobNamingNormalizer` — Azure container name rules
+
+Azure containers (the top-level concept, not the per-blob path) must:
+
+- Be lowercase letters, digits, dashes.
+- Start and end with a letter or digit.
+- Have no consecutive dashes.
+- Be 3-63 characters long.
+
+`NormalizeContainerName`:
+
+```csharp
+containerName = containerName.ToLower();
+if (containerName.Length > 63) containerName = containerName.Substring(0, 63);
+containerName = Regex.Replace(containerName, "[^a-z0-9-]", string.Empty);
+containerName = Regex.Replace(containerName, "-{2,}", "-");
+containerName = Regex.Replace(containerName, "^-", string.Empty);
+containerName = Regex.Replace(containerName, "-$", string.Empty);
+if (containerName.Length < 3)
+{
+    var length = containerName.Length;
+    for (var i = 0; i < 3 - length; i++) containerName += "0";
+}
+```
+
+`NormalizeBlobName` returns the name unchanged — Azure blob names allow most printable characters.
+
+## Per-call client lifecycle
+
+`new BlobServiceClient(connectionString)` is created on every method call. The Azure SDK pools the underlying HTTP pipeline internally, so this is cheap (similar pattern to `IHttpClientFactory` for typed clients). If you customise the SDK (`BlobClientOptions`, identity-based auth, retry policies), inherit `AzureBlobProvider` and override `GetBlobContainerClient` to inject a shared, pre-configured client — register your subclass with `services.Replace`.
+
+## Cross-references
+
+- [BLOB storing overview](/blob/blob-storing-overview) — container/factory/selector model.
+- [AWS S3](/blob/aws-s3) / [GCS](/blob/google-cloud-storage) / [Aliyun OSS](/blob/aliyun-oss) / [Bunny CDN](/blob/bunny-cdn) / [MinIO](/blob/minio) — peer providers.
+- [Database BLOB provider](/modules/blob-storing-database) — for storing blobs inside the application database.

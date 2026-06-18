@@ -1,0 +1,358 @@
+---
+title: "ABP CLI Command Reference: Names, Handlers and Key Flags"
+sidebarTitle: "Commands"
+description: "Comprehensive table of every sub-command registered in AbpCliCoreModule with its handler class, short description and most relevant command-line flags."
+---
+
+This page is the authoritative reference for the `abp` command surface. Every command is registered in `AbpCliCoreModule.ConfigureServices` (file: `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/AbpCliCoreModule.cs`) by mapping a name constant on the command class (`public const string Name = "...";`) to its `Type`. `CommandSelector.Select` looks up the dictionary; missing entries fall back to `HelpCommand`.
+
+## How a command resolves
+
+```mermaid
+flowchart LR
+    A[args[]] --> B[ICommandLineArgumentParser.Parse]
+    B --> C[CommandLineArgs.Command]
+    C --> D[CommandSelector.Select]
+    D -->|known| E[AbpCliOptions.Commands[name]]
+    D -->|unknown / empty| F[HelpCommand]
+    E --> G[IServiceProvider.GetRequiredService]
+    G --> H[IConsoleCommand.ExecuteAsync]
+```
+
+`CommandLineArgs` exposes:
+- `Command` — the first token (e.g. `new`, `add-module`).
+- `Target` — the second positional token (e.g. project name for `new`).
+- `Options` — `Dictionary<string, string>` with every `-x`/`--xxx` flag.
+
+All flag-parsing helpers used below live as nested `static class Options` types on each command class.
+
+## Master command table
+
+| Command | Handler | Short description | Most relevant flags |
+| --- | --- | --- | --- |
+| [`add-module`](#add-module) | `AddModuleCommand.cs` | Add a multi-package module to every project of a solution | `-s/--solution`, `-v/--version`, `--with-source-code`, `--new`, `-t/--template`, `--skip-opening-documentation` |
+| [`add-package`](#add-package) | `AddPackageCommand.cs` | Add a single NuGet package + `[DependsOn]` attribute | `-p/--project`, `-s/--solution`, `-ad/--angular-directory`, `-v/--version`, `--with-source-code` |
+| [`build`](#build) | `BuildCommand.cs` | Repository-aware `dotnet build` orchestrator | `-wd/--working-directory`, `-a/--dotnet-build-arguments`, `-n/--build-name`, `-f/--force` |
+| [`bundle`](#bundle) | `BundleCommand.cs` | Generate Blazor static asset bundle | `-wd/--working-directory`, `-t/--project-type`, `-f/--force` |
+| [`clean`](#clean) | `CleanCommand.cs` | `dotnet clean` + delete `bin` / `obj` (skips `node_modules`) | — |
+| [`cli`](#cli) | `CliCommand.cs` | Self-update / remove the `Volo.Abp.Cli` tool | `--preview`, `-v/--version`, `-p` |
+| [`clear-download-cache`](#clear-download-cache) | `ClearDownloadCacheCommand.cs` | Empty `~/.abp/templates` | — |
+| [`create-migration-and-run-migrator`](#create-migration-and-run-migrator) | `CreateMigrationAndRunMigratorCommand.cs` | Scaffold migration then launch `DbMigrator` project | (positional path) |
+| [`generate-proxy`](#generate-proxy) | `GenerateProxyCommand.cs` | Generate client proxies for HTTP APIs | `-t/--type`, `-m/--module`, `-u/--url`, `-o/--output`, `-a/--api-name`, `--folder`, `--without-contracts`, `-st/--service-type`, `-ep/--entry-point` |
+| [`generate-razor-page`](#generate-razor-page) | `GenerateRazorPage.cs` | Scaffold a Razor page + code-behind + JS | (positional name + path) |
+| [`get-source`](#get-source) | `GetSourceCommand.cs` | Download module source via `nuget.abp.io` | `-o/--output-folder`, `-v/--version`, `--preview`, `--abp-path`, `--volo-path` |
+| [`help`](#help) | `HelpCommand.cs` | Print global usage or a single command's usage | (positional command name) |
+| [`install-libs`](#install-libs) | `InstallLibsCommand.cs` | Run yarn + copy `wwwroot/libs` via mapping file | `-wd/--working-directory` |
+| [`list-modules`](#list-modules) | `ListModulesCommand.cs` | List open-source application modules from abp.io | — |
+| [`list-templates`](#list-templates) | `ListTemplatesCommand.cs` | List solution templates with metadata | — |
+| [`login`](#login) | `LoginCommand.cs` | Auth to `account.abp.io` (password or device flow) | `(target)`, `-p/--password`, `-o/--organization`, `--device` |
+| [`login-info`](#login-info) | `LoginInfoCommand.cs` | Print cached login info | — |
+| [`logout`](#logout) | `LogoutCommand.cs` | Hit `/api/license/logout` and wipe token cache | — |
+| [`mcp`](#mcp) | `McpCommand.cs` | Run local Model-Context-Protocol server | (subcommands: `client-config`, etc.) |
+| [`new`](#new) | `NewCommand.cs` | Generate a new solution from a template | `-t/--template`, `-u/--ui`, `-m/--mobile`, `-d/--database-provider`, `--dbms`, `-o/--output-folder`, `-v/--version`, `-cs/--connection-string`, `-csf/--create-solution-folder`, `--theme`, `--tiered`, `--separate-auth-server`, `--preview`, `-sib/--skip-installing-libs`, `-sb/--skip-bundling`, `-sc/--skip-cache` |
+| [`prompt`](#prompt) | `PromptCommand.cs` | Enter REPL (handled in `CliService.RunPromptAsync`) | — |
+| [`remove-proxy`](#remove-proxy) | `RemoveProxyCommand.cs` | Delete files emitted by `generate-proxy` | mirrors `generate-proxy` flags |
+| [`suite`](#suite) | `SuiteCommand.cs` | Install/update/remove/start ABP Suite | `install`, `update`, `remove`, `(default)` start |
+| [`switch-to-local`](#switch-to-local) | `SwitchToLocalCommand.cs` | Replace NuGet refs with local `<ProjectReference>` | `-s/--solution`, `-p/--paths` |
+| [`switch-to-nightly`](#switch-to-nightly) | `SwitchToNightlyCommand.cs` | Move packages to nightly MyGet feed | (positional path) |
+| [`switch-to-prerc`](#switch-to-prerc) | `SwitchToPreRcCommand.cs` | Switch npm packages to pre-rc track | (positional path) |
+| [`switch-to-preview`](#switch-to-preview) | `SwitchToPreviewCommand.cs` | Switch packages to preview channel | (positional path) |
+| [`switch-to-stable`](#switch-to-stable) | `SwitchToStableCommand.cs` | Return to stable from a preview channel | (positional path) |
+| [`translate`](#translate) | `TranslateCommand.cs` | Bulk localisation JSON translation helper | `--apply`, `--reference`, `--all-values`, `--culture` |
+| [`update`](#update) | `UpdateCommand.cs` | Bump NuGet/npm versions across a solution | `--npm`, `--nuget`, `-sn/--solution-name`, `-sp/--solution-path`, `-v/--version`, `--lpx`/`--leptonx-version`, `--check-all` |
+
+<Note>
+`PromptCommand.cs` and `McpCommand.cs` are registered like normal commands but they are also special-cased — `CliService.RunAsync` intercepts `prompt` to drive its own REPL, and `Program.Main` reconfigures Serilog before resolving `mcp`.
+</Note>
+
+## Common parsing rules
+
+- Flags can be short (`-t`) or long (`--type`); names come from `Options.<Group>.Short` / `Options.<Group>.Long` constants.
+- A flag with no value (e.g. `--tiered`) is checked with `Options.ContainsKey(...)`.
+- A flag with a value uses `Options.GetOrNull(short, long)` from `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Args/`.
+
+## Per-command reference
+
+### add-module
+
+Adds **every package** of a multi-package module to the matching layer of a solution (e.g. add `Volo.Identity` → `*.Domain`, `*.Application`, `*.HttpApi`, ...).
+
+Key flags:
+- `-s|--solution <path>` — target `.sln`/`.slnx`. Auto-discovered when omitted.
+- `-v|--version <ver>` — pin to a specific package version.
+- `--with-source-code` — pull source as well (calls `get-source` under the hood).
+- `--new` — install from a fresh template (used for module-templates).
+- `-t|--template <name>` — module template name (`module`, `module-pro`).
+- `--skip-opening-documentation` — do not open the browser after install.
+
+Internally consults `AbpCliOptions.DisabledModulesToAddToSolution` and refuses to install the listed packages.
+
+### add-package
+
+Single-package counterpart of `add-module`. Adds a NuGet reference and edits the nearest `*Module.cs` to insert `[DependsOn(typeof(...))]`.
+
+Key flags:
+- `-p|--project <path>` — target `.csproj`.
+- `-s|--solution <path>` — when omitted, the command runs against the current directory `.csproj`.
+- `-ad|--angular-directory <dir>` — also wire the matching Angular npm package.
+- `-v|--version <ver>` — pin version.
+- `--with-source-code` — pull source.
+
+### build
+
+`abp build` is a smarter `dotnet build`: it understands cross-repo dependencies and skips projects whose state matches the last successful build. See [Bundle & Build](/cli/bundle-and-build).
+
+```bash
+abp build -wd ./src -a "-c Release" -n nightly -f
+```
+
+| Flag | Description |
+| --- | --- |
+| `-wd, --working-directory` | Root path; defaults to current directory. |
+| `-a, --dotnet-build-arguments` | Verbatim args forwarded to `dotnet build`. |
+| `-n, --build-name` | Name persisted alongside the build status snapshot. |
+| `-f, --force` | Ignore cached build status; rebuild everything. |
+
+### bundle
+
+Bundles third-party CSS/JS for Blazor projects.
+
+```bash
+abp bundle -wd ./MyApp.Blazor -t webassembly -f
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-wd, --working-directory` | current dir | Must contain a `.csproj`. |
+| `-t, --project-type` | `webassembly` | Accepts `webassembly`, `maui-blazor`. Validated in `GetProjectType`. |
+| `-f, --force` | `false` | Force a `dotnet build` before bundling so the latest assembly is scanned. |
+
+### clean
+
+Walks the current directory, runs `dotnet clean`, and recursively removes every `bin/` and `obj/` folder **except** those under `node_modules`. No flags.
+
+### cli
+
+Manages the `Volo.Abp.Cli` global tool itself (install / update / remove). Useful when a CLI session needs to switch channels.
+
+Key flags: `--preview`, `-v|--version <ver>`, `-p` (silent prompt).
+
+### clear-download-cache
+
+Deletes everything under `CliPaths.TemplateCache` (`~/.abp/templates`). Useful after `--skip-cache` runs to free disk.
+
+### create-migration-and-run-migrator
+
+Two-step utility for EF Core projects: runs `dotnet ef migrations add ...` against the `*.EntityFrameworkCore` project, then executes the `*.DbMigrator` console project. Used by `NewCommand` after solution scaffolding (`CreateInitialMigrationsAsync`).
+
+### generate-proxy
+
+See [Generate Proxy](/cli/generate-proxy). Resolves a generator from `AbpCliServiceProxyOptions.Generators[type]`:
+
+| `-t/--type` | Generator class |
+| --- | --- |
+| `csharp` | `CSharpServiceProxyGenerator` |
+| `js` | `JavaScriptServiceProxyGenerator` |
+| `ng` | `AngularServiceProxyGenerator` |
+
+### generate-razor-page
+
+Scaffolds a Razor page (`.cshtml`), code-behind (`.cshtml.cs`), and an optional JS file. The handler class file is named `GenerateRazorPage.cs` (no `Command` suffix) but the registered name is `generate-razor-page`.
+
+### get-source
+
+Resolves the package via `nuget.abp.io`, downloads the zip, extracts it to `OutputFolder`.
+
+| Flag | Description |
+| --- | --- |
+| `-o, --output-folder` | Target dir; defaults to a folder named after the module under cwd. |
+| `-v, --version` | Specific version. |
+| `--preview` | Use latest pre-release. |
+| `--abp-path` / `--volo-path` | Override search roots for already-cloned ABP repos. |
+
+### help
+
+`abp help` lists all commands with their `GetShortDescription()` output. `abp help <command>` resolves the command and prints `GetUsageInfo()`. `HelpCommand.NotHiddenFromCommandList` filters out commands tagged with `[HideFromCommandList]` (e.g. internal scaffolding commands).
+
+### install-libs
+
+See [install-libs](/cli/install-libs). Single flag: `-wd|--working-directory`. Runs yarn for every detected web/Angular/React-Native project, then copies files via `abp.resourcemapping.js`.
+
+### list-modules
+
+Hits the abp.io marketplace endpoint and prints a table of open-source modules with short description and source-code URL. No flags.
+
+### list-templates
+
+Lists every template returned from `ITemplateInfoProvider` (e.g. `app`, `app-pro`, `app-nolayers`, `app-nolayers-pro`, `module`, `module-pro`, `microservice-pro`, `console`, `wpf`, `maui`). No flags.
+
+### login
+
+Two flows:
+
+<Tabs>
+  <Tab title="Password flow">
+
+```bash
+abp login <username> -p <password> -o <organization>
+```
+
+`AuthService.LoginAsync(username, password, organization)`. If `--organization` is omitted but the account belongs to multiple, the CLI lists them and exits.
+  </Tab>
+  <Tab title="Device flow">
+
+```bash
+abp login --device
+```
+
+`AuthService.DeviceLoginAsync()` performs OAuth device flow. After approval `GetLoginInfoAsync()` prints the resolved user.
+  </Tab>
+</Tabs>
+
+The bearer token is cached to `CliPaths.AccessToken` (`~/.abp/cli/access-token.bin`).
+
+### login-info
+
+Reads the cached token and calls `AuthService.GetLoginInfoAsync()` to print `Name`, `Surname`, `Username`, `EmailAddress`, `Organization`. Exits with an error if not logged in.
+
+### logout
+
+`AuthService.LogoutAsync()` POSTs to `CliConsts.LogoutUrl` (`{AccountAbpIo}api/license/logout`) and removes `CliPaths.AccessToken`.
+
+### mcp
+
+Starts the local MCP server. Logging is reconfigured at program start (`Program.Main`) so stdout carries only JSON-RPC frames. File log lives at `CliPaths.McpLog` (`~/.abp/cli/logs/mcp.log`). Tool definitions are cached at `CliPaths.McpToolsCache`. Subcommands write to `CliPaths.McpConfig` (`mcp-config.json`) — that file is what AI tools point at.
+
+Server URL defaults to `CliConsts.DefaultMcpServerUrl` = `https://mcp.abp.io`. Override the log level with `ABP_MCP_LOG_LEVEL` (env var name in `CliConsts.McpLogLevelEnvironmentVariable`).
+
+### new
+
+See [Project Creation](/cli/project-creation) for the full pipeline. Below is the canonical flag list from `NewCommand.GetUsageInfo()`:
+
+```text
+-t|--template <template-name>               (default: app)
+-u|--ui <ui-framework>                      (if supported by the template)
+-m|--mobile <mobile-framework>              (if supported by the template)
+-d|--database-provider <database-provider>  (if supported by the template)
+-o|--output-folder <output-folder>          (default: current folder)
+-v|--version <version>                      (default: latest version)
+--preview                                   (Use latest pre-release version)
+-ts|--template-source <template-source>     (local or network template source)
+-csf|--create-solution-folder               (default: true)
+-cs|--connection-string <connection-string> (database connection string)
+--dbms <database-management-system>         (database management system)
+--theme <theme-name>                        (default: leptonx-lite)
+--tiered                                    (if supported by the template)
+--no-ui                                     (if supported by the template)
+--no-random-port                            (Use template's default ports)
+--separate-auth-server                      (if supported by the template)
+--local-framework-ref --abp-path <repo>     (keep local project refs)
+-sib|--skip-installing-libs                 (do not run `abp install-libs`)
+-sb|--skip-bundling                         (do not run `abp bundle`)
+-sc|--skip-cache                            (re-download templates)
+```
+
+### prompt
+
+Enters a REPL handled by `CliService.RunPromptAsync`. Reads lines from `Console.ReadLine`, splits by space, runs each through `RunInternalAsync`. Exit with literal `exit`.
+
+### remove-proxy
+
+Mirror of `generate-proxy`: same flags, different action. Each generator branches on `args.CommandName == RemoveProxyCommand.Name`. See [Generate Proxy](/cli/generate-proxy).
+
+### suite
+
+ABP Suite is a separate `dotnet tool` (`Volo.Abp.Suite`). `SuiteCommand` handles `install`, `update`, `remove`, plus the default form `abp suite` which launches `volo-abp-suite`.
+
+### switch-to-local
+
+Walks every `.csproj` under the working directory, and rewrites NuGet `<PackageReference>` lines for ABP packages into `<ProjectReference>` lines that point at the matching project in a local clone of the `abp` repo.
+
+| Flag | Description |
+| --- | --- |
+| `-s, --solution` | Solution file to scope the replacement. |
+| `-p, --paths` | Semicolon-separated list of local-source roots. |
+
+### switch-to-nightly / switch-to-preview / switch-to-prerc / switch-to-stable
+
+Bump all `Volo.*` package references plus matching npm packages to the chosen channel. Implementation reuses `VoloNugetPackagesVersionUpdater` and `NpmPackagesUpdater` from `ProjectModification/`.
+
+`switch-to-nightly` additionally appends MyGet (`https://www.myget.org/F/abp-nightly/...`) to `NuGet.config`.
+
+### translate
+
+Localisation helper. Two phases:
+
+1. **Discover** — without `--apply`, prints JSON entries that are missing translations.
+2. **Apply** — with `--apply`, writes the merged translation back.
+
+Common flags: `--reference <culture>` (source culture), `--culture <culture>` (target), `--all-values` (overwrite even already-translated keys).
+
+### update
+
+```bash
+abp update --nuget --check-all -v 9.0.0
+abp update --npm --leptonx-version 4.0.0
+```
+
+| Flag | Description |
+| --- | --- |
+| `--npm` | Update only npm packages. |
+| `--nuget` | Update only NuGet packages. Omitting both does both. |
+| `-sn, --solution-name <name>` | Target a specific `.sln`/`.slnx`. |
+| `-sp, --solution-path <dir>` | Working directory. |
+| `-v, --version <ver>` | Pin target version. |
+| `--lpx, --leptonx-version` | Override LeptonX theme version independently. |
+| `--check-all` | Update every NuGet package, not only `Volo.*`. |
+
+Drives `VoloNugetPackagesVersionUpdater.UpdateSolutionAsync` and `NpmPackagesUpdater.Update`.
+
+## Discovering flags for an unknown command
+
+Every command exposes:
+
+```csharp
+public string GetUsageInfo();            // long form used by `abp help <cmd>`
+public static string GetShortDescription(); // one-liner shown by `abp help`
+```
+
+For agents authoring scripts, the safest source-of-truth is **the command's nested `Options` static class** — every `Short` / `Long` constant is declared there. Grep:
+
+```bash
+rg -n "public const string (Short|Long)" \
+  framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/<Command>.cs
+```
+
+## Hidden commands
+
+`HelpCommand` filters with `[HideFromCommandList]` (see `Internal/HideFromCommandList.cs`). Such commands are still callable but absent from `abp help`. Example: `RecreateInitialMigrationCommand` (registered in `AbpCliCoreModule` but tagged hidden) and `CliCommand` (`cli`).
+
+## Aliasing or replacing commands
+
+To swap a command implementation in your own host (rare), add a module that depends on `AbpCliCoreModule` and:
+
+```csharp
+Configure<AbpCliOptions>(options =>
+{
+    options.Commands[NewCommand.Name] = typeof(MyCustomNewCommand);
+});
+```
+
+Because `CommandSelector` reads the dictionary at dispatch time, the override applies for every subsequent invocation in that process — useful for embedding the CLI in a custom shell or for unit tests.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/cli/overview">
+    Big-picture architecture and the `Cli.Core` folder map.
+  </Card>
+  <Card title="Project Creation" icon="plus" href="/cli/project-creation">
+    The full pipeline behind `abp new`.
+  </Card>
+  <Card title="install-libs" icon="box" href="/cli/install-libs">
+    Yarn-driven `wwwroot/libs` provisioning.
+  </Card>
+  <Card title="Generate Proxy" icon="code" href="/cli/generate-proxy">
+    HTTP-API client generation for C#/JS/Angular.
+  </Card>
+</CardGroup>

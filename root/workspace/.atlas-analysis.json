@@ -1,0 +1,426 @@
+{
+  "projectType": "framework",
+  "projectName": "ABP Framework",
+  "projectDescription": "Open-source, modular, DDD-friendly application framework for ASP.NET Core that ships a large ecosystem of NuGet packages, pre-built application modules, Angular/Blazor UI libraries, CLI tooling, and solution templates for building enterprise-grade .NET solutions.",
+  "theme": "maple",
+  "primaryColor": "#ba4395",
+  "lightColor": "#ffffff",
+  "darkColor": "#7a2c61",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Wiki",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "index",
+              "overview/architecture",
+              "overview/repository-layout",
+              "overview/solution-structure",
+              "overview/build-and-tooling",
+              "overview/glossary"
+            ]
+          },
+          {
+            "group": "Core & Modularity",
+            "pages": [
+              "core/overview",
+              "core/volo-abp-core",
+              "core/modularity-system",
+              "core/dependency-injection",
+              "core/dynamic-proxy-and-aspects",
+              "core/exception-handling",
+              "core/threading-and-async",
+              "core/reflection-and-collections",
+              "core/options-and-static-definitions",
+              "core/virtual-file-system",
+              "core/logging-and-tracing"
+            ]
+          },
+          {
+            "group": "Domain-Driven Design Layer",
+            "pages": [
+              "ddd/overview",
+              "ddd/domain-shared",
+              "ddd/domain",
+              "ddd/entities-and-aggregates",
+              "ddd/repositories",
+              "ddd/domain-services",
+              "ddd/value-objects-and-specifications",
+              "ddd/application-contracts",
+              "ddd/application-services",
+              "ddd/dtos-and-object-mapping",
+              "ddd/object-extending"
+            ]
+          },
+          {
+            "group": "Data Access",
+            "pages": [
+              "data/overview",
+              "data/volo-abp-data",
+              "data/unit-of-work",
+              "data/entity-framework-core",
+              "data/ef-core-providers",
+              "data/mongodb",
+              "data/dapper",
+              "data/memory-db",
+              "data/data-seeding-and-migrations",
+              "data/data-filtering",
+              "data/connection-strings"
+            ]
+          },
+          {
+            "group": "ASP.NET Core Integration",
+            "pages": [
+              "aspnetcore/overview",
+              "aspnetcore/volo-abp-aspnetcore",
+              "aspnetcore/mvc-integration",
+              "aspnetcore/mvc-ui-bootstrap",
+              "aspnetcore/mvc-ui-bundling",
+              "aspnetcore/mvc-ui-themes",
+              "aspnetcore/mvc-ui-widgets",
+              "aspnetcore/mvc-client-proxies",
+              "aspnetcore/mvc-newtonsoft",
+              "aspnetcore/mvc-multitenancy",
+              "aspnetcore/signalr",
+              "aspnetcore/serilog",
+              "aspnetcore/swashbuckle",
+              "aspnetcore/test-base"
+            ]
+          },
+          {
+            "group": "Authentication & Authorization",
+            "pages": [
+              "auth/overview",
+              "auth/authorization",
+              "auth/permissions",
+              "auth/jwt-bearer",
+              "auth/oauth",
+              "auth/openid-connect",
+              "auth/identity-model",
+              "auth/security-and-claims",
+              "auth/ldap",
+              "auth/gdpr"
+            ]
+          },
+          {
+            "group": "Multi-Tenancy",
+            "pages": [
+              "multitenancy/overview",
+              "multitenancy/tenant-resolution",
+              "multitenancy/current-tenant",
+              "multitenancy/connection-string-resolver",
+              "multitenancy/aspnetcore-integration",
+              "multitenancy/mvc-ui"
+            ]
+          },
+          {
+            "group": "Event Bus & Messaging",
+            "pages": [
+              "eventbus/overview",
+              "eventbus/local-event-bus",
+              "eventbus/distributed-event-bus",
+              "eventbus/rabbitmq",
+              "eventbus/kafka",
+              "eventbus/azure-service-bus",
+              "eventbus/dapr-integration",
+              "eventbus/rebus-integration"
+            ]
+          },
+          {
+            "group": "Background Jobs & Workers",
+            "pages": [
+              "background/overview",
+              "background/background-jobs",
+              "background/background-workers",
+              "background/hangfire",
+              "background/quartz",
+              "background/rabbitmq-jobs",
+              "background/tickerq",
+              "background/distributed-locking"
+            ]
+          },
+          {
+            "group": "Caching & Storage",
+            "pages": [
+              "caching/overview",
+              "caching/distributed-cache",
+              "caching/redis",
+              "blob/blob-storing-overview",
+              "blob/azure-blob",
+              "blob/aws-s3",
+              "blob/google-cloud-storage",
+              "blob/aliyun-oss",
+              "blob/bunny-cdn",
+              "blob/minio",
+              "blob/file-system",
+              "blob/memory"
+            ]
+          },
+          {
+            "group": "Cross-Cutting Concerns",
+            "pages": [
+              "crosscut/auditing",
+              "crosscut/validation",
+              "crosscut/fluent-validation",
+              "crosscut/features",
+              "crosscut/global-features",
+              "crosscut/settings",
+              "crosscut/localization",
+              "crosscut/multilingual-objects",
+              "crosscut/serialization-and-json",
+              "crosscut/guids",
+              "crosscut/timing"
+            ]
+          },
+          {
+            "group": "Text Templating & Imaging",
+            "pages": [
+              "texttemplating/overview",
+              "texttemplating/razor",
+              "texttemplating/scriban",
+              "imaging/overview",
+              "imaging/imagesharp",
+              "imaging/skiasharp",
+              "imaging/magicknet"
+            ]
+          },
+          {
+            "group": "Communication",
+            "pages": [
+              "comm/emailing",
+              "comm/mailkit",
+              "comm/sms",
+              "comm/sms-aliyun",
+              "comm/sms-tencent-cloud",
+              "comm/http-client",
+              "comm/remote-services"
+            ]
+          },
+          {
+            "group": "AI & Integrations",
+            "pages": [
+              "ai/abstractions",
+              "ai/implementation",
+              "integrations/dapr",
+              "integrations/autofac",
+              "integrations/automapper",
+              "integrations/mapperly",
+              "integrations/castle-core"
+            ]
+          },
+          {
+            "group": "UI Stacks",
+            "pages": [
+              "ui/overview",
+              "ui/navigation-menus",
+              "ui/mvc-razor-pages",
+              "ui/blazor-components-web",
+              "ui/blazor-components-server",
+              "ui/blazor-components-webassembly",
+              "ui/blazor-maui",
+              "ui/blazorise-ui",
+              "ui/maui-client",
+              "ui/minify"
+            ]
+          },
+          {
+            "group": "Application Modules",
+            "pages": [
+              "modules/overview",
+              "modules/identity",
+              "modules/account",
+              "modules/openiddict",
+              "modules/identityserver",
+              "modules/permission-management",
+              "modules/setting-management",
+              "modules/feature-management",
+              "modules/tenant-management",
+              "modules/audit-logging",
+              "modules/background-jobs-module",
+              "modules/blob-storing-database",
+              "modules/cms-kit",
+              "modules/blogging",
+              "modules/docs",
+              "modules/users",
+              "modules/virtual-file-explorer",
+              "modules/basic-theme",
+              "modules/client-simulation"
+            ]
+          },
+          {
+            "group": "Angular UI (npm/ng-packs)",
+            "pages": [
+              "angular/overview",
+              "angular/core",
+              "angular/account",
+              "angular/identity",
+              "angular/permission-management",
+              "angular/setting-management",
+              "angular/feature-management",
+              "angular/tenant-management",
+              "angular/cms-kit",
+              "angular/components",
+              "angular/oauth",
+              "angular/schematics-and-generators",
+              "angular/theme-basic-shared"
+            ]
+          },
+          {
+            "group": "CLI & Tooling",
+            "pages": [
+              "cli/overview",
+              "cli/commands",
+              "cli/project-creation",
+              "cli/install-libs",
+              "cli/bundle-and-build",
+              "cli/generate-proxy",
+              "cli/login-and-licensing",
+              "cli/mcp-and-translate",
+              "cli/cli-core",
+              "tools/changelog-generator",
+              "tools/localization-key-synchronizer"
+            ]
+          },
+          {
+            "group": "Solution Templates",
+            "pages": [
+              "templates/overview",
+              "templates/app",
+              "templates/app-nolayers",
+              "templates/module",
+              "templates/console",
+              "templates/maui",
+              "templates/wpf"
+            ]
+          },
+          {
+            "group": "Key Flows",
+            "pages": [
+              "flows/application-startup",
+              "flows/module-loading-lifecycle",
+              "flows/http-request-lifecycle",
+              "flows/unit-of-work-flow",
+              "flows/distributed-event-publish",
+              "flows/background-job-execution",
+              "flows/multi-tenant-request",
+              "flows/authentication-flow",
+              "flows/data-seeding-flow",
+              "flows/dynamic-c-sharp-client-proxy"
+            ]
+          },
+          {
+            "group": "Build, Test & Deploy",
+            "pages": [
+              "ops/build-scripts",
+              "ops/test-base",
+              "ops/perf-and-distevents",
+              "ops/deploy-scripts",
+              "ops/nuget-and-packaging",
+              "ops/npm-publish-pipeline"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Volo.Abp.Core foundation (AbpApplicationBase, modularity, DI, virtual file system)",
+    "Modularity system with AbpModule and dependency graph",
+    "Dependency Injection extensions and conventional registration",
+    "Dynamic proxy / interception aspects (Castle integration)",
+    "Domain-Driven Design layer (Domain.Shared, Domain, Application.Contracts, Application)",
+    "Entities, aggregate roots, value objects, repositories, domain services, specifications",
+    "Unit of Work with ambient context and event ordering",
+    "Data layer: connection strings, data filtering, data seeding, migrations",
+    "Entity Framework Core integration with SQL Server, PostgreSQL, MySQL, SQLite, Oracle providers",
+    "MongoDB, Dapper, MemoryDb persistence providers",
+    "ASP.NET Core integration: MVC, Razor Pages, SignalR, Serilog, Swashbuckle",
+    "MVC UI: Bootstrap theme, bundling, widgets, dynamic JS proxies",
+    "Authentication: JWT Bearer, OAuth, OpenID Connect, IdentityModel",
+    "Authorization framework and Permission system",
+    "Multi-Tenancy with tenant resolvers and connection string resolver",
+    "Local and distributed Event Bus (RabbitMQ, Kafka, Azure Service Bus, Dapr, Rebus)",
+    "Background Jobs and Background Workers (Hangfire, Quartz, RabbitMQ, TickerQ)",
+    "Distributed Locking (with Dapr provider)",
+    "Caching (in-memory + StackExchange Redis distributed cache)",
+    "BLOB Storing providers (Azure, AWS S3, Google Cloud, Aliyun, Bunny, MinIO, FileSystem, Memory)",
+    "Auditing and AuditLogging module",
+    "Validation (DataAnnotations + FluentValidation)",
+    "Features and GlobalFeatures",
+    "Settings and SettingManagement module",
+    "Localization (resources, abstractions, multi-lingual objects)",
+    "Text Templating (Razor, Scriban)",
+    "Imaging (ImageSharp, SkiaSharp, MagickNet)",
+    "Emailing (MailKit) and SMS (Aliyun, Tencent Cloud)",
+    "HTTP client + Remote Services (IdentityModel auth flows for MVC/Blazor/MAUI)",
+    "AI abstractions",
+    "Dapr integration (sidecar event bus, distributed lock, HTTP client, MVC)",
+    "Autofac and AutoMapper / Mapperly object mapping",
+    "Blazor UI stack (Server, WebAssembly, Web App, MauiBlazor, BlazoriseUI)",
+    "MAUI client integration",
+    "UI Navigation menu system",
+    "Minification",
+    "Application modules: Identity, Account, OpenIddict, IdentityServer, PermissionManagement, SettingManagement, FeatureManagement, TenantManagement, AuditLogging, BackgroundJobs, BlobStoring.Database, CmsKit, Blogging, Docs, Users, VirtualFileExplorer, BasicTheme, ClientSimulation",
+    "Angular UI packages (ng-packs): core, account, identity, permission-management, setting-management, feature-management, tenant-management, cms-kit, components, oauth, schematics, generators, theme-basic, theme-shared",
+    "ABP CLI command set (new, add-module, install-libs, generate-proxy, bundle, build, switch-to-*, login, translate, mcp)",
+    "Cli.Core: ProjectBuilding, ProjectModification, ServiceProxying, Licensing, GitHub, Bundling",
+    "Solution templates (app, app-nolayers, module, console, maui, wpf) with Angular and ASP.NET Core variants",
+    "Test base infrastructure (Volo.Abp.TestBase, AspNetCore.TestBase)",
+    "Build scripts (PowerShell), deploy/NuGet/NPM publish scripts",
+    "AI rules folder for ABP coding conventions",
+    "GDPR abstractions",
+    "Object extending system"
+  ],
+  "publicApiSurface": [
+    "framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs",
+    "framework/src/Volo.Abp.Core/Volo/Abp/IAbpApplication.cs",
+    "framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs",
+    "framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModule.cs",
+    "framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/Entity.cs",
+    "framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/AggregateRoot.cs",
+    "framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/IRepository.cs",
+    "framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/ApplicationService.cs",
+    "framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/CrudAppService.cs",
+    "framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkAttribute.cs",
+    "framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWorkManager.cs",
+    "framework/src/Volo.Abp.EventBus/Volo/Abp/EventBus/Local/ILocalEventBus.cs",
+    "framework/src/Volo.Abp.EventBus/Volo/Abp/EventBus/Distributed/IDistributedEventBus.cs",
+    "framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/DefaultBackgroundJobManager.cs",
+    "framework/src/Volo.Abp.BackgroundWorkers/Volo/Abp/BackgroundWorkers/IBackgroundWorkerManager.cs",
+    "framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/CurrentTenant.cs",
+    "framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/TenantResolver.cs",
+    "framework/src/Volo.Abp.Authorization/Volo/Abp/Authorization/AbpAuthorizationService.cs",
+    "framework/src/Volo.Abp.Authorization/Volo/Abp/Authorization/Permissions/",
+    "framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpController.cs",
+    "framework/src/Volo.Abp.Cli/Volo/Abp/Cli/Program.cs",
+    "framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/",
+    "framework/src/Volo.Abp.BlobStoring/",
+    "framework/src/Volo.Abp.Caching/",
+    "framework/src/Volo.Abp.Settings/",
+    "framework/src/Volo.Abp.Features/",
+    "framework/src/Volo.Abp.Localization/",
+    "framework/src/Volo.Abp.Validation/",
+    "framework/src/Volo.Abp.Auditing/",
+    "framework/src/Volo.Abp.EntityFrameworkCore/",
+    "framework/src/Volo.Abp.MongoDB/",
+    "framework/src/Volo.Abp.Data/Volo/Abp/Data/",
+    "modules/identity/src/Volo.Abp.Identity.Domain/",
+    "modules/account/src/Volo.Abp.Account.Application/",
+    "modules/openiddict/src/",
+    "modules/permission-management/src/",
+    "modules/tenant-management/src/",
+    "modules/feature-management/src/",
+    "modules/setting-management/src/",
+    "modules/audit-logging/src/",
+    "modules/cms-kit/src/",
+    "modules/docs/src/",
+    "modules/blogging/src/",
+    "templates/app/aspnet-core/src/",
+    "templates/app-nolayers/aspnet-core/",
+    "npm/ng-packs/packages/core/src/lib/",
+    "npm/ng-packs/packages/account/",
+    "npm/ng-packs/packages/identity/"
+  ]
+}

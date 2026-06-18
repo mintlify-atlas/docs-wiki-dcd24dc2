@@ -1,0 +1,127 @@
+---
+title: "AWS S3 provider"
+sidebarTitle: "AWS S3"
+description: "Volo.Abp.BlobStoring.Aws — AwsBlobProvider, AwsBlobProviderConfiguration, IAmazonS3ClientFactory with profile / temporary-session / federated-token credentials, STS caching via IDistributedCache, AwsBlobNamingNormalizer."
+---
+
+The AWS provider package is `framework/src/Volo.Abp.BlobStoring.Aws/Volo/Abp/BlobStoring/Aws/`. It depends on `AbpBlobStoringModule` **and** `AbpCachingModule` because temporary STS credentials are cached through `IDistributedCache<AwsTemporaryCredentialsCacheItem>` (encrypted) between calls. SDKs: `AWSSDK.S3`, `AWSSDK.SecurityToken`.
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `AbpBlobStoringAwsModule.cs` | `[DependsOn(AbpBlobStoringModule, AbpCachingModule)]`, empty body. |
+| `AwsBlobContainerConfigurationExtensions.cs` | `UseAws(action)` and `GetAwsConfiguration()`. |
+| `AwsBlobProviderConfiguration.cs` | Typed view over the container's properties bag. |
+| `AwsBlobProviderConfigurationNames.cs` | The string keys for the bag (`Aws.AccessKeyId`, `Aws.Region`, etc.). |
+| `AwsBlobProvider.cs` | The `IBlobProvider`. |
+| `AwsBlobNamingNormalizer.cs` | S3 bucket naming rules (lowercase, dots/dashes, no IP-like names, length 3-63). |
+| `IAwsBlobNameCalculator.cs` + `DefaultAwsBlobNameCalculator.cs` | `host/{blob}` vs. `tenants/{tenantId}/{blob}` blob key. |
+| `IAmazonS3ClientFactory.cs` + `DefaultAmazonS3ClientFactory.cs` | Builds `AmazonS3Client` with one of four credential strategies; caches STS sessions. |
+| `AwsTemporaryCredentialsCacheItem.cs` | `{ AccessKeyId, SecretAccessKey, SessionToken }` cache entry (encrypted via `IStringEncryptionService`). |
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule),
+           typeof(AbpCachingModule))]
+public class AbpBlobStoringAwsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context) { }
+}
+```
+
+Conventional registration picks up `AwsBlobProvider`, `DefaultAmazonS3ClientFactory`, `DefaultAwsBlobNameCalculator`, and `AwsBlobNamingNormalizer` as transient.
+
+## `UseAws(...)`
+
+```csharp
+containerConfiguration.ProviderType = typeof(AwsBlobProvider);
+containerConfiguration.NamingNormalizers.TryAdd<AwsBlobNamingNormalizer>();
+awsConfigureAction(new AwsBlobProviderConfiguration(containerConfiguration));
+```
+
+```csharp
+o.Containers.ConfigureDefault(c =>
+{
+    c.UseAws(aws =>
+    {
+        aws.AccessKeyId     = config["Aws:AccessKeyId"];
+        aws.SecretAccessKey = config["Aws:SecretAccessKey"];
+        aws.Region          = "eu-west-1";
+        aws.ContainerName   = "myapp-blobs";
+        aws.CreateContainerIfNotExists = true;
+    });
+});
+```
+
+## `AwsBlobProviderConfiguration`
+
+| Property | Bag key | Type | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `AccessKeyId` | `Aws.AccessKeyId` | `string?` | `null` | Long-lived access key id. Required if neither `UseCredentials` nor the temporary modes are enabled. |
+| `SecretAccessKey` | `Aws.SecretAccessKey` | `string?` | `null` | Paired with `AccessKeyId`. |
+| `UseCredentials` | `Aws.UseCredentials` | `bool` | `false` | Read AWS credentials from the local profile store via `ProfileName` / `ProfilesLocation`. |
+| `UseTemporaryCredentials` | `Aws.UseTemporaryCredentials` | `bool` | `false` | Use STS `GetSessionToken` to derive short-lived creds and cache them. |
+| `UseTemporaryFederatedCredentials` | `Aws.UseTemporaryFederatedCredentials` | `bool` | `false` | Use STS `GetFederationToken` (requires `Name` + `Policy`) and cache. |
+| `ProfileName` | `Aws.ProfileName` | `string?` | `null` | Named profile in the AWS SDK credential store. |
+| `ProfilesLocation` | `Aws.ProfilesLocation` | `string?` | `null` | Custom path to the credentials file. |
+| `DurationSeconds` | `Aws.DurationSeconds` | `int` | `0` | STS duration. Session: 900-129600. Federated: depends on `Name`/`Policy`. |
+| `Name` | `Aws.Name` | `string` | required for federated | Federation session name. |
+| `Policy` | `Aws.Policy` | `string?` | required for federated | IAM policy JSON scoped to the federated session. |
+| `Region` | `Aws.Region` | `string` | required | AWS region system name (e.g. `eu-west-1`). |
+| `ContainerName` | `Aws.ContainerName` | `string?` | `null` | Override the bucket name. Falls back to `args.ContainerName`. Run through `BlobNormalizeNamingService.NormalizeContainerName` when used. |
+| `CreateContainerIfNotExists` | `Aws.CreateContainerIfNotExists` | `bool` | `false` | Call `AmazonS3Util.DoesS3BucketExistV2Async` and `PutBucketAsync` on save when the bucket doesn't exist. |
+| `TemporaryCredentialsCacheKey` | `Aws.TemporaryCredentialsCacheKey` | `string?` | `Guid.NewGuid().ToString("N")` (per configuration instance) | Cache key for the STS session. Override to share cached sessions across configurations. |
+
+## `IAmazonS3ClientFactory` strategy
+
+`DefaultAmazonS3ClientFactory.GetAmazonS3Client(configuration)` picks one of four paths, in priority order:
+
+1. **`UseCredentials = true`** — `GetAwsCredentials()` walks `CredentialProfileStoreChain(configuration.ProfilesLocation)`. If `ProfileName` resolves, returns `new AmazonS3Client(awsCreds, region)`; if not, falls back to `new AmazonS3Client(region)` which uses the default SDK chain (env, IAM role, …).
+2. **`UseTemporaryCredentials = true`** — calls `GetTemporaryCredentialsAsync`:
+   - `Cache.GetAsync(configuration.TemporaryCredentialsCacheKey)` first.
+   - On miss, builds an `AmazonSecurityTokenServiceClient` (with the long-lived key + secret if supplied, otherwise the profile store), invokes `GetSessionTokenAsync(new GetSessionTokenRequest { DurationSeconds })`, and caches the response.
+   - Cache value is `AwsTemporaryCredentialsCacheItem` with **`IStringEncryptionService`-encrypted** access key / secret / session token. TTL = `DurationSeconds - 10` seconds.
+   - Returns `new SessionAWSCredentials(decryptedAK, decryptedSK, decryptedToken)`.
+3. **`UseTemporaryFederatedCredentials = true`** — same flow but `GetFederationTokenAsync(new GetFederationTokenRequest { Name, Policy, DurationSeconds })`. Requires `Name` and `Policy` to be set.
+4. **Otherwise** — `Check.NotNullOrWhiteSpace(AccessKeyId)`, `Check.NotNullOrWhiteSpace(SecretAccessKey)`, return `new AmazonS3Client(ak, sk, region)`.
+
+Because `TemporaryCredentialsCacheKey` defaults to a new GUID per `AwsBlobProviderConfiguration` instance, distinct containers (or even distinct evaluations of `GetAwsConfiguration()`) on the same node will not share cached STS sessions unless you set an explicit key. Setting an explicit key matters when you have a fleet of containers all in the same region using the same long-lived credentials.
+
+## `AwsBlobProvider`
+
+For each call: `using (var amazonS3Client = await GetAmazonS3Client(args)) { … }` — the client is disposed at the end of the operation. Per-call client construction matches the Azure provider's pattern.
+
+| Method | Flow |
+| --- | --- |
+| `SaveAsync` | If `!OverrideExisting && BlobExistsAsync(client, container, blobName)` → `BlobAlreadyExistsException`. If `CreateContainerIfNotExists` and `!await AmazonS3Util.DoesS3BucketExistV2Async(...)` → `client.PutBucketAsync(container)`. Then `PutObjectAsync(new PutObjectRequest { BucketName, Key, InputStream })`. |
+| `DeleteAsync` | If blob exists → `DeleteObjectAsync(...)` → return true; else false. |
+| `ExistsAsync` | Issues `GetObjectMetadataAsync(...)` and returns true on success, false on `AmazonS3Exception` with `HttpStatusCode.NotFound`. |
+| `GetOrNullAsync` | If not exists → null. Else `GetObjectAsync` and `TryCopyToMemoryStreamAsync(response.ResponseStream)` (returns a buffered `MemoryStream` so the caller can read after the AWS response is disposed). |
+
+## `AwsBlobNamingNormalizer` — S3 bucket rules
+
+Lowercases, truncates to 63 chars, strips characters outside `[a-z0-9-.]`, collapses runs of dots, strips leading/trailing dots/dashes, removes IP-address-like patterns, pads to ≥3 chars. Blob names are returned unchanged — S3 keys allow most UTF-8 strings.
+
+## `DefaultAwsBlobNameCalculator`
+
+```csharp
+return CurrentTenant.Id == null
+    ? $"host/{args.BlobName}"
+    : $"tenants/{CurrentTenant.Id.Value:D}/{args.BlobName}";
+```
+
+Identical pattern to Azure: `host` or `tenants/{tenantId}` prefix on the **S3 key**, not the bucket.
+
+## Operational considerations
+
+- **STS cache invalidation**. The STS session is cached for `DurationSeconds - 10s`. AWS revokes IAM policies in roughly real time; cached sessions outlive the revocation by up to that margin. Cap `DurationSeconds` accordingly for sensitive workloads.
+- **Encryption at rest in the cache**. Sessions are encrypted with `IStringEncryptionService`. Configure your `AbpStringEncryptionOptions` (passphrase / IV) consistently across instances if you share the distributed cache, otherwise nodes can't decrypt each other's entries.
+- **Bucket existence checks** issue an S3 head/list. Setting `CreateContainerIfNotExists = false` (the default) saves one round-trip per save and is appropriate when buckets are provisioned out-of-band.
+
+## Cross-references
+
+- [BLOB storing overview](/blob/blob-storing-overview), [MinIO](/blob/minio) (S3-compatible alternative).
+- [Distributed cache](/caching/distributed-cache) — backs `IDistributedCache<AwsTemporaryCredentialsCacheItem>`.
+- `Volo.Abp.Security.Encryption.IStringEncryptionService` — encrypts cached STS tokens.

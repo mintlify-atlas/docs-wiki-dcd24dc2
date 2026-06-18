@@ -1,0 +1,240 @@
+---
+title: "Distributed cache (IDistributedCache<T>)"
+sidebarTitle: "Distributed cache"
+description: "Volo.Abp.Caching — typed IDistributedCache<TCacheItem[, TCacheKey]>, the DistributedCache<> singleton, AbpDistributedCacheOptions, CacheNameAttribute, IDistributedCacheKeyNormalizer, sliding/absolute expiration, multi-tenant key prefixing, HideErrors, and unit-of-work-aware cache items."
+---
+
+ABP wraps `Microsoft.Extensions.Caching.Distributed.IDistributedCache` with a generic, JSON-serialised, tenant-aware façade. The core types live in `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/`.
+
+## File map
+
+| File | Purpose |
+| --- | --- |
+| `AbpCachingModule.cs` | Registers memory cache, the open generics `IDistributedCache<>` / `IDistributedCache<,>` (singletons), the hybrid cache, and a 20-minute default sliding expiration. Disables `HideErrors` in Development. |
+| `IDistributedCache.cs` | The two interfaces — `IDistributedCache<TCacheItem>` (string keys) and `IDistributedCache<TCacheItem, TCacheKey>` (arbitrary keys with `ToString()`). |
+| `DistributedCache.cs` | The implementation. The string-key version just delegates to the generic-key one through `InternalCache`. |
+| `AbpDistributedCacheOptions.cs` | `HideErrors`, `KeyPrefix`, `GlobalCacheEntryOptions`, per-cache `CacheConfigurators`. |
+| `CacheNameAttribute.cs` | Names the cache. Falls back to `TCacheItem.FullName` minus a `CacheItem` postfix. |
+| `IDistributedCacheKeyNormalizer.cs` + `DistributedCacheKeyNormalizer.cs` | Builds the final cache key (tenant + prefix + cache name + raw key). |
+| `DistributedCacheKeyNormalizeArgs.cs` | Bag passed to the normaliser. |
+| `IDistributedCacheSerializer.cs` + `Utf8JsonDistributedCacheSerializer.cs` | JSON byte-array serialisation through `IJsonSerializer`. |
+| `ICacheSupportsMultipleItems.cs` | Optional capability on the underlying `IDistributedCache` for batched `GetMany` / `SetMany` / `RefreshMany` / `RemoveMany`. Implemented by `AbpRedisCache`; not implemented by `MemoryDistributedCache` (the generic cache falls back to per-key loops). |
+| `UnitOfWorkCacheItem.cs` + `UnitOfWorkCacheItemExtensions.cs` | The `{Value, IsRemoved}` envelope buffered in the active UoW when `considerUow: true`. |
+| `Hybrid/*` | Wraps `Microsoft.Extensions.Caching.Hybrid.HybridCache` as `IHybridCache<T>` using `AbpHybridCacheJsonSerializer`. |
+
+## Two interfaces, one implementation
+
+`IDistributedCache<TCacheItem>` extends `IDistributedCache<TCacheItem, string>` and adds a single `InternalCache` getter. The string-keyed `DistributedCache<TCacheItem>` is therefore a thin pass-through to a registered generic-keyed instance:
+
+```csharp
+public class DistributedCache<TCacheItem> : IDistributedCache<TCacheItem>
+    where TCacheItem : class
+{
+    public IDistributedCache<TCacheItem, string> InternalCache { get; }
+
+    public DistributedCache(IDistributedCache<TCacheItem, string> internalCache)
+        => InternalCache = internalCache;
+
+    public TCacheItem? Get(string key, bool? hideErrors = null, bool considerUow = false)
+        => InternalCache.Get(key, hideErrors, considerUow);
+    // … delegates Get/GetMany/GetOrAdd/Set/SetMany/Refresh/Remove …
+}
+```
+
+Inject `IDistributedCache<MyCacheItem>` when keys are strings; inject `IDistributedCache<MyCacheItem, Guid>` (or any `TCacheKey : notnull`) when keys are typed. Both are registered as **singletons** by `AbpCachingModule`:
+
+```csharp
+context.Services.AddSingleton(typeof(IDistributedCache<>),   typeof(DistributedCache<>));
+context.Services.AddSingleton(typeof(IDistributedCache<,>),  typeof(DistributedCache<,>));
+```
+
+## API surface
+
+The interface (from `IDistributedCache.cs`) exposes the full sync + async matrix:
+
+| Operation | Sync | Async | Many |
+| --- | --- | --- | --- |
+| Read | `Get(key)` | `GetAsync(key)` | `GetMany` / `GetManyAsync` |
+| Read-through | `GetOrAdd(key, factory)` | `GetOrAddAsync` | `GetOrAddMany` / `GetOrAddManyAsync` |
+| Write | `Set(key, value, opts?)` | `SetAsync` | `SetMany` / `SetManyAsync` |
+| Refresh TTL | `Refresh(key)` | `RefreshAsync` | `RefreshMany` / `RefreshManyAsync` |
+| Delete | `Remove(key)` | `RemoveAsync` | `RemoveMany` / `RemoveManyAsync` |
+
+Every method takes two cross-cutting flags:
+
+- **`bool? hideErrors`** — null falls back to `AbpDistributedCacheOptions.HideErrors`. When `true`, exceptions thrown by the underlying `IDistributedCache` are logged and swallowed (read methods return null; write methods no-op). Useful for treating cache outages as "miss". `HideErrors` defaults to `true` but is forced to `false` in `Development` by `AbpCachingModule`.
+- **`bool considerUow`** — when `true` and there is a current `IUnitOfWork`, the operation reads/writes through `UnitOfWorkCacheItem<TCacheItem>` in `UoW.Items["AbpDistributedCache"]` until the UoW completes, so transient changes made inside a transaction don't leak across into the real cache before commit.
+
+## Cache name resolution and `CacheNameAttribute`
+
+The cache name segments cache items from each other in the underlying `IDistributedCache` keyspace. `DistributedCache<,>.SetDefaultOptions()` calls:
+
+```csharp
+CacheName = CacheNameAttribute.GetCacheName(typeof(TCacheItem));
+```
+
+`CacheNameAttribute.GetCacheName(Type)`:
+
+```csharp
+var attr = type.GetCustomAttributes(true).OfType<CacheNameAttribute>().FirstOrDefault();
+return attr?.Name ?? type.FullName!.RemovePostFix("CacheItem");
+```
+
+So `class UserCacheItem` becomes the cache name `MyApp.Users.UserCacheItem` → trimmed to `MyApp.Users.User`. If you want a stable, short name (e.g. for cross-service compatibility) annotate:
+
+```csharp
+[CacheName("user")]
+public class UserCacheItem { … }
+```
+
+## Key normalisation: tenant + prefix + cache name + raw key
+
+`DistributedCacheKeyNormalizer` is the default `IDistributedCacheKeyNormalizer` (`ITransientDependency`):
+
+```csharp
+public virtual string NormalizeKey(DistributedCacheKeyNormalizeArgs args)
+{
+    var normalizedKey = $"c:{args.CacheName},k:{DistributedCacheOptions.KeyPrefix}{args.Key}";
+
+    if (!args.IgnoreMultiTenancy && CurrentTenant.Id.HasValue)
+    {
+        normalizedKey = $"t:{CurrentTenant.Id.Value},{normalizedKey}";
+    }
+
+    return normalizedKey;
+}
+```
+
+A key for cache item `[CacheName("user")] class UserCacheItem` with `KeyPrefix = "myapp:"` and tenant `3fa…` becomes:
+
+```
+t:3fa85f64-5717-4562-b3fc-2c963f66afa6,c:user,k:myapp:42
+```
+
+`IgnoreMultiTenancy` is set in `DistributedCache<,>.SetDefaultOptions()` from `[IgnoreMultiTenancy]` on `TCacheItem`. Use it for global lookups (e.g. tenant resolution, host-wide settings).
+
+Override `IDistributedCacheKeyNormalizer` to change the layout — e.g. to use Redis hash tags `{tenant}:cache:user:42` for cluster slotting. Replace it in your module:
+
+```csharp
+context.Services.Replace(
+    ServiceDescriptor.Transient<IDistributedCacheKeyNormalizer, MyKeyNormalizer>());
+```
+
+## `AbpDistributedCacheOptions`
+
+| Property | Default | Effect |
+| --- | --- | --- |
+| `HideErrors` | `true` (forced `false` in Development) | Swallow underlying `IDistributedCache` exceptions and log them instead of throwing. |
+| `KeyPrefix` | `""` | String inserted between `k:` and the raw key, e.g. `"myapp:"`. Useful when many services share one Redis. |
+| `GlobalCacheEntryOptions` | `DistributedCacheEntryOptions { SlidingExpiration = 20 min }` | Fallback for any cache item with no per-name configurator. |
+| `CacheConfigurators` | empty `List<Func<string, DistributedCacheEntryOptions?>>` | Per-cache options. Added via `ConfigureCache<T>(...)`. |
+
+Configure once in your module:
+
+```csharp
+Configure<AbpDistributedCacheOptions>(o =>
+{
+    o.KeyPrefix = "myapp:";
+    o.GlobalCacheEntryOptions = new DistributedCacheEntryOptions
+    {
+        SlidingExpiration = TimeSpan.FromMinutes(10)
+    };
+    o.ConfigureCache<UserCacheItem>(new DistributedCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(2)
+    });
+});
+```
+
+`ConfigureCache<T>` resolves the cache name from `CacheNameAttribute` and appends a `Func<string, DistributedCacheEntryOptions?>` that returns the options only when the name matches. `DistributedCache<,>.GetDefaultCacheEntryOptions()` walks the configurators in order and returns the first non-null match, then falls back to `GlobalCacheEntryOptions`.
+
+## Sliding vs. absolute expiration
+
+The implementation passes whatever `DistributedCacheEntryOptions` you supply straight to the underlying `IDistributedCache.SetAsync(key, bytes, options)`:
+
+- `SlidingExpiration` — TTL reset every time the value is read or refreshed.
+- `AbsoluteExpiration` / `AbsoluteExpirationRelativeToNow` — hard expiry regardless of access.
+
+If you pass `options: null` to `SetAsync`, the cache uses `DefaultCacheOptions` (the resolved per-cache or global options). `Refresh*` only touches the sliding window — calling `RefreshAsync` on an expired key is a no-op.
+
+`AbpRedisCache.PipelineSetMany` (Redis provider) stores both as hash fields `absexp` / `sldexp` and combines them: the effective TTL on the Redis key is `min(absoluteRemaining, sliding)`.
+
+## `GetOrAdd*` — read-through with a single SemaphoreSlim
+
+`DistributedCache<,>` holds one `SemaphoreSlim(1, 1)` per typed cache instance (per `TCacheItem`/`TCacheKey` pair). Inside `GetOrAddAsync`:
+
+1. Try `GetAsync(key)`.
+2. If null, await the semaphore.
+3. Re-check the cache (someone else may have populated it).
+4. Call `factory()`, `SetAsync`, return.
+
+The lock is **in-process only** — it does not coordinate across replicas. For a Redis fleet, two pods can still both run `factory()` on a cold miss; that's intentional, since `IDistributedCache` has no atomic "load-or-add". If `factory()` is expensive and idempotent this is acceptable; if not, you need an `IAbpDistributedLock` around the factory (see [Distributed locking](/background/distributed-locking)).
+
+## `considerUow` — UoW-buffered cache writes
+
+When `considerUow: true` and there is a current `IUnitOfWork`:
+
+- `Get` first checks `UoW.Items["AbpDistributedCache"]` for a `Dictionary<TCacheKey, UnitOfWorkCacheItem<TCacheItem>>`, returns the buffered value if present (or null if `IsRemoved`).
+- `Set` writes the new value into the UoW dictionary instead of the real cache.
+- `Remove` writes a tombstone `IsRemoved = true` into the UoW dictionary.
+- On UoW complete, the implementation flushes the buffered set/remove operations to the real cache.
+
+This is essential for "write to DB then invalidate cache" patterns inside the same transaction: if the DB write rolls back, the cache invalidation does not happen.
+
+## Many-key operations and `ICacheSupportsMultipleItems`
+
+`DistributedCache<,>` checks whether the injected `IDistributedCache` implements `ICacheSupportsMultipleItems`. If yes (e.g. `AbpRedisCache`), `GetMany`/`SetMany`/`RefreshMany`/`RemoveMany` go through a single pipelined round-trip. Otherwise it loops, calling the single-key methods. The interface itself (in `ICacheSupportsMultipleItems.cs`) operates on `byte[]?[]` and is independent of `TCacheItem` — serialisation still happens in `DistributedCache<,>`.
+
+## Hybrid cache (`IHybridCache<T>`)
+
+`AbpCachingModule.ConfigureServices` also registers `AddHybridCache().AddSerializerFactory<AbpHybridCacheJsonSerializerFactory>()` and exposes generic wrappers `IHybridCache<T>` / `IHybridCache<T, TKey>` (`AbpHybridCache.cs`). These delegate to `Microsoft.Extensions.Caching.Hybrid.HybridCache` (L1 in-memory + L2 distributed) and reuse `IJsonSerializer` for the L2 byte representation. Use them when you need stampede-protected, two-tier caching of expensive computations; the API mirrors `HybridCache` — see `AbpHybridCacheOptions` for limits.
+
+## Practical recipe
+
+```csharp
+[CacheName("user")]
+public class UserCacheItem
+{
+    public Guid Id { get; set; }
+    public string UserName { get; set; } = default!;
+}
+
+public class UserAppService
+{
+    private readonly IDistributedCache<UserCacheItem, Guid> _cache;
+    private readonly IUserRepository _users;
+
+    public UserAppService(IDistributedCache<UserCacheItem, Guid> cache, IUserRepository users)
+    {
+        _cache = cache;
+        _users = users;
+    }
+
+    public Task<UserCacheItem?> GetAsync(Guid id) =>
+        _cache.GetOrAddAsync(
+            id,
+            async () => {
+                var u = await _users.GetAsync(id);
+                return new UserCacheItem { Id = u.Id, UserName = u.UserName };
+            },
+            () => new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+            },
+            considerUow: true);
+}
+```
+
+This single call:
+
+1. Resolves cache name `user` from `[CacheName("user")]`.
+2. Builds key `t:{tenantId},c:user,k:{keyPrefix}{id}`.
+3. Checks UoW buffer, then `MemoryDistributedCache` / Redis.
+4. On miss, holds the per-type semaphore, calls the factory, JSON-serialises and writes with a 5-minute absolute TTL.
+
+## Cross-references
+
+- [Redis provider](/caching/redis) — `AbpCachingStackExchangeRedisModule` and `AbpRedisCache`.
+- [BLOB storing overview](/blob/blob-storing-overview) — uses the cache to memoise STS credentials and storage zone metadata.
+- [Distributed locking](/background/distributed-locking) — pair with `GetOrAdd` when you need cross-process stampede protection.
+- [Connection string resolver](/multitenancy/connection-string-resolver) — the cache itself is not tenant-routed, but `KeyPrefix` and `CurrentTenant` segment the keyspace.

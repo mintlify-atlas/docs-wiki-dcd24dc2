@@ -1,0 +1,418 @@
+---
+title: "Basic Theme Module — Default Bootstrap Theme for ABP"
+sidebarTitle: "Basic Theme"
+description: "The default theme ABP ships across MVC, Blazor Server, and Blazor WebAssembly — minimal Bootstrap layouts registered under StandardLayouts and bundling."
+---
+
+`modules/basic-theme/` is the **default theme** every freshly-generated ABP application uses. It's deliberately minimal — a Bootstrap 5 navbar across the top, a content area, a footer — so you can read the source and understand the entire [theming contract](/aspnetcore/mvc-ui-themes) end to end. The same module ships three parallel implementations: one for **ASP.NET Core MVC / Razor Pages**, one for **Blazor Server**, and one for **Blazor WebAssembly**. Each implements the same `ITheme` interface, returns layouts for the three `StandardLayouts` (`Application`, `Account`, `Empty`), and registers its bundles via the [bundling system](/aspnetcore/mvc-ui-bundling).
+
+This page walks all three implementations, the bundle structure, the toolbar contributors, the view-component family, and the steps to replace it with a custom theme (or with the commercial LeptonX theme).
+
+## Projects
+
+`modules/basic-theme/src/` ships seven projects covering MVC + Blazor variants:
+
+| Project | Target | Purpose |
+| --- | --- | --- |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic` | MVC / Razor Pages | `BasicTheme : ITheme` (returns `*.cshtml` paths), Razor layouts, view-components, `BasicThemeBundles`, `BasicThemeGlobalScriptContributor`, `BasicThemeGlobalStyleContributor`, `BasicThemeMainTopToolbarContributor` |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic.Installer` | NuGet metadata | `abp install-module` integration |
+| `Volo.Abp.AspNetCore.Components.Web.BasicTheme` | Shared Blazor | `BasicTheme : ITheme` (returns `Type` of `MainLayout`), `MainLayout.razor`, `NavMenu.razor`, `NavToolbar.razor`, `FirstLevelNavMenuItem.razor`, `SecondLevelNavMenuItem.razor` |
+| `Volo.Abp.AspNetCore.Components.Server.BasicTheme` | Blazor Server | `BasicThemeToolbarContributor`, `BlazorBasicThemeBundles`, `BlazorBasicThemeStyleContributor`, server-specific `LoginDisplay.razor` |
+| `Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme` | Blazor WebAssembly | `BasicThemeBundleContributor`, `BasicThemeToolbarContributor`, WASM-specific `LoginDisplay.razor`, `AuthenticationOptions` |
+| `Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme.Bundling` | Blazor WASM (bundle build) | `BasicThemeBundleStyleContributor` for the WebAssembly bundle-time CSS pipeline |
+| `Volo.Abp.BasicTheme.Installer` | NuGet metadata | Aggregate installer |
+
+```mermaid
+flowchart TD
+  abs[ITheme + ThemeName<br/>Volo.Abp.AspNetCore.Mvc.UI.Theming]
+  abs --> mvc[Mvc.UI.Theme.Basic<br/>~/Themes/Basic/Layouts/*.cshtml]
+  abs --> blazorweb[Components.Web.BasicTheme<br/>typeof(MainLayout)]
+  blazorweb --> server[Components.Server.BasicTheme<br/>Server bundles + toolbar]
+  blazorweb --> wasm[Components.WebAssembly.BasicTheme<br/>WASM bundles + toolbar]
+  wasm --> bundling[WebAssembly.BasicTheme.Bundling<br/>build-time CSS pipeline]
+```
+
+## The `ITheme` contract
+
+ABP's theming system asks every theme one question: *"Given a layout name, what should I render?"* The answer differs by UI stack:
+
+- **MVC** — return a virtual path (`string`) that the Razor view engine resolves.
+- **Blazor** — return a `Type` that Blazor's `LayoutComponentBase` system mounts.
+
+Basic Theme implements both shapes.
+
+### MVC implementation
+
+```csharp
+[ThemeName(Name)]
+public class BasicTheme : ITheme, ITransientDependency
+{
+    public const string Name = "Basic";
+
+    public virtual string GetLayout(string name, bool fallbackToDefault = true)
+    {
+        switch (name)
+        {
+            case StandardLayouts.Application: return "~/Themes/Basic/Layouts/Application.cshtml";
+            case StandardLayouts.Account:     return "~/Themes/Basic/Layouts/Account.cshtml";
+            case StandardLayouts.Empty:       return "~/Themes/Basic/Layouts/Empty.cshtml";
+            default: return fallbackToDefault ? "~/Themes/Basic/Layouts/Application.cshtml" : null;
+        }
+    }
+}
+```
+
+The three `*.cshtml` files live as embedded resources inside the module assembly — added to the virtual file system by the module's `Configure<AbpVirtualFileSystemOptions>` call. The Razor view engine resolves `~/Themes/Basic/Layouts/Application.cshtml` against the [virtual file provider](/core/virtual-file-system), so the host doesn't need physical copies.
+
+### Blazor implementation
+
+```csharp
+[ThemeName(Name)]
+public class BasicTheme : ITheme, ITransientDependency
+{
+    public const string Name = "Basic";
+
+    public virtual Type GetLayout(string name, bool fallbackToDefault = true)
+    {
+        switch (name)
+        {
+            case StandardLayouts.Application:
+            case StandardLayouts.Account:
+            case StandardLayouts.Empty:
+                return typeof(MainLayout);
+            default:
+                return fallbackToDefault ? typeof(MainLayout) : typeof(NullLayout);
+        }
+    }
+}
+```
+
+Blazor's Basic Theme intentionally returns the same `MainLayout` for all three slots — Account screens and Empty screens differ only via the `BodyContent`. The MVC version splits them because Razor `_Layout.cshtml` files are not composable in the same way.
+
+## Standard layouts
+
+Every theme honors the [`StandardLayouts`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Mvc.UI.Theming/Volo/Abp/AspNetCore/Mvc/UI/Theming/StandardLayouts.cs) enum so module authors can request layouts portably:
+
+| Layout name | When picked | Basic Theme file (MVC) |
+| --- | --- | --- |
+| `StandardLayouts.Application` | Default — every page that doesn't specify otherwise | `Application.cshtml` |
+| `StandardLayouts.Account` | Login, register, forgot password (no navbar, centered card) | `Account.cshtml` |
+| `StandardLayouts.Empty` | Modal popups, error pages | `Empty.cshtml` |
+
+Modules pin a layout per page model:
+
+```csharp
+[Layout(StandardLayouts.Account)]
+public class LoginModel : AbpPageModel { ... }
+```
+
+The active theme's `GetLayout` is called at view-rendering time to translate the name to a path.
+
+## Module wiring
+
+### MVC
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpAspNetCoreMvcUiMultiTenancyModule))]
+public class AbpAspNetCoreMvcUiBasicThemeModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpThemingOptions>(options =>
+        {
+            options.Themes.Add<BasicTheme>();
+            if (options.DefaultThemeName == null)
+                options.DefaultThemeName = BasicTheme.Name;
+        });
+
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAspNetCoreMvcUiBasicThemeModule>(
+                "Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic");
+        });
+
+        Configure<AbpToolbarOptions>(options =>
+        {
+            options.Contributors.Add(new BasicThemeMainTopToolbarContributor());
+        });
+
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.StyleBundles.Add(BasicThemeBundles.Styles.Global, bundle =>
+            {
+                bundle.AddBaseBundles(StandardBundles.Styles.Global)
+                      .AddContributors(typeof(BasicThemeGlobalStyleContributor));
+            });
+
+            options.ScriptBundles.Add(BasicThemeBundles.Scripts.Global, bundle =>
+            {
+                bundle.AddBaseBundles(StandardBundles.Scripts.Global)
+                      .AddContributors(typeof(BasicThemeGlobalScriptContributor));
+            });
+        });
+    }
+}
+```
+
+Four configurations:
+
+<Steps>
+  <Step title="Register the theme">
+    `options.Themes.Add<BasicTheme>()`. If no `DefaultThemeName` is set, this module wins by default.
+  </Step>
+  <Step title="Mount the embedded resources">
+    Razor layouts, view-components, CSS, JS — all embedded in the assembly under `Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic.*`.
+  </Step>
+  <Step title="Contribute toolbar items">
+    `BasicThemeMainTopToolbarContributor` adds the language switch and user menu (see below).
+  </Step>
+  <Step title="Define the global bundles">
+    `Basic.Global` for both styles and scripts, layered on top of `StandardBundles.Global` (which contains Bootstrap, jQuery, etc).
+  </Step>
+</Steps>
+
+### Blazor Server
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreComponentsServerThemingModule))]
+[DependsOn(typeof(AbpAspNetCoreComponentsWebBasicThemeModule))]
+public class AbpAspNetCoreComponentsServerBasicThemeModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpToolbarOptions>(options =>
+        {
+            options.Contributors.Add(new BasicThemeToolbarContributor());
+        });
+
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.StyleBundles.Add(BlazorBasicThemeBundles.Styles.Global, bundle =>
+                bundle.AddContributors(typeof(BlazorBasicThemeStyleContributor)));
+
+            options.ScriptBundles.Add(BlazorBasicThemeBundles.Scripts.Global, bundle =>
+                bundle.AddContributors(typeof(BlazorBasicThemeScriptContributor)));
+        });
+    }
+}
+```
+
+### Blazor WebAssembly
+
+The WebAssembly module mirrors the Server one but registers `BasicThemeBundleContributor` (which differs because WASM bundles are produced at *build* time, not request time):
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreComponentsWebAssemblyThemingModule))]
+[DependsOn(typeof(AbpAspNetCoreComponentsWebBasicThemeModule))]
+public class AbpAspNetCoreComponentsWebAssemblyBasicThemeModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpToolbarOptions>(options =>
+        {
+            options.Contributors.Add(new BasicThemeToolbarContributor());
+        });
+
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.StyleBundles.Add(/* ... */);
+        });
+    }
+}
+```
+
+`AuthenticationOptions` (WASM-only) carries OIDC-related config that `LoginDisplay.razor` reads to redirect to the correct authority.
+
+## Bundles
+
+```csharp
+public static class BasicThemeBundles
+{
+    public static class Styles  { public const string Global = "Basic.Global"; }
+    public static class Scripts { public const string Global = "Basic.Global"; }
+}
+```
+
+The two contributors define what goes into the global bundle:
+
+```csharp
+public class BasicThemeGlobalStyleContributor : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.Add(new BundleFile("/themes/basic/googlefonts.css", true)); // external = true
+        context.Files.Add("/themes/basic/layout.css");
+    }
+}
+
+public class BasicThemeGlobalScriptContributor : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.Add("/themes/basic/layout.js");
+    }
+}
+```
+
+The Razor layout's `<head>` calls `@await Component.InvokeAsync(typeof(MainNavbarViewComponent))` and `@await Component.InvokeAsync(typeof(PageAlertsViewComponent))`, and emits the global bundle via `<abp-style-bundle name="@BasicThemeBundles.Styles.Global" />` (see [bundling](/aspnetcore/mvc-ui-bundling)).
+
+## Toolbar contributors
+
+### MVC
+
+```csharp
+public class BasicThemeMainTopToolbarContributor : IToolbarContributor
+{
+    public async Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name != StandardToolbars.Main) return;
+        if (context.Theme is not BasicTheme) return;
+
+        var languageProvider = context.ServiceProvider.GetService<ILanguageProvider>();
+        var languages = await languageProvider.GetLanguagesAsync();
+        if (languages.Count > 1)
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LanguageSwitchViewComponent)));
+
+        if (context.ServiceProvider.GetRequiredService<ICurrentUser>().IsAuthenticated)
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(UserMenuViewComponent)));
+    }
+}
+```
+
+The contributor honors three policies:
+
+| Check | Why |
+| --- | --- |
+| `context.Toolbar.Name != StandardToolbars.Main` | Other toolbars (footer, mobile) shouldn't get this menu. |
+| `context.Theme is not BasicTheme` | A different theme is active — let *its* contributor run. |
+| `languages.Count > 1` | Hide the language switch if only one language is configured. |
+
+### Blazor
+
+The Server / WASM toolbar contributor is simpler — Blazor doesn't have view-components; it injects Razor components instead:
+
+```csharp
+public class BasicThemeToolbarContributor : IToolbarContributor
+{
+    public Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name == StandardToolbars.Main)
+        {
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LoginDisplay)));
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LanguageSwitch)));
+        }
+        return Task.CompletedTask;
+    }
+}
+```
+
+`LoginDisplay.razor` is implementation-specific (different for Server vs WASM because the Server one uses cookie auth while WASM uses OIDC redirects).
+
+## View-components (MVC)
+
+The Razor layout pulls a small set of view-components that other modules can override individually:
+
+| View-component | File | Role |
+| --- | --- | --- |
+| `MainNavbarBrandViewComponent` | `Components/Brand/MainNavbarBrandViewComponent.cs` | Logo + app name on the navbar |
+| `MainNavbarViewComponent` | `Components/MainNavbar/MainNavbarViewComponent.cs` | The whole navbar wrapper |
+| `MainNavbarMenuViewComponent` | `Components/Menu/MainNavbarMenuViewComponent.cs` | Renders the main menu from `IMenuManager` |
+| `MainNavbarToolbarViewComponent` | `Components/Toolbar/MainNavbarToolbarViewComponent.cs` | Renders toolbar items contributed by `IToolbarContributor`s |
+| `LanguageSwitchViewComponent` | `Components/Toolbar/LanguageSwitch/LanguageSwitchViewComponent.cs` | Dropdown of available languages |
+| `UserMenuViewComponent` | `Components/Toolbar/UserMenu/UserMenuViewComponent.cs` | "My account / Sign out" dropdown |
+| `ContentTitleViewComponent` | `Components/ContentTitle/ContentTitleViewComponent.cs` | The page title region |
+| `PageAlertsViewComponent` | `Components/PageAlerts/PageAlertsViewComponent.cs` | Renders `IAlertManager`-contributed alerts |
+
+Each can be overridden by registering a derived view-component with the same name — the [virtual file system](/core/virtual-file-system) and the MVC view-component selector pick the override.
+
+## Blazor component family
+
+The shared Blazor stack ships these Razor components:
+
+| Component | File | Role |
+| --- | --- | --- |
+| `MainLayout` | `MainLayout.razor[.cs]` | Top-level layout — navbar, sidebar, content, toolbar |
+| `NavMenu` | `NavMenu.razor[.cs]` | Renders the main menu via `IMenuManager.GetMainMenuAsync()`; subscribes to `ApplicationConfigurationChangedService.Changed` for live refresh |
+| `FirstLevelNavMenuItem`, `SecondLevelNavMenuItem` | `*.razor[.cs]` | Recursive renderers for the two-level menu structure |
+| `NavToolbar` | `NavToolbar.razor[.cs]` | Renders toolbar items |
+| `Branding` | `Branding.razor` | Logo block |
+| `LoginDisplay` (Server / WASM variants) | `Themes/Basic/LoginDisplay.razor[.cs]` | Sign-in / sign-out UI |
+
+```csharp
+public partial class NavMenu : IDisposable
+{
+    [Inject] protected IMenuManager MenuManager { get; set; }
+    [Inject] protected ApplicationConfigurationChangedService ApplicationConfigurationChangedService { get; set; }
+
+    protected ApplicationMenu Menu { get; set; }
+
+    protected async override Task OnInitializedAsync()
+    {
+        Menu = await MenuManager.GetMainMenuAsync();
+        ApplicationConfigurationChangedService.Changed += ApplicationConfigurationChanged;
+    }
+
+    private async void ApplicationConfigurationChanged()
+    {
+        Menu = await MenuManager.GetMainMenuAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+}
+```
+
+The `ApplicationConfigurationChangedService.Changed` subscription is what keeps the menu in sync after a user signs in / out or a permission grant changes — without a full page reload.
+
+## Replacing the theme
+
+To replace Basic Theme with a custom one:
+
+<Steps>
+  <Step title="Implement ITheme">
+    Build your own `MyTheme : ITheme, ITransientDependency` with `[ThemeName("MyTheme")]`. Return your own layout paths or types.
+  </Step>
+  <Step title="Register and make default">
+    ```csharp
+    Configure<AbpThemingOptions>(options =>
+    {
+        options.Themes.Add<MyTheme>();
+        options.DefaultThemeName = "MyTheme";   // override Basic's claim
+    });
+    ```
+  </Step>
+  <Step title="Remove the Basic dependency (optional)">
+    If you don't want Basic's bundles and view-components in your app at all, drop the `[DependsOn(typeof(AbpAspNetCoreMvcUiBasicThemeModule))]` from your `Web` module and depend directly on `AbpAspNetCoreMvcUiThemeSharedModule`.
+  </Step>
+  <Step title="Override individual view-components">
+    If you only want to change pieces (e.g. just the brand), keep Basic Theme and override `MainNavbarBrandViewComponent` in your own module — Razor view selection will prefer yours.
+  </Step>
+</Steps>
+
+For commercial alternatives, see ABP Commercial's LeptonX Theme — same `ITheme` contract, richer UI.
+
+## Extension points
+
+<CardGroup cols={2}>
+  <Card title="Add a toolbar item" icon="puzzle-piece">
+    Implement your own `IToolbarContributor` and register it via `Configure<AbpToolbarOptions>(o => o.Contributors.Add(new MyContributor()))`. Yours runs alongside Basic's.
+  </Card>
+  <Card title="Add files to the global bundle" icon="file-code">
+    Use `options.StyleBundles.Get(BasicThemeBundles.Styles.Global).AddContributors(typeof(MyContributor))` from your own module's `ConfigureServices`.
+  </Card>
+  <Card title="Replace a layout" icon="object-group">
+    Subclass `BasicTheme` and override `GetLayout` to return your own `*.cshtml` path for one or more `StandardLayouts` keys.
+  </Card>
+  <Card title="Theme-aware contributors" icon="palette">
+    Inspect `context.Theme is BasicTheme` in your contributor to add items only when Basic is active — useful when multiple themes coexist.
+  </Card>
+</CardGroup>
+
+## Cross-references
+
+- [MVC UI themes](/aspnetcore/mvc-ui-themes) — the abstraction this module implements.
+- [MVC UI bundling](/aspnetcore/mvc-ui-bundling) — `BasicThemeBundles` integration.
+- [Virtual file system](/core/virtual-file-system) — where the embedded Razor layouts live.
+- [Virtual File Explorer](/modules/virtual-file-explorer) — debug tool to inspect the theme's embedded files.
+- [Security and claims](/auth/security-and-claims) — `LoginDisplay` and `UserMenuViewComponent` consume `ICurrentUser`.
+- [Modules overview](/modules/overview) — module catalog index.

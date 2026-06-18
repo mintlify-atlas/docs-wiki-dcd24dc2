@@ -1,0 +1,463 @@
+---
+title: "Magick.NET provider"
+sidebarTitle: "Magick.NET"
+description: "Volo.Abp.Imaging.MagickNet — MagickImageResizerContributor, MagickImageCompressorContributor, MagickNetCompressOptions and the per-mode resize math."
+---
+
+`Volo.Abp.Imaging.MagickNet` is the broadest-coverage provider in the box. It binds to [Magick.NET](https://github.com/dlemstra/Magick.NET) — the .NET wrapper around the ImageMagick `Magick++` C++ library — and supplies both a resizer and a compressor (built on `ImageMagick.ImageOptimizer`). Format coverage spans virtually everything ImageMagick recognizes, and the compressor is the only one in the abstraction that supports **truly lossless** JPEG / PNG / GIF re-encoding.
+
+Use it when:
+
+- You need GIF (animated or otherwise) handled correctly end-to-end.
+- You want lossless compression for archival pipelines.
+- Format coverage matters more than raw speed (Magick.NET is native, but the per-call overhead is higher than SkiaSharp).
+- The build/deploy environment can carry the Magick.NET native dependency.
+
+See [`imaging/overview`](/imaging/overview) for how contributors plug into the coordinator chain.
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `AbpImagingMagickNetModule.cs` | ABP module — empty body; depends on `AbpImagingAbstractionsModule`. Contributors auto-register via `ITransientDependency`. |
+| `MagickImageResizerContributor.cs` | `IImageResizerContributor` — decodes via `MagickImage`, implements every `ImageResizeMode` explicitly in dedicated `Resize*` helpers. |
+| `MagickImageCompressorContributor.cs` | `IImageCompressorContributor` — uses `ImageMagick.ImageOptimizer`, with `Lossless` and `OptimalCompression` toggles. |
+| `MagickNetCompressOptions.cs` | `OptimalCompression`, `IgnoreUnsupportedFormats`, `Lossless` switches. |
+
+## Module
+
+`framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/AbpImagingMagickNetModule.cs`:
+
+```csharp
+[DependsOn(typeof(AbpImagingAbstractionsModule))]
+public class AbpImagingMagickNetModule : AbpModule
+{
+}
+```
+
+Both contributors are `ITransientDependency`. Wire it up by depending on the module:
+
+```csharp
+[DependsOn(typeof(AbpImagingMagickNetModule))]
+public class MyModule : AbpModule { }
+```
+
+## The resizer
+
+`framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/MagickImageResizerContributor.cs`:
+
+```csharp
+public class MagickImageResizerContributor : IImageResizerContributor, ITransientDependency
+{
+    private const int Min = 1;
+
+    public virtual async Task<ImageResizeResult<Stream>> TryResizeAsync(
+        Stream stream, ImageResizeArgs resizeArgs,
+        string? mimeType = null, CancellationToken cancellationToken = default)
+    {
+        if (!mimeType.IsNullOrWhiteSpace() && !CanResize(mimeType))
+            return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        var memoryStream = await stream.CreateMemoryStreamAsync(cancellationToken: cancellationToken);
+
+        try
+        {
+            using var image = new MagickImage(memoryStream);
+
+            if (mimeType.IsNullOrWhiteSpace() && !CanResize(image.Format))
+                return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+            Resize(image, resizeArgs);
+
+            memoryStream.Position = 0;
+            await image.WriteAsync(memoryStream, cancellationToken);
+            memoryStream.SetLength(memoryStream.Position);
+            memoryStream.Position = 0;
+
+            return new ImageResizeResult<Stream>(memoryStream, ImageProcessState.Done);
+        }
+        catch
+        {
+            memoryStream.Dispose();
+            throw;
+        }
+    }
+}
+```
+
+Behavior:
+
+- The input is buffered into a `MemoryStream` via the `Stream.CreateMemoryStreamAsync` extension — Magick.NET needs a seekable source.
+- The same `memoryStream` is reused as the **output** target: position 0, write, `SetLength` to clip any tail bytes from the input that the new payload didn't overwrite, position 0.
+- If `mimeType` is supplied, `CanResize(mimeType)` is the pre-check. If it's blank, `image.Format` (a `MagickFormat` enum) is checked instead — covers in-flight format detection.
+- Failures dispose the output buffer and rethrow.
+
+### Supported formats (resize)
+
+```csharp
+protected virtual bool CanResize(string mimeType)
+{
+    return mimeType.ToLowerInvariant() switch
+    {
+        MimeTypes.Image.Jpeg => true,
+        MimeTypes.Image.Png  => true,
+        MimeTypes.Image.Gif  => true,
+        MimeTypes.Image.Bmp  => true,
+        MimeTypes.Image.Tiff => true,
+        MimeTypes.Image.Webp => true,
+        _ => false
+    };
+}
+
+protected virtual bool CanResize(MagickFormat format)
+{
+    return format switch
+    {
+        MagickFormat.Jpeg => true,
+        MagickFormat.Png  => true,
+        MagickFormat.Gif  => true,
+        MagickFormat.Bmp  => true,
+        MagickFormat.Tiff => true,
+        MagickFormat.WebP => true,
+        _ => false
+    };
+}
+```
+
+JPEG, PNG, GIF, BMP, TIFF, WebP — matching the abstraction's full matrix. Note the `WebP` casing in the enum vs. `Webp` constant.
+
+### Byte array overload
+
+Synchronous-style (no `await` because Magick.NET's byte-array path is in-memory only):
+
+```csharp
+public virtual Task<ImageResizeResult<byte[]>> TryResizeAsync(
+    byte[] bytes, ImageResizeArgs resizeArgs,
+    string? mimeType = null, CancellationToken cancellationToken = default)
+{
+    if (!mimeType.IsNullOrWhiteSpace() && !CanResize(mimeType))
+        return Task.FromResult(new ImageResizeResult<byte[]>(bytes, ImageProcessState.Unsupported));
+
+    using var image = new MagickImage(bytes);
+
+    if (mimeType.IsNullOrWhiteSpace() && !CanResize(image.Format))
+        return Task.FromResult(new ImageResizeResult<byte[]>(bytes, ImageProcessState.Unsupported));
+
+    Resize(image, resizeArgs);
+
+    return Task.FromResult(new ImageResizeResult<byte[]>(image.ToByteArray(), ImageProcessState.Done));
+}
+```
+
+## Resize mode math
+
+Unlike the ImageSharp contributor which delegates aspect-ratio logic to ImageSharp's `ResizeOptions`, the Magick.NET contributor implements every mode by hand. The dispatch:
+
+```csharp
+protected virtual void ApplyResizeMode(MagickImage image, ImageResizeArgs resizeArgs)
+{
+    switch (resizeArgs.Mode)
+    {
+        case ImageResizeMode.None:    ResizeModeNone(image, resizeArgs); break;
+        case ImageResizeMode.Stretch: ResizeStretch (image, resizeArgs); break;
+        case ImageResizeMode.Pad:     ResizePad     (image, resizeArgs); break;
+        case ImageResizeMode.BoxPad:  ResizeBoxPad  (image, resizeArgs); break;
+        case ImageResizeMode.Max:     ResizeMax     (image, resizeArgs); break;
+        case ImageResizeMode.Min:     ResizeMin     (image, resizeArgs); break;
+        case ImageResizeMode.Crop:    ResizeCrop    (image, resizeArgs); break;
+        default: throw new NotSupportedException("Resize mode " + resizeArgs.Mode + "is not supported!");
+    }
+}
+```
+
+### Helper math
+
+Two helpers compute the missing axis from source aspect when only one of `Width`/`Height` was supplied:
+
+```csharp
+protected virtual uint GetTargetHeight(ImageResizeArgs args, uint min, uint srcW, uint srcH)
+{
+    if (args.Height == 0 && args.Width > 0)
+        return (uint)Math.Max(min, Math.Round(srcH * args.Width / (float)srcW));
+    return args.Height;
+}
+
+protected virtual uint GetTargetWidth(ImageResizeArgs args, uint min, uint srcW, uint srcH)
+{
+    if (args.Width == 0 && args.Height > 0)
+        return (uint)Math.Max(min, Math.Round(srcW * args.Height / (float)srcH));
+    return args.Width;
+}
+
+protected virtual float CalculatePercent(uint srcAxis, uint targetAxis)
+    => targetAxis / (float)srcAxis;
+
+protected virtual float CalculateRatio(uint width, uint height)
+    => height / (float)width;
+```
+
+`Min = 1` is the absolute minimum pixel size; useful when aspect math would round to 0 for very thin sources.
+
+### Per-mode behavior
+
+| Mode | Magick operations | Effect |
+| --- | --- | --- |
+| `None` | `image.Resize(W, H)` with computed target | Plain resize — Magick.NET preserves aspect when one axis is 0 by default. |
+| `Stretch` | `image.Resize(new MagickGeometry(W, H) { IgnoreAspectRatio = true })` | Force exact dimensions, distort aspect. |
+| `Pad` | Compute scale-to-fit, `image.Resize(newW, newH)`, then `image.Extent(W, H, Gravity.Center, MagickColors.Transparent)` | Fit-inside with transparent center-padding. |
+| `BoxPad` | Like `Pad` but with a `boxPadWidth/Height` based on source < target check; doesn't upscale when source is smaller than the box. | Original is centered inside an exact-size transparent box. |
+| `Max` | Compute scale-to-cover, `image.Resize(W, H)` | Result fully covers target box; one dimension can exceed target. |
+| `Min` | Constrain to ≤ target preserving aspect; if source already smaller, no upscale | Result fits inside target without enlargement. |
+| `Crop` | `image.Extent(W, H, Gravity.Center, Transparent)`, `image.Crop(new MagickGeometry(W, H) { IgnoreAspectRatio = true }, Gravity.Center)` | Center-crop to exact target size. |
+
+Snippet — `ResizePad`:
+
+```csharp
+protected virtual void ResizePad(MagickImage image, ImageResizeArgs resizeArgs)
+{
+    var srcW = image.Width;
+    var srcH = image.Height;
+    var tgtW = GetTargetWidth (resizeArgs, Min, srcW, srcH);
+    var tgtH = GetTargetHeight(resizeArgs, Min, srcW, srcH);
+
+    var pH = CalculatePercent(srcH, tgtH);
+    var pW = CalculatePercent(srcW, tgtW);
+
+    var newW = tgtW; var newH = tgtH;
+    if (pH < pW)  newW = (uint)Math.Round(srcW * pH);
+    else          newH = (uint)Math.Round(srcH * pW);
+
+    image.Resize(newW, newH);
+    image.Extent(tgtW, tgtH, Gravity.Center, MagickColors.Transparent);
+}
+```
+
+The `MagickColors.Transparent` pad colour assumes an alpha-capable output (PNG, WebP, GIF). JPEG outputs effectively render the transparent pad as black; if you need a different pad colour (white for JPEG), override the helper.
+
+### Crop mode
+
+```csharp
+protected virtual void ResizeCrop(MagickImage image, ImageResizeArgs resizeArgs)
+{
+    var srcW = image.Width;
+    var srcH = image.Height;
+    var tgtW = GetTargetWidth (resizeArgs, Min, srcW, srcH);
+    var tgtH = GetTargetHeight(resizeArgs, Min, srcW, srcH);
+
+    image.Extent(tgtW, tgtH, Gravity.Center, MagickColors.Transparent);
+    image.Crop(new MagickGeometry(tgtW, tgtH) { IgnoreAspectRatio = true }, Gravity.Center);
+}
+```
+
+`Extent` first expands or shrinks the canvas, then `Crop` produces the final tile. Both operations use `Gravity.Center`, so the kept region is the geometric middle of the image. Override and pass a different `Gravity` if you need top/bottom/edge-anchored crops.
+
+## The compressor
+
+`framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/MagickImageCompressorContributor.cs` wraps `ImageMagick.ImageOptimizer`:
+
+```csharp
+public class MagickImageCompressorContributor : IImageCompressorContributor, ITransientDependency
+{
+    protected MagickNetCompressOptions Options { get; }
+    protected readonly ImageOptimizer Optimizer;
+
+    public MagickImageCompressorContributor(IOptions<MagickNetCompressOptions> options)
+    {
+        Options = options.Value;
+        Optimizer = new ImageOptimizer
+        {
+            OptimalCompression       = Options.OptimalCompression,
+            IgnoreUnsupportedFormats = Options.IgnoreUnsupportedFormats
+        };
+    }
+
+    public virtual async Task<ImageCompressResult<Stream>> TryCompressAsync(
+        Stream stream, string? mimeType = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrWhiteSpace(mimeType) && !CanCompress(mimeType))
+            return new ImageCompressResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        var memoryStream = await stream.CreateMemoryStreamAsync(cancellationToken: cancellationToken);
+
+        try
+        {
+            if (!Optimizer.IsSupported(memoryStream))
+                return new ImageCompressResult<Stream>(stream, ImageProcessState.Unsupported);
+
+            if (Compress(memoryStream))
+                return new ImageCompressResult<Stream>(memoryStream, ImageProcessState.Done);
+
+            memoryStream.Dispose();
+            return new ImageCompressResult<Stream>(stream, ImageProcessState.Canceled);
+        }
+        catch
+        {
+            memoryStream.Dispose();
+            throw;
+        }
+    }
+
+    protected virtual bool Compress(Stream stream)
+    {
+        return Options.Lossless
+            ? Optimizer.LosslessCompress(stream)
+            : Optimizer.Compress(stream);
+    }
+}
+```
+
+Key behaviors:
+
+- **`ImageOptimizer.IsSupported`** is checked **on the decoded bytes** — a second-pass safety net beyond the MIME pre-check.
+- **`LosslessCompress` vs. `Compress`** — chosen at construction time from `Options.Lossless`. Lossless mode preserves pixel data exactly; it's the right choice for archival or strict-fidelity workflows.
+- **Boolean return contract** — both `Optimizer.Compress` and `Optimizer.LosslessCompress` return `true` when the optimization produced a smaller file (and rewrote the stream in place), `false` when the original was already optimal. The contributor maps `false` → `ImageProcessState.Canceled` and returns the **original** stream.
+
+### Supported formats (compress)
+
+```csharp
+protected virtual bool CanCompress(string? mimeType)
+{
+    return mimeType switch
+    {
+        MimeTypes.Image.Jpeg => true,
+        MimeTypes.Image.Png  => true,
+        MimeTypes.Image.Gif  => true,
+        _ => false
+    };
+}
+```
+
+Three formats — the ones `ImageOptimizer` natively understands. WebP is **not** in the list. If your pipeline must compress WebP, chain this provider with ImageSharp ([`imaging/imagesharp`](/imaging/imagesharp)) which covers WebP.
+
+### Byte array overload
+
+```csharp
+using var memoryStream = new MemoryStream(bytes);
+var result = await TryCompressAsync(memoryStream, mimeType, cancellationToken);
+if (result.State != ImageProcessState.Done)
+    return new ImageCompressResult<byte[]>(bytes, result.State);
+
+var newBytes = await result.Result.GetAllBytesAsync(cancellationToken);
+result.Result.Dispose();
+return new ImageCompressResult<byte[]>(newBytes, result.State);
+```
+
+Same `Stream` → `byte[]` adapter pattern as the other contributors.
+
+## Compress options
+
+`framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/MagickNetCompressOptions.cs`:
+
+```csharp
+public class MagickNetCompressOptions
+{
+    public bool OptimalCompression       { get; set; }
+    public bool IgnoreUnsupportedFormats { get; set; }
+    public bool Lossless                 { get; set; }
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `OptimalCompression` | `false` | When `true`, `ImageOptimizer` searches harder for the best compression. Increases CPU cost significantly. |
+| `IgnoreUnsupportedFormats` | `false` | When `true`, `ImageOptimizer` doesn't throw on unknown formats. The contributor still pre-checks via `IsSupported`, so this only matters if you bypass the chain. |
+| `Lossless` | `false` | When `true`, calls `LosslessCompress` instead of `Compress`. Pixel-perfect; ratio is typically lower. |
+
+Sample configuration:
+
+```csharp
+Configure<MagickNetCompressOptions>(options =>
+{
+    options.OptimalCompression = true;
+    options.Lossless = true;
+});
+```
+
+<Note>
+`Optimizer` is constructed **once** at the contributor's construction time. If you change `Options.OptimalCompression` or `Options.IgnoreUnsupportedFormats` after registration (via `IOptionsMonitor`-style runtime updates), the contributor won't pick them up. `Lossless` is read on every call so it can be changed dynamically.
+</Note>
+
+## End-to-end
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Caller
+  participant Coord as ImageCompressor
+  participant Contrib as MagickImageCompressorContributor
+  participant Opt as ImageOptimizer
+
+  Caller->>Coord: CompressAsync(stream, "image/gif")
+  Coord->>Coord: ensure CanRead/CanSeek
+  Coord->>Contrib: TryCompressAsync(stream, "image/gif")
+  Contrib->>Contrib: CanCompress("image/gif") → true
+  Contrib->>Contrib: CreateMemoryStreamAsync(stream)
+  Contrib->>Opt: IsSupported(ms) → true
+  Contrib->>Opt: Compress(ms)  (or LosslessCompress if Options.Lossless)
+  alt returned true
+    Opt-->>Contrib: ms now smaller
+    Contrib-->>Coord: ImageCompressResult(ms, Done)
+  else returned false
+    Contrib->>Contrib: dispose ms
+    Contrib-->>Coord: ImageCompressResult(stream, Canceled)
+  end
+  Coord-->>Caller: result
+```
+
+## Sample usage
+
+A pipeline that lets Magick.NET resize GIFs and lossless-compress PNGs, with ImageSharp covering WebP compression:
+
+```csharp
+[DependsOn(
+    typeof(AbpImagingMagickNetModule),
+    typeof(AbpImagingImageSharpModule))]
+public class MyModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<MagickNetCompressOptions>(o =>
+        {
+            o.Lossless = true;
+            o.OptimalCompression = true;
+        });
+    }
+}
+```
+
+Because contributor iteration is **last-registered-first**, the last `DependsOn` entry runs first. Pin priorities explicitly by injecting the contributor type directly if it matters:
+
+```csharp
+public class GifPipeline : ITransientDependency
+{
+    private readonly MagickImageResizerContributor _magick;
+    public GifPipeline(MagickImageResizerContributor magick) => _magick = magick;
+}
+```
+
+## Operational notes
+
+- **Native dependency.** Magick.NET ships `Magick.NET-Q8-x64.dll` (or variants like Q16, OpenMP). Container images need a base where the right runtime libs (`libgomp1` for OpenMP builds) are available.
+- **Memory.** Magick.NET's `MagickImage` is unmanaged underneath. Always wrap in `using` — leaks accumulate in native heap and won't show up on managed memory profilers.
+- **Concurrency.** `MagickImage` instances are not thread-safe. The contributor allocates a new one per call, so concurrent inbound requests are safe.
+- **Cancellation.** Both resize and compress paths thread the cancellation token through the I/O calls only. `MagickImage` operations themselves are synchronous and not cancellable mid-flight.
+- **Animated GIFs.** `new MagickImage(stream)` reads the **first frame**. For multi-frame GIFs use `new MagickImageCollection(stream)` — the current contributor does not, so animated GIFs are flattened to one frame on resize.
+- **`MagickColors.Transparent` padding.** Falls back to black on JPEG. Override `ResizePad`/`ResizeBoxPad` to inject a different pad colour for JPEG outputs.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Imaging overview" href="/imaging/overview">
+    Coordinator chain semantics, action filters, provider stacking.
+  </Card>
+  <Card title="ImageSharp provider" href="/imaging/imagesharp">
+    Pure-managed alternative; covers WebP compression.
+  </Card>
+  <Card title="SkiaSharp provider" href="/imaging/skiasharp">
+    Native Skia resizer — fastest for JPEG/PNG/WebP but no compression and no mode support.
+  </Card>
+  <Card title="BLOB storing" href="/blob/blob-storing-overview">
+    Pre-process uploads with `IImageCompressor.CompressAsync` before persisting.
+  </Card>
+</CardGroup>

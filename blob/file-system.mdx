@@ -1,0 +1,138 @@
+---
+title: "File system provider"
+sidebarTitle: "File system"
+description: "Volo.Abp.BlobStoring.FileSystem — FileSystemBlobProvider with Polly-based retries, IBlobFilePathCalculator producing host or per-tenant directories, FileSystemBlobNamingNormalizer that sanitises Windows-illegal characters."
+---
+
+The file-system provider package is `framework/src/Volo.Abp.BlobStoring.FileSystem/Volo/Abp/BlobStoring/FileSystem/`. It stores BLOBs as regular files under a configured `BasePath`, optionally inserting the container name and a `host`/`tenants/{tenantId}` segment. It depends on `AbpBlobStoringModule` only; no cloud SDKs. Polly is used to retry transient `IOException`s.
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `AbpBlobStoringFileSystemModule.cs` | `[DependsOn(AbpBlobStoringModule)]`, empty body. |
+| `FileSystemBlobContainerConfigurationExtensions.cs` | `UseFileSystem(action)` and `GetFileSystemConfiguration()`. |
+| `FileSystemBlobProviderConfiguration.cs` | Typed view: `BasePath` (required) and `AppendContainerNameToBasePath` (default `true`). |
+| `FileSystemBlobProviderConfigurationNames.cs` | Bag keys (`FileSystem.BasePath`, `FileSystem.AppendContainerNameToBasePath`). |
+| `FileSystemBlobProvider.cs` | The `IBlobProvider`. Wraps `File.*` with `Polly.WaitAndRetryAsync(2, 1s/2s)` for `IOException`s. |
+| `IBlobFilePathCalculator.cs` + `DefaultBlobFilePathCalculator.cs` | Resolves the on-disk path for a blob: `BasePath / (host or tenants/<tenantId>) / [containerName] / blobName`. |
+| `FileSystemBlobNamingNormalizer.cs` | Strips Windows-illegal characters (`: * ? " < > |`). Forward and back slashes are preserved so blob names can include subdirectories. |
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule))]
+public class AbpBlobStoringFileSystemModule : AbpModule { }
+```
+
+## `UseFileSystem(...)`
+
+```csharp
+containerConfiguration.ProviderType = typeof(FileSystemBlobProvider);
+containerConfiguration.NamingNormalizers.TryAdd<FileSystemBlobNamingNormalizer>();
+fileSystemConfigureAction(new FileSystemBlobProviderConfiguration(containerConfiguration));
+```
+
+```csharp
+o.Containers.ConfigureDefault(c =>
+{
+    c.UseFileSystem(fs =>
+    {
+        fs.BasePath = Path.Combine(env.ContentRootPath, "blobs");
+        fs.AppendContainerNameToBasePath = true;
+    });
+});
+```
+
+## `FileSystemBlobProviderConfiguration`
+
+| Property | Bag key | Type | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `BasePath` | `FileSystem.BasePath` | `string` | required | Absolute path on disk under which all blobs are written. `Check.NotNullOrWhiteSpace` enforces presence on `set`. |
+| `AppendContainerNameToBasePath` | `FileSystem.AppendContainerNameToBasePath` | `bool` | `true` | When true, the container name is added between `host`/`tenants/{id}` and the blob name. Set to false to flatten all containers into one directory. |
+
+## `DefaultBlobFilePathCalculator`
+
+```csharp
+public virtual string Calculate(BlobProviderArgs args)
+{
+    var fileSystemConfiguration = args.Configuration.GetFileSystemConfiguration();
+    var blobPath = fileSystemConfiguration.BasePath;
+
+    if (CurrentTenant.Id == null)
+        blobPath = Path.Combine(blobPath, "host");
+    else
+        blobPath = Path.Combine(blobPath, "tenants", CurrentTenant.Id.Value.ToString("D"));
+
+    if (fileSystemConfiguration.AppendContainerNameToBasePath)
+        blobPath = Path.Combine(blobPath, args.ContainerName);
+
+    blobPath = Path.Combine(blobPath, args.BlobName);
+    return blobPath;
+}
+```
+
+Layout example with `BasePath = "/var/myapp/blobs"`, container name `profile-photos`, blob name `user-7e1d/avatar.png`, tenant `3fa…`:
+
+```
+/var/myapp/blobs/tenants/3fa85f64-5717-4562-b3fc-2c963f66afa6/profile-photos/user-7e1d/avatar.png
+```
+
+When `IsMultiTenant = false` on the container configuration, `BlobContainer` doesn't switch tenant scope, so `CurrentTenant.Id` reflects whatever the ambient request is; pair it with a `host` resolution in your code if you want a strictly tenant-agnostic placement.
+
+## `FileSystemBlobProvider`
+
+```csharp
+public class FileSystemBlobProvider : BlobProviderBase, ITransientDependency
+{
+    public FileSystemBlobProvider(IBlobFilePathCalculator filePathCalculator)
+        => FilePathCalculator = filePathCalculator;
+}
+```
+
+| Method | Flow |
+| --- | --- |
+| `SaveAsync` | Resolve path. If `!OverrideExisting && File.Exists` → `BlobAlreadyExistsException`. `DirectoryHelper.CreateIfNotExists(Path.GetDirectoryName(filePath))`. `FileMode` = `Create` when overriding, else `CreateNew`. Open `FileStream` and `BlobStream.CopyToAsync(fileStream, ct)`; `FlushAsync`. Wrapped in `Policy.Handle<IOException>().WaitAndRetryAsync(2, retry => TimeSpan.FromSeconds(retry))`. |
+| `DeleteAsync` | `FileHelper.DeleteIfExists(filePath)` — returns whether a file actually existed and was removed. |
+| `ExistsAsync` | `Task.FromResult(File.Exists(filePath))`. |
+| `GetOrNullAsync` | If `!File.Exists` → null. Otherwise the same 2× Polly retry wraps `File.OpenRead(filePath)`. Returns a `FileStream` — the caller is responsible for disposing it. |
+
+### Polly retry policy
+
+Both `SaveAsync` and `GetOrNullAsync` retry `IOException` twice with exponential delay (1 s then 2 s) before propagating. This covers transient SMB share hiccups, Windows file-locking by AV scanners, and similar transients but does **not** wrap `UnauthorizedAccessException` or generic exceptions.
+
+## `FileSystemBlobNamingNormalizer`
+
+The normaliser is OS-aware. On Windows it strips characters that the file-system rejects in names while preserving `/` and `\` so blob names can include subdirectories:
+
+```csharp
+protected virtual string Normalize(string fileName)
+{
+    using (CultureHelper.Use(CultureInfo.InvariantCulture))
+    {
+        var os = _iosPlatformProvider.GetCurrentOSPlatform();
+        if (os == OSPlatform.Windows)
+            fileName = Regex.Replace(fileName, "[:\\*\\?\"<>\\|]", string.Empty);
+
+        return fileName;
+    }
+}
+```
+
+On Linux/macOS the normaliser returns the name unchanged — POSIX allows almost every byte except `/` (which keeps its directory-separator meaning).
+
+<Warning>
+  Path traversal is the caller's responsibility. The normaliser does not strip `..`. If your blob name comes from untrusted input, validate that the resolved `filePath` is still inside `BasePath` before saving — for example using `Path.GetFullPath(filePath).StartsWith(Path.GetFullPath(BasePath))`. Replace `IBlobFilePathCalculator` to enforce this universally for a container.
+</Warning>
+
+## Operational notes
+
+- **`AppendContainerNameToBasePath = false`** is useful when you want each container to point at a different physical directory: configure a unique `BasePath` per container and disable the suffix.
+- **Per-tenant directories are eagerly created** by `DirectoryHelper.CreateIfNotExists`. Tenant deletion does not cascade to disk — clean up out-of-band when removing tenants.
+- **Symlink across providers**. Combine with the database provider for metadata (filename, size, owner, audit) and the file-system provider for bytes by configuring two containers, e.g. `Configure<UploadsContainer>(c => c.UseFileSystem(...))` for the bytes and a domain `UploadEntity` for the metadata.
+
+## Cross-references
+
+- [BLOB storing overview](/blob/blob-storing-overview).
+- [Memory provider](/blob/memory) — same shape, in-memory.
+- [Database BLOB provider](/modules/blob-storing-database) — durable alternative when filesystem access is constrained (containerised, ephemeral filesystem).

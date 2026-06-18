@@ -1,0 +1,134 @@
+---
+title: "Dapper integration"
+description: "Volo.Abp.Dapper lets you drop down to raw SQL using Dapper while staying inside the ABP unit of work."
+---
+
+`Volo.Abp.Dapper` is a small package — three files — that exposes a [Dapper](https://github.com/DapperLib/Dapper)-friendly repository sharing the same `DbConnection` and ambient `DbTransaction` as an EF Core `DbContext`. Use it when EF Core's expression translation is the wrong tool: complex reporting queries, set-based updates, bulk inserts, vendor-specific SQL.
+
+Source: `framework/src/Volo.Abp.Dapper/`.
+
+## Module — `AbpDapperModule`
+
+File: `Volo/Abp/Dapper/AbpDapperModule.cs`.
+
+```csharp
+[DependsOn(
+    typeof(AbpDddDomainModule),
+    typeof(AbpEntityFrameworkCoreModule))]
+public class AbpDapperModule : AbpModule { }
+```
+
+Note the dependency on `AbpEntityFrameworkCoreModule` — Dapper here is **not** a standalone provider; it piggybacks on an EF Core `DbContext` so it can reuse the connection, ambient transaction, and the connection-string resolution machinery you already configured.
+
+## `IDapperRepository`
+
+File: `Volo/Abp/Domain/Repositories/Dapper/IDapperRepository.cs`.
+
+```csharp
+public interface IDapperRepository
+{
+    [Obsolete("Use GetDbConnectionAsync method.")]
+    IDbConnection DbConnection { get; }
+
+    Task<IDbConnection> GetDbConnectionAsync();
+
+    [Obsolete("Use GetDbTransactionAsync method.")]
+    IDbTransaction? DbTransaction { get; }
+
+    Task<IDbTransaction?> GetDbTransactionAsync();
+}
+```
+
+`IDbConnection` lets you call any Dapper extension (`QueryAsync<T>`, `ExecuteAsync`, ...). `IDbTransaction?` is `null` when the active unit of work is not transactional — pass it explicitly to Dapper so your statement enrolls in the same transaction as EF Core writes.
+
+## `DapperRepository<TDbContext>`
+
+File: `Volo/Abp/Domain/Repositories/Dapper/DapperRepository.cs`.
+
+```csharp
+public class DapperRepository<TDbContext> : IDapperRepository, IUnitOfWorkEnabled
+    where TDbContext : IEfCoreDbContext
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    public IDataFilter DataFilter => LazyServiceProvider.LazyGetRequiredService<IDataFilter>();
+    public ICurrentTenant CurrentTenant => LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+    public IUnitOfWorkManager UnitOfWorkManager => LazyServiceProvider.LazyGetRequiredService<IUnitOfWorkManager>();
+    public ICancellationTokenProvider CancellationTokenProvider =>
+        LazyServiceProvider.LazyGetService<ICancellationTokenProvider>(NullCancellationTokenProvider.Instance);
+
+    private readonly IDbContextProvider<TDbContext> _dbContextProvider;
+
+    public DapperRepository(IDbContextProvider<TDbContext> dbContextProvider)
+    {
+        _dbContextProvider = dbContextProvider;
+    }
+
+    public virtual async Task<IDbConnection> GetDbConnectionAsync()
+        => (await _dbContextProvider.GetDbContextAsync()).Database.GetDbConnection();
+
+    public virtual async Task<IDbTransaction?> GetDbTransactionAsync()
+        => (await _dbContextProvider.GetDbContextAsync()).Database.CurrentTransaction?.GetDbTransaction();
+}
+```
+
+Key observations:
+
+- It is `IUnitOfWorkEnabled`, so methods get the standard `[UnitOfWork]` interception (`/data/unit-of-work`).
+- It does **not** implement `IRepository<TEntity>` — it is intentionally not a typed repository. You typically derive a concrete repository from it (e.g. `MyProjectDapperRepository : DapperRepository<MyProjectDbContext>, IMyReportingRepository, ITransientDependency`).
+- The connection comes from `EfCoreDbContext.Database.GetDbConnection()`. EF Core caches the connection; Dapper reuses it.
+- The transaction comes from `EfCoreDbContext.Database.CurrentTransaction?.GetDbTransaction()`. When the surrounding UoW is transactional, this is non-null and **must** be passed to every Dapper call.
+
+## Usage pattern
+
+```csharp
+public interface IBookReportingRepository
+{
+    Task<List<BookSalesRow>> GetSalesAsync(DateTime from, DateTime to);
+}
+
+public class BookReportingRepository
+    : DapperRepository<MyProjectDbContext>, IBookReportingRepository, ITransientDependency
+{
+    public async Task<List<BookSalesRow>> GetSalesAsync(DateTime from, DateTime to)
+    {
+        var connection = await GetDbConnectionAsync();
+        var transaction = await GetDbTransactionAsync();
+
+        var rows = await connection.QueryAsync<BookSalesRow>(
+            @"SELECT BookId, SUM(Quantity) AS Quantity
+              FROM Sales
+              WHERE SaleDate >= @from AND SaleDate < @to
+              GROUP BY BookId",
+            new { from, to },
+            transaction);
+
+        return rows.AsList();
+    }
+}
+```
+
+Because it's still inside a UoW:
+
+- If the surrounding application service is transactional, your `INSERT/UPDATE/DELETE` via Dapper commits or rolls back atomically with EF Core's `SaveChangesAsync`.
+- `IDataFilter` is available, but Dapper does **not** apply ABP's global query filters automatically — you must respect `ISoftDelete` / `IMultiTenant` yourself in your SQL.
+- `ICurrentTenant.Id` is available; combine with `WHERE TenantId = @tenantId` (parameterised) in your queries.
+
+## When to choose Dapper over EF Core
+
+| Reason | Why Dapper helps |
+| --- | --- |
+| Complex aggregation / window functions | Avoids LINQ-to-SQL translation gymnastics. |
+| Bulk operations (`UPDATE...FROM`, `INSERT...SELECT`) | EF Core's `ExecuteUpdateAsync` is recent and limited. |
+| Vendor-specific SQL (`MERGE`, `CTE`, `JSON`) | Pass-through SQL. |
+| Read-model projections to flat DTOs | Skip change-tracking overhead. |
+| Stored-procedure calls with table-valued params | Use `IDbConnection.Execute` directly. |
+
+When you don't need ABP's audit-property setting / domain events / soft delete / multi-tenant filter, Dapper is acceptable. For aggregate-root mutation paths, prefer EF Core repositories so the change-tracker hooks fire (`/data/entity-framework-core`).
+
+## Cross-references
+
+- `/data/entity-framework-core` — `IDbContextProvider<TDbContext>` and the underlying connection.
+- `/data/unit-of-work` — why `GetDbTransactionAsync` is non-null only inside a transactional UoW.
+- `/ddd/repositories` — the typed `IRepository<TEntity>` abstraction Dapper deliberately bypasses.
+- `/data/data-filtering` — you must replicate `ISoftDelete` / `IMultiTenant` in your SQL by hand.

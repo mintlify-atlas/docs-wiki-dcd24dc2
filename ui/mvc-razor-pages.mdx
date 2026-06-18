@@ -1,0 +1,244 @@
+---
+title: "ASP.NET Core MVC / Razor Pages stack"
+sidebarTitle: "MVC / Razor Pages"
+description: "ABP's MVC + Razor Pages UI: AbpPageModel/AbpPage base classes, theming-driven layout selection (ITheme.GetLayout with StandardLayouts), alerts, layout hooks, tag helpers and the Mvc.UI package chain."
+---
+
+The classic MVC / Razor Pages stack is the most feature-complete UI surface in ABP. It lives in a chain of packages — abstractions in `Volo.Abp.AspNetCore.Mvc.UI`, Bootstrap default look in `Volo.Abp.AspNetCore.Mvc.UI.Bootstrap`, shared toolbars / error pages / page-toolbars in `Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared`, and per-theme NuGet packages (Basic theme in `modules/basic-theme/`, plus commercial themes).
+
+This page covers the bits that **every** ABP Razor Pages app inherits, regardless of theme.
+
+## Module composition
+
+`framework/src/Volo.Abp.AspNetCore.Mvc.UI/Volo/Abp/AspNetCore/Mvc/UI/AbpAspNetCoreMvcUiModule.cs`:
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreMvcModule))]
+[DependsOn(typeof(AbpUiNavigationModule))]
+public class AbpAspNetCoreMvcUiModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpAspNetCoreMvcUiModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(o => o.FileSets.AddEmbedded<AbpAspNetCoreMvcUiModule>());
+    }
+}
+```
+
+So the module: (a) pulls in MVC + navigation, (b) registers itself as an MVC application part (its compiled Razor views and tag helpers become discoverable), (c) mounts its embedded resources into the virtual file system.
+
+The full UI stack typically looks like:
+
+```
+AbpAspNetCoreMvcUiModule
+ ├── AbpAspNetCoreMvcUiBootstrapModule
+ │    └── (Bootstrap CSS/JS contributors)
+ ├── AbpAspNetCoreMvcUiBundlingModule         ← see /aspnetcore/mvc-ui-bundling
+ ├── AbpAspNetCoreMvcUiPackagesModule         ← 3rd-party JS/CSS bundle contributors
+ └── AbpAspNetCoreMvcUiThemeSharedModule      ← toolbars, error pages, page toolbar
+       └── (the actual theme module e.g. Basic / LeptonX / Lepton)
+```
+
+The active **theme module** registers an `ITheme` implementation and seeds `AbpThemingOptions.DefaultThemeName`. See [`/aspnetcore/mvc-ui-themes`](/aspnetcore/mvc-ui-themes) for the deep dive.
+
+## `AbpPageModel` — base for every Razor page
+
+Every ABP Razor page inherits from `AbpPageModel` (`Volo/Abp/AspNetCore/Mvc/UI/RazorPages/AbpPageModel.cs`). It is to Razor Pages what `AbpController` is to MVC controllers — a property bag of *lazy-resolved* framework services so handlers don't need constructor-injected boilerplate:
+
+```csharp
+public abstract class AbpPageModel : PageModel
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    protected IClock              Clock              => LazyServiceProvider.LazyGetRequiredService<IClock>();
+    protected IUnitOfWorkManager  UnitOfWorkManager  => LazyServiceProvider.LazyGetRequiredService<IUnitOfWorkManager>();
+    protected ICurrentUser        CurrentUser        => LazyServiceProvider.LazyGetRequiredService<ICurrentUser>();
+    protected ICurrentTenant      CurrentTenant      => LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+    protected ISettingProvider    SettingProvider    => LazyServiceProvider.LazyGetRequiredService<ISettingProvider>();
+    protected IAuthorizationService AuthorizationService => LazyServiceProvider.LazyGetRequiredService<IAuthorizationService>();
+    protected IAlertManager       AlertManager       => LazyServiceProvider.LazyGetRequiredService<IAlertManager>();
+    protected IModelStateValidator ModelValidator   => LazyServiceProvider.LazyGetRequiredService<IModelStateValidator>();
+    protected IGuidGenerator      GuidGenerator      => LazyServiceProvider.LazyGetService<IGuidGenerator>(SimpleGuidGenerator.Instance);
+    protected ILogger             Logger             => LazyServiceProvider.LazyGetService<ILogger>(p => LoggerFactory?.CreateLogger(GetType().FullName!) ?? NullLogger.Instance);
+    protected IAppUrlProvider     AppUrlProvider     => LazyServiceProvider.LazyGetRequiredService<IAppUrlProvider>();
+
+    protected IUnitOfWork? CurrentUnitOfWork => UnitOfWorkManager?.Current;
+    protected AlertList   Alerts            => AlertManager.Alerts;
+
+    protected Type? ObjectMapperContext { get; set; }
+    protected IObjectMapper ObjectMapper => /* picks IObjectMapper<TContext> if ObjectMapperContext is set */;
+
+    protected IStringLocalizer L { get { _localizer ??= CreateLocalizer(); return _localizer; } }
+    protected Type? LocalizationResourceType { get; set; }
+    // ...
+}
+```
+
+Key conventions:
+
+| Member | Use |
+| --- | --- |
+| `L` | String localizer. Resolves `LocalizationResourceType` if set, otherwise `AbpLocalizationOptions.DefaultResourceType`. Throws `AbpException` if neither is configured. |
+| `ObjectMapperContext` | Set in `OnGet`/ctor to scope `ObjectMapper` to a typed `IObjectMapper<TContext>`. |
+| `Alerts` | `AlertManager`-backed list; the active theme renders these as Bootstrap alerts on the next render. |
+| `ValidateModel()` | Delegates to `IModelStateValidator` (adds ABP's validation conventions). |
+| `CheckPolicyAsync(name)` | Sugar for `AuthorizationService.CheckAsync(name)` — throws when denied. |
+| `RedirectSafelyAsync(returnUrl, hash?)` | Validates `returnUrl` is local *or* whitelisted via `IAppUrlProvider.IsRedirectAllowedUrlAsync`, then redirects. Falls back to `GetAppHomeUrlAsync()` (returns `~/`). Use this in every `Login`/`Logout` handler instead of `Redirect(returnUrl)`. |
+| `PartialView<TModel>(viewName, model)` | Strongly-typed shortcut for `PartialViewResult` with a fresh `ViewDataDictionary<TModel>`. |
+| `NoContent()` | Returns a `NoContentResult`. |
+
+`LazyServiceProvider` is wired by the `ServiceBasedPageModelActivatorProvider` (registered by the module) — that's the activator that lets ABP do its lazy-service injection on Razor Pages instead of the default ASP.NET Core activator.
+
+### `AbpPage` for `.cshtml` files
+
+The Razor *file*-side counterpart is `AbpPage : Page` (`RazorPages/AbpPage.cs`). It uses `[RazorInject]` to surface `CurrentUser` directly in markup:
+
+```csharp
+public abstract class AbpPage : Page
+{
+    [RazorInject]
+    public ICurrentUser CurrentUser { get; set; } = default!;
+}
+```
+
+Razor `_ViewImports.cshtml` typically does `@inherits Volo.Abp.AspNetCore.Mvc.UI.RazorPages.AbpPage<TModel>` (the generic variant lives in the same namespace) so every page can call `@CurrentUser.IsAuthenticated`.
+
+## Layout selection via `ITheme`
+
+`Volo/Abp/AspNetCore/Mvc/UI/Theming/ITheme.cs`:
+
+```csharp
+public interface ITheme
+{
+    string GetLayout(string name, bool fallbackToDefault = true);
+}
+```
+
+A Razor page picks a layout by **name**, not by path — usually inside the page's `OnPageHandlerExecuting` or directly at the top of the `.cshtml`:
+
+```csharp
+public class StandardLayouts
+{
+    public const string Application = "Application";  // app pages w/ sidebar + toolbar
+    public const string Account     = "Account";      // login / register
+    public const string Public      = "Public";       // marketing
+    public const string Empty       = "Empty";        // popups / iframes
+}
+```
+
+```cshtml
+@using Volo.Abp.AspNetCore.Mvc.UI.Theming
+@inject IThemeManager ThemeManager
+@{
+    Layout = ThemeManager.CurrentTheme.GetLayout(StandardLayouts.Account);
+}
+```
+
+`IThemeManager.CurrentTheme` resolves via `DefaultThemeSelector → AbpThemingOptions.DefaultThemeName → ThemeDictionary[Type]`. The result is `ITheme.GetLayout("Account")` returning something like `~/Themes/Basic/Layouts/Account.cshtml`, depending on which theme module is active. Read [`/aspnetcore/mvc-ui-themes`](/aspnetcore/mvc-ui-themes) for the full resolution flow.
+
+## Alerts
+
+`AbpPageModel.Alerts` (an `AlertList`) is filled from handlers and rendered by the theme:
+
+```csharp
+public async Task<IActionResult> OnPostAsync()
+{
+    await _service.DoWorkAsync();
+    Alerts.Success(L["WorkDone"]);
+    return RedirectToPage();
+}
+```
+
+`Volo.Abp.AspNetCore.Mvc.UI/Alerts/`:
+
+| Type | Purpose |
+| --- | --- |
+| `AlertMessage` | `Type` (`AlertType`), `Text`, `Title`, `Dismissible` flag. |
+| `AlertType` | `Default`/`Success`/`Warning`/`Danger`/`Info`. |
+| `IAlertManager` | One scoped manager exposing `AlertList Alerts { get; }`. |
+| `AlertList` | `Add(...)`, `Success(...)`, `Warning(...)`, `Danger(...)`, `Info(...)` shortcuts. |
+
+The theme module renders these via a view component (look for `AbpPageAlertsViewComponent` in your theme).
+
+## Page layout and breadcrumbs
+
+`Volo/Abp/AspNetCore/Mvc/UI/Layout/`:
+
+- `IPageLayout` / `PageLayout` — set `Content.Title`, `Content.BreadCrumb`, `Content.MenuItemName` from a handler (`@inject IPageLayout PageLayout`). The active theme's `_Layout.cshtml` reads them to render the page header.
+- `BreadCrumb` / `BreadCrumbItem` — model for the breadcrumb trail.
+
+## Layout hooks
+
+`Volo.Abp.UI/LayoutHooks/` (in `Volo.Abp.UI`, reused by both MVC and Blazor): named injection points the layout exposes — `Header.First`, `Header.Last`, `Body.First`, `Body.Last`, `PageContent.First`, `PageContent.Last`. Modules register components for a hook:
+
+```csharp
+Configure<AbpLayoutHookOptions>(options =>
+{
+    options.Add(LayoutHooks.Head.Last, typeof(MyHeadComponent));
+});
+```
+
+On the MVC side, `Volo/Abp/AspNetCore/Mvc/UI/Components/LayoutHook/LayoutHookViewComponent.cs` renders all components registered for a given hook name; the theme's layouts invoke it at the canonical positions.
+
+## Tag helpers and view components
+
+The framework adds dozens of Bootstrap-aware tag helpers via `Volo.Abp.AspNetCore.Mvc.UI.Bootstrap` (e.g. `<abp-button>`, `<abp-card>`, `<abp-collapse>`, `<abp-modal>`, `<abp-tabs>`, `<abp-form>`). The **bundling** ones (`<abp-script-bundle>`, `<abp-style-bundle>`, `<abp-script>`, `<abp-style>`) live in `Volo.Abp.AspNetCore.Mvc.UI.Bundling/TagHelpers/` and are covered in [`/aspnetcore/mvc-ui-bundling`](/aspnetcore/mvc-ui-bundling).
+
+`Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared/Pages/Shared/Components/` ships theme-agnostic view components used by every theme:
+
+- `AbpApplicationPathViewComponent` — emits `<script>` window globals for the SPA base path.
+- `AbpPageSearchBoxViewComponent` — header search box.
+- `AbpPageToolbarViewComponent` + `AbpPageToolbarButtonViewComponent` — render the toolbar contributions configured via `IPageToolbarManager` / `IPageToolbarContributor` (see `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared/PageToolbars/`).
+
+## Branding
+
+`Volo.Abp.UI/Branding/IBrandingProvider.cs` is the single hook every theme reads for app name + logo:
+
+```csharp
+public interface IBrandingProvider
+{
+    string AppName { get; }
+    string? LogoUrl { get; }           // light background
+    string? LogoReverseUrl { get; }    // dark background
+}
+```
+
+The default is `DefaultBrandingProvider` with `AppName = "MyApplication"`. Replace it via `[Dependency(ReplaceServices = true)]`:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class MyBrandingProvider : DefaultBrandingProvider
+{
+    public override string AppName => "Acme HR";
+    public override string? LogoUrl => "/logos/acme.png";
+    public override string? LogoReverseUrl => "/logos/acme-reverse.png";
+}
+```
+
+## `AbpMvcUiOptions`
+
+```csharp
+public class AbpMvcUiOptions
+{
+    public string LoginUrl  { get; set; } = "/Account/Login";
+    public string LogoutUrl { get; set; } = "/Account/Logout";
+}
+```
+
+These are the URLs `AbpPageModel.RedirectSafelyAsync` and the auth flow widgets target. Change them if you mount the Account module under a different path.
+
+## Related pages
+
+- [`/aspnetcore/mvc-ui-themes`](/aspnetcore/mvc-ui-themes) — full theming pipeline.
+- [`/aspnetcore/mvc-ui-bundling`](/aspnetcore/mvc-ui-bundling) — bundle/minify pipeline and tag helpers.
+- [`/aspnetcore/mvc-ui-bootstrap`](/aspnetcore/mvc-ui-bootstrap) — Bootstrap tag helpers.
+- [`/ui/navigation-menus`](/ui/navigation-menus) — menu contributors that drive the sidebar.
+- [`/modules/basic-theme`](/modules/basic-theme) — reference `ITheme` implementation.
+- [`/ui/minify`](/ui/minify) — the minifier that bundling delegates to.

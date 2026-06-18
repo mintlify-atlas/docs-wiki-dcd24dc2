@@ -1,0 +1,116 @@
+---
+title: "MinIO provider"
+sidebarTitle: "MinIO"
+description: "Volo.Abp.BlobStoring.Minio — MinioBlobProvider over the official Minio .NET SDK, MinioBlobProviderConfiguration with EndPoint/AccessKey/SecretKey/WithSSL/PresignedGetExpirySeconds, and the internal __MinioApiClient HTTP factory wiring."
+---
+
+The MinIO provider package is `framework/src/Volo.Abp.BlobStoring.Minio/`. It targets the **`Minio`** SDK (the official client) and works against MinIO, MinIO Gateway, or any S3-compatible store reachable over a single endpoint. No `IDistributedCache` dependency — credentials are long-lived.
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `Microsoft/Extensions/DependencyInjection/MinioHttpClientFactoryServiceCollectionExtensions.cs` | Internal — registers an `IHttpClientFactory` typed client named `__MinioApiClient` so the provider can pull a configured `HttpClient` for the Minio SDK. |
+| `Volo/Abp/BlobStoring/Minio/AbpBlobStoringMinioModule.cs` | `[DependsOn(AbpBlobStoringModule)]`. Calls `services.AddMinioHttpClient()` in `ConfigureServices`. |
+| `MinioBlobContainerConfigurationExtensions.cs` | `UseMinio(action)` and `GetMinioConfiguration()`. |
+| `MinioBlobProviderConfiguration.cs` | Typed view over the bag. |
+| `MinioBlobProviderConfigurationNames.cs` | Bag keys (`Minio.BucketName`, `Minio.EndPoint`, …). |
+| `MinioBlobProvider.cs` | The `IBlobProvider`. |
+| `MinioBlobNamingNormalizer.cs` | S3-style bucket name rules. |
+| `IMinioBlobNameCalculator.cs` + `DefaultMinioBlobNameCalculator.cs` | `host/{blob}` vs. `tenants/{tenantId}/{blob}` object key. |
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule))]
+public class AbpBlobStoringMinioModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMinioHttpClient();
+    }
+}
+```
+
+`AddMinioHttpClient()` is `internal` and registers `services.AddHttpClient("__MinioApiClient")`. The provider's client factory pulls this named client out of `IHttpClientFactory`, which means MinIO calls participate in any global `HttpClient` configuration you've added (proxy, certificate validation, message handlers, Polly retries).
+
+## `UseMinio(...)`
+
+```csharp
+containerConfiguration.ProviderType = typeof(MinioBlobProvider);
+containerConfiguration.NamingNormalizers.TryAdd<MinioBlobNamingNormalizer>();
+minioConfigureAction(new MinioBlobProviderConfiguration(containerConfiguration));
+```
+
+```csharp
+o.Containers.ConfigureDefault(c =>
+{
+    c.UseMinio(m =>
+    {
+        m.EndPoint   = "minio.local:9000";        // host[:port], no scheme
+        m.AccessKey  = config["Minio:AccessKey"];
+        m.SecretKey  = config["Minio:SecretKey"];
+        m.BucketName = "myapp-blobs";
+        m.WithSSL    = false;                     // true → https
+        m.CreateBucketIfNotExists  = true;
+        m.PresignedGetExpirySeconds = 7 * 24 * 3600;
+    });
+});
+```
+
+## `MinioBlobProviderConfiguration`
+
+| Property | Bag key | Type | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `BucketName` | `Minio.BucketName` | `string?` | `null` | Override the bucket name. If null, falls back to `args.ContainerName`. |
+| `EndPoint` | `Minio.EndPoint` | `string` | required | URL/host/IPv4/IPv6 — must be a hostname or address, *not* a full URL with scheme. The SDK constructs `http(s)://{EndPoint}` itself. |
+| `AccessKey` | `Minio.AccessKey` | `string` | required | Long-lived access key (or `""` for anonymous). |
+| `SecretKey` | `Minio.SecretKey` | `string` | required | Paired secret. |
+| `WithSSL` | `Minio.WithSSL` | `bool` | `false` | When `true`, calls `MinioClient.WithSSL()` so the SDK uses HTTPS. |
+| `CreateBucketIfNotExists` | `Minio.CreateBucketIfNotExists` | `bool` | `false` | When `true`, `SaveAsync` checks `BucketExistsAsync` and calls `MakeBucketAsync` on miss. |
+| `PresignedGetExpirySeconds` | `Minio.PresignedGetExpirySeconds` | `int` | `7 * 24 * 3600` (7 days) | Default expiry used by callers building presigned GET URLs (the provider stores it; the URL generation itself happens in your code or a separate helper). |
+
+`EndPoint`, `AccessKey`, `SecretKey` are required (`GetConfiguration<string>` throws on null). `BucketName` is optional.
+
+## `MinioBlobProvider`
+
+The provider's constructor pulls an `IHttpClientFactory` (to build the SDK client) and the name calculator. For each call it builds a fresh `MinioClient`:
+
+```csharp
+var minio = new MinioClient()
+    .WithEndpoint(configuration.EndPoint)
+    .WithCredentials(configuration.AccessKey, configuration.SecretKey);
+if (configuration.WithSSL) minio = minio.WithSSL();
+minio = minio.WithHttpClient(_httpClientFactory.CreateMinioHttpClient()).Build();
+```
+
+| Method | Flow |
+| --- | --- |
+| `SaveAsync` | If `!OverrideExisting && exists` → `BlobAlreadyExistsException`. If `CreateBucketIfNotExists` and `!BucketExistsAsync` → `MakeBucketAsync`. Then `PutObjectAsync(new PutObjectArgs().WithBucket(bucket).WithObject(key).WithStreamData(args.BlobStream).WithObjectSize(stream.Length))`. |
+| `DeleteAsync` | If exists → `RemoveObjectAsync(new RemoveObjectArgs(...))` → true; else false. |
+| `ExistsAsync` | `StatObjectAsync` — returns false on `ObjectNotFoundException`. |
+| `GetOrNullAsync` | Returns null if absent. Otherwise issues `GetObjectAsync(new GetObjectArgs().WithBucket(...).WithObject(...).WithCallbackStream(s => …))` and buffers the stream into a `MemoryStream` (the SDK calls the callback synchronously). |
+
+`PresignedGetExpirySeconds` is **not** consumed by the provider itself — it's a settings value the application reads via `args.Configuration.GetMinioConfiguration().PresignedGetExpirySeconds` when generating presigned URLs.
+
+## `MinioBlobNamingNormalizer`
+
+S3-compatible rules — same shape as `AwsBlobNamingNormalizer`: lowercases, allows `[a-z0-9-.]`, strips IP-like patterns, collapses dots, trims leading/trailing dots and dashes, pads to ≥3 chars, truncates to 63.
+
+## `DefaultMinioBlobNameCalculator`
+
+```csharp
+return CurrentTenant.Id == null
+    ? $"host/{args.BlobName}"
+    : $"tenants/{CurrentTenant.Id.Value:D}/{args.BlobName}";
+```
+
+## Operational notes
+
+- **HttpClient lifetime**. `CreateMinioHttpClient` returns a transient `HttpClient` (via `IHttpClientFactory`), so the SDK's connection pooling is delegated to the factory. Avoid re-implementing message handlers per provider call — register globally instead.
+- **MinIO + S3 SDK interop**. Because MinIO is S3-compatible, you can also use the `Volo.Abp.BlobStoring.Aws` provider against a MinIO endpoint by setting `Aws.Region = "us-east-1"` and pointing the AWS SDK at a custom service URL through a subclassed factory. The MinIO provider is preferred when you want the official Minio SDK features (e.g. presigned URLs, notifications) without going through S3-API quirks.
+
+## Cross-references
+
+- [BLOB storing overview](/blob/blob-storing-overview).
+- [AWS S3](/blob/aws-s3) — same naming rules, S3-protocol alternative.

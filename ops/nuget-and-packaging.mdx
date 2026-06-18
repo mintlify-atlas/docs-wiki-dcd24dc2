@@ -1,0 +1,416 @@
+---
+title: "NuGet packaging — Directory.Packages.props, nupkg/ and latest-versions.json"
+sidebarTitle: "NuGet & Packaging"
+description: "Central package management (Directory.Packages.props), NuGet.Config, NuGet.md per-package readme, nupkg/pack.ps1 + push_packages.ps1, the ~400-entry $projects list and latest-versions.json."
+---
+
+The NuGet side of the release pipeline is implemented in three places: root-level configuration (`Directory.Packages.props`, `NuGet.Config`, `NuGet.md`, `latest-versions.json`), the `nupkg/` working directory (where `pack.ps1` and `push_packages.ps1` live alongside the long `$projects` enumeration in `common.ps1`), and the `deploy/2-nuget-pack.ps1` + `deploy/3-nuget-push.ps1` wrappers that invoke them. This page enumerates every input, the ~400-entry project list and the per-package conventions that make `dotnet pack` produce the published artifacts.
+
+<Info>
+For the deploy-step view (how steps 2 and 3 fit into `_run_all.ps1`) see [/ops/deploy-scripts](/ops/deploy-scripts). For the build that must precede `dotnet pack` see [/ops/build-scripts](/ops/build-scripts).
+</Info>
+
+## Root-level inputs
+
+| File | Role |
+| --- | --- |
+| `Directory.Packages.props` | Central package version management — every `PackageReference` resolves through here |
+| `Directory.Build.props` | Implicitly imported per-project — pulls in `common.props` |
+| `common.props` | Owns `<Version>` and `<LeptonXVersion>`. Edited in-place by `deploy/1-fetch-and-build.ps1` |
+| `common.test.props` | Imported by `*.Tests.csproj` — adds Shouldly, xUnit, coverlet |
+| `configureawait.props` | ConfigureAwait analyzer settings |
+| `NuGet.Config` | Restrict restore to `nuget.org` only |
+| `NuGet.md` | Per-package README template embedded as `<PackageReadmeFile>` |
+| `latest-versions.json` | Public manifest of available stable/RC versions, consumed by the CLI |
+| `delete-bin-obj.ps1` | Hygiene script: recursive `bin`/`obj` delete (skips `node_modules`) |
+
+## `Directory.Packages.props` — central package management
+
+```xml
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageFloatingVersionsEnabled>true</CentralPackageFloatingVersionsEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="Autofac" Version="8.4.0" />
+    <PackageVersion Include="AutoMapper" Version="14.0.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.2" />
+    <PackageVersion Include="Microsoft.AspNetCore.Components" Version="10.0.2" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="10.0.2" />
+    <!-- … hundreds more — alphabetical by Include -->
+  </ItemGroup>
+</Project>
+```
+
+Properties:
+
+| Property | Effect |
+| --- | --- |
+| `ManagePackageVersionsCentrally=true` | Every `<PackageReference>` in any `*.csproj` becomes version-less; the version comes from this file |
+| `CentralPackageFloatingVersionsEnabled=true` | Allows `Version="10.0.*"` style floats (used sparingly) |
+
+**Rule**: a new package dependency must be added to `Directory.Packages.props` first. Adding `<PackageReference Include="…" Version="…"/>` directly in a csproj will cause `NU1008` build failures.
+
+### Notable pinning conventions
+
+- ASP.NET Core / EF Core / Microsoft.Extensions.* line up on a single major (`10.0.2` at time of writing) to match `global.json` (`10.0.100`).
+- Long-lived "framework-of-framework" dependencies (`Autofac`, `AutoMapper`, `Castle.Core`, `JetBrains.Annotations`) jump majors only between ABP majors.
+- IdentityServer4 stays pinned at `4.1.2` (final OSS release) — the modern path is OpenIddict.
+- Test-only packages live in the same file (`Shouldly`, `xunit`, `NSubstitute`).
+
+## `NuGet.Config`
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+    <packageSources>
+        <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    </packageSources>
+</configuration>
+```
+
+Single source. There is no MyGet / GitHub Packages fallback in the public repo — pinning to `nuget.org` makes reproducible restores possible. (`nupkg/push-nightly-packages-myget.ps1` is a left-over helper that takes `-source` and `-apikey` as parameters; the public CI no longer pushes to MyGet.)
+
+## `NuGet.md` — per-package README
+
+The repo ships **one** `NuGet.md` at the root that every published package embeds as `<PackageReadmeFile>NuGet.md</PackageReadmeFile>`. The file is a generic ABP marketing blurb with key features, supported databases and UI frameworks, and links to abp.io / GitHub / Discord / YouTube. It is rendered on each NuGet listing page so consumers see consistent metadata.
+
+If you fork ABP and want per-package READMEs, add a `<PackageReadmeFile>` override per csproj or per module's `.props`.
+
+## `latest-versions.json` — public version manifest
+
+```json
+[
+  {
+    "version": "10.1.0",
+    "releaseDate": "",
+    "type": "stable",
+    "message": "",
+    "leptonx": { "version": "5.1.0" }
+  },
+  {
+    "version": "10.0.3",
+    "releaseDate": "",
+    "type": "stable",
+    "message": "",
+    "leptonx": { "version": "5.0.5" }
+  }
+  // …more entries, newest first
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `version` | ABP framework SemVer |
+| `releaseDate` | (Currently blank — populated by the CLI / abp.io rendering layer) |
+| `type` | `stable` or `rc` |
+| `message` | Optional banner shown by the CLI / templates |
+| `leptonx.version` | Matching LeptonX theme version (shipped separately) |
+
+Consumed by:
+
+- **ABP CLI** (`Volo.Abp.Cli`) when generating templates and when `abp update` decides which version to bump to.
+- **abp.io** website to show the current stable + preview channels.
+
+When cutting a new release, prepend an entry to this file (and ensure `leptonx.version` aligns with the matching LeptonX release).
+
+## `nupkg/` — the working directory
+
+```
+nupkg/
+├── common.ps1            ← helpers + $solutions + $projects (~400 entries)
+├── common.ps1.bak        ← backup snapshot
+├── pack.ps1              ← dotnet pack every project, move .nupkg here
+├── push_packages.ps1     ← dotnet nuget push every *.nupkg to nuget.org
+├── push-nightly-packages-myget.ps1  ← legacy MyGet helper
+└── unit_test.ps1         ← `dotnet test --logger trx` per solution (rarely used)
+```
+
+When `pack.ps1` finishes, this folder contains hundreds of `*.nupkg` files (e.g. `Volo.Abp.Core.10.2.0-rc.3.nupkg`). They stay here through step 3 (push) so failed pushes can be retried.
+
+### `nupkg/common.ps1` — the project enumeration
+
+The file dot-sources into every `deploy/*.ps1` script. It defines:
+
+```powershell
+$packFolder = (Get-Item -Path "./" -Verbose).FullName
+$rootFolder = Join-Path $packFolder "../"
+
+function Write-Info($text) { Write-Host $text -ForegroundColor Black -BackgroundColor Green; … }
+function Write-Error($text) { Write-Host $text -ForegroundColor Red -BackgroundColor Black }
+function Seperator       { Write-Host ("_" * 100) -ForegroundColor gray }
+function Get-Current-Version {
+    $commonPropsXmlCurrent = [xml](Get-Content (resolve-path "../common.props"))
+    return $commonPropsXmlCurrent.Project.PropertyGroup.Version.Trim()
+}
+function Get-Current-Branch { return git branch --show-current }
+function Read-File($filePath) { … }
+```
+
+Plus the two big lists:
+
+#### `$solutions` — restored before packing
+
+```powershell
+$solutions = (
+    "framework",
+    "modules/account",
+    "modules/audit-logging",
+    "modules/background-jobs",
+    "modules/basic-theme",
+    "modules/blogging",
+    "modules/client-simulation",
+    "modules/docs",
+    "modules/feature-management",
+    "modules/identity",
+    "modules/identityserver",
+    "modules/openiddict",
+    "modules/permission-management",
+    "modules/setting-management",
+    "modules/tenant-management",
+    "modules/users",
+    "modules/virtual-file-explorer",
+    "modules/blob-storing-database",
+    "modules/cms-kit"
+)
+```
+
+19 solutions. `pack.ps1` runs `dotnet restore` per solution **before** the pack loop, so transitive references inside a solution share a restore graph.
+
+#### `$projects` — packed individually
+
+The list is hundreds of entries long, grouped by section header comments:
+
+```powershell
+$projects = (
+    # framework
+    "framework/src/Volo.Abp.AI.Abstractions",
+    "framework/src/Volo.Abp.AI",
+    "framework/src/Volo.Abp.AspNetCore",
+    "framework/src/Volo.Abp.AspNetCore.Mvc",
+    "framework/src/Volo.Abp.Autofac",
+    "framework/src/Volo.Abp.Caching",
+    "framework/src/Volo.Abp.Core",
+    "framework/src/Volo.Abp",
+    "framework/src/Volo.Abp.EntityFrameworkCore",
+    "framework/src/Volo.Abp.EntityFrameworkCore.SqlServer",
+    "framework/src/Volo.Abp.EventBus",
+    "framework/src/Volo.Abp.EventBus.RabbitMQ",
+    "framework/src/Volo.Abp.MongoDB",
+    "framework/src/Volo.Abp.TestBase",
+    "framework/src/Volo.Abp.AspNetCore.TestBase",
+    # … plus all *.Blazor, *.MauiBlazor, *.Sms.*, *.BlobStoring.*, *.Imaging.* variants
+
+    # modules/account
+    "modules/account/src/Volo.Abp.Account.Application.Contracts",
+    "modules/account/src/Volo.Abp.Account.Application",
+    "modules/account/src/Volo.Abp.Account.HttpApi.Client",
+    "modules/account/src/Volo.Abp.Account.HttpApi",
+    "modules/account/src/Volo.Abp.Account.Web",
+    "modules/account/src/Volo.Abp.Account.Web.IdentityServer",
+    "modules/account/src/Volo.Abp.Account.Web.OpenIddict",
+    "modules/account/src/Volo.Abp.Account.Blazor",
+    "modules/account/src/Volo.Abp.Account.Installer",
+    "source-code/Volo.Abp.Account.SourceCode",
+    # … 18 modules × ~10 projects each, plus their .SourceCode entries
+
+    # modules/cms-kit
+    "modules/cms-kit/src/Volo.CmsKit.Admin.Application",
+    "modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts",
+    "modules/cms-kit/src/Volo.CmsKit.Admin.HttpApi",
+    "modules/cms-kit/src/Volo.CmsKit.HttpApi.Client",
+    "modules/cms-kit/src/Volo.CmsKit.MongoDB",
+    "modules/cms-kit/src/Volo.CmsKit.Public.Application",
+    # …
+    "source-code/Volo.CmsKit.SourceCode"
+)
+```
+
+The order matters only for human readability — `dotnet pack` reads each project independently. The list ends with each module's `.Installer` project (which embeds the module's source for the CLI's "add module" flow) and the matching `source-code/Volo.*.SourceCode` project (an empty NuGet shell whose only content is the module's source tree, used by Suite-purchased "source-code" customers).
+
+| Naming suffix | Purpose |
+| --- | --- |
+| `.Abstractions` | Contracts-only (no implementation) |
+| `.Domain.Shared` | DTOs and enums shared across boundaries |
+| `.Domain` | Aggregates, repositories, domain services |
+| `.Application.Contracts` | Application service interfaces + DTOs |
+| `.Application` | Application service implementations |
+| `.HttpApi` | ASP.NET Core controllers exposing the app services |
+| `.HttpApi.Client` | Dynamic C# proxies for the controllers |
+| `.Web` | Razor Pages UI |
+| `.Blazor` / `.Blazor.Server` / `.Blazor.WebAssembly` | Blazor UI variants |
+| `.EntityFrameworkCore` | EF Core implementation of `IRepository` |
+| `.MongoDB` | MongoDB implementation |
+| `.Installer` | Module installer (embeds source in the NuGet for the CLI) |
+| `.SourceCode` | Empty NuGet shell with full source, in `source-code/` |
+
+## `nupkg/pack.ps1` — `dotnet pack` loop
+
+```powershell
+. ".\common.ps1"
+del *.nupkg
+
+# Restore each solution first
+foreach($solution in $solutions) {
+    $solutionFolder = Join-Path $rootFolder $solution
+    Set-Location $solutionFolder
+    dotnet restore
+}
+
+$i = 0
+$projectsCount = $projects.length
+Write-Info "Running dotnet pack on $projectsCount projects..."
+
+foreach($project in $projects) {
+    $i += 1
+    $projectFolder = Join-Path $rootFolder $project
+    $projectName = ($project -split '/')[-1]
+
+    Write-Info "[$i / $projectsCount] - Packing project: $projectName"
+    Set-Location $projectFolder
+
+    dotnet pack -c Release --no-build -- /maxcpucount
+
+    if (-Not $?) {
+        Write-Error "Packaging failed for the project: $projectName"
+        exit $LASTEXITCODE
+    }
+
+    # Move nuget package
+    $projectPackPath = Join-Path $projectFolder ("/bin/Release/" + $projectName + ".*.nupkg")
+    Move-Item -Force $projectPackPath $packFolder
+    Seperator
+}
+
+Set-Location $packFolder
+```
+
+Key decisions:
+
+| Decision | Why |
+| --- | --- |
+| `del *.nupkg` first | A clean working directory means `push_packages.ps1` can't accidentally publish stale builds |
+| Restore per `$solution` upfront | Keeps the per-project pack `--no-build` honest — if the solution restored, every project in it can pack without re-restoring |
+| `dotnet pack -c Release --no-build` | Requires that `deploy/1-fetch-and-build.ps1` has already produced `bin/Release/<tfm>/*.dll` |
+| `-- /maxcpucount` | One MSBuild worker per core during pack |
+| `Move-Item -Force` | Sweep `bin/Release/<name>.*.nupkg` into `nupkg/` so step 3 finds everything in one folder |
+| `exit $LASTEXITCODE` on first failure | Fail-fast; CI sees the first broken project |
+
+## `nupkg/push_packages.ps1` — `dotnet nuget push` loop
+
+```powershell
+. ".\common.ps1"
+$apiKey = $args[0]
+
+[xml]$commonPropsXml = Get-Content (Join-Path $rootFolder "common.props")
+$version = $commonPropsXml.Project.PropertyGroup.Version
+
+$nugetUrl = "https://api.nuget.org/v3/index.json"
+Set-Location $packFolder
+
+foreach($project in $projects) {
+    $i += 1
+    $projectName = ($project -split '/')[-1]
+    $nugetPackageName = $projectName + "." + $version + ".nupkg"
+    $nugetPackageExists = Test-Path $nugetPackageName -PathType leaf
+
+    Write-Info "[$i / $totalProjectsCount] - Pushing: $nugetPackageName"
+
+    if ($nugetPackageExists) {
+        dotnet nuget push $nugetPackageName --skip-duplicate -s $nugetUrl --api-key "$apiKey"
+    }
+    else {
+        Write-Host ("********** ERROR PACKAGE NOT FOUND: " + $nugetPackageName) -ForegroundColor red
+        $errorCount += 1
+    }
+}
+
+if ($errorCount > 0) {
+    Write-Host ("******* $errorCount error(s) occured *******") -ForegroundColor red
+}
+```
+
+| Behaviour | Effect |
+| --- | --- |
+| `--skip-duplicate` | Step 3 is idempotent — re-running after a partial failure won't fail on already-published packages |
+| `Test-Path` before push | Surfaces packing gaps loudly (missing project → red error in log) |
+| Single source (`nuget.org`) | No fan-out to multiple registries; the same key works for every project |
+| Iterates `$projects` (not `*.nupkg`) | Ensures every entry in `common.ps1` has a matching `<projectName>.<version>.nupkg`; a missing file is a CI failure, not a silent skip |
+
+## `nupkg/push-nightly-packages-myget.ps1` — legacy MyGet helper
+
+```powershell
+param([string]$source, [string]$apikey)
+if (!$source) { $source = "https://nuget.org/" }
+if (!$apikey) { $apikey = "dummy" }
+dotnet nuget push '*.nupkg' -s $source --skip-duplicate --api-key $apikey
+```
+
+Single-line glob push to an arbitrary feed. Kept for fork users who want to mirror packages to a private feed (Azure Artifacts, GitHub Packages, MyGet). Not invoked by `_run_all.ps1`.
+
+## `nupkg/unit_test.ps1` — supplementary test runner
+
+```powershell
+. ".\common.ps1"
+foreach($solution in $solutions) {
+    $solutionFolder = Join-Path $rootFolder $solution
+    Set-Location $solutionFolder
+    dotnet test --no-build --logger trx
+}
+```
+
+Runs `dotnet test --logger trx` (Visual Studio Test Results XML) per solution. The main test runner is [/ops/build-scripts](/ops/build-scripts)'s `build/test-all.ps1`; this one exists for older CI infrastructure that consumes `.trx`.
+
+## The pack + push view
+
+```mermaid
+sequenceDiagram
+    participant Deploy as deploy/2 & deploy/3
+    participant Pack as nupkg/pack.ps1
+    participant Push as nupkg/push_packages.ps1
+    participant Solutions as 19 solutions
+    participant Projects as ~400 projects
+    participant Local as nupkg/*.nupkg
+    participant NugetOrg as nuget.org
+
+    Deploy->>Pack: cd nupkg ; powershell -File pack.ps1
+    Pack->>Solutions: dotnet restore (per $solutions entry)
+    Pack->>Projects: dotnet pack -c Release --no-build (per $projects)
+    Projects->>Local: Move-Item bin/Release/*.nupkg → nupkg/
+    Deploy->>Push: powershell -File push_packages.ps1 <apiKey>
+    Push->>Local: Test-Path <name>.<version>.nupkg
+    loop per project
+        Push->>NugetOrg: dotnet nuget push --skip-duplicate
+    end
+```
+
+## Recipe: pack + push locally to a private feed
+
+```bash
+# 1. Build in Release first (pack uses --no-build)
+cd build
+pwsh build-all-release.ps1
+
+# 2. Pack into nupkg/
+cd ../nupkg
+pwsh pack.ps1
+
+# 3. Push to a private feed (override with push-nightly-packages-myget.ps1)
+pwsh push-nightly-packages-myget.ps1 `
+     -source https://pkgs.dev.azure.com/<org>/_packaging/<feed>/nuget/v3/index.json `
+     -apikey <pat-as-key>
+```
+
+## Cross-links
+
+<CardGroup cols={2}>
+  <Card title="Build scripts (must precede pack)" href="/ops/build-scripts" />
+  <Card title="Deploy scripts (steps 2 & 3)" href="/ops/deploy-scripts" />
+  <Card title="NPM publish pipeline (parallel half)" href="/ops/npm-publish-pipeline" />
+  <Card title="Build & Tooling overview" href="/overview/build-and-tooling" />
+  <Card title="CLI (consumes published NuGets)" href="/cli/overview" />
+  <Card title="Templates (reference packed versions)" href="/templates/overview" />
+  <Card title="Solution structure" href="/overview/solution-structure" />
+  <Card title="Repository layout" href="/overview/repository-layout" />
+</CardGroup>

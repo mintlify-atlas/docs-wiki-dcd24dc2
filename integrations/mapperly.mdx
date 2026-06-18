@@ -1,0 +1,327 @@
+---
+title: "Mapperly integration"
+sidebarTitle: "Mapperly"
+description: "Source-generated object mapping: IAbpMapperlyMapper, MapperBase, AbpMapperlyConventionalRegistrar, and MapperlyAutoObjectMappingProvider with collection / extensible-property handling."
+---
+
+`Volo.Abp.Mapperly` is an alternative `IAutoObjectMappingProvider` implementation backed by **Riok.Mapperly**, a Roslyn source generator. Unlike AutoMapper, no reflection or runtime configuration provider is involved — Mapperly emits straight-line C# code at compile time. ABP wraps this with its own contracts so the rest of the framework (extra-properties mapping, audited-object ignores, conventional discovery) keeps working.
+
+See [`ddd/dtos-and-object-mapping`](/ddd/dtos-and-object-mapping) for how this slots into `IObjectMapper`; this page is about the Mapperly-specific wiring.
+
+## Files
+
+```
+framework/src/Volo.Abp.Mapperly/
+├── Microsoft/Extensions/DependencyInjection/
+│   └── AbpAutoMapperServiceCollectionExtensions.cs     — AddMapperlyObjectMapper
+└── Volo/Abp/Mapperly/
+    ├── AbpMapperlyModule.cs                            — module
+    ├── AbpMapperlyConventionalRegistrar.cs             — discovers IAbpMapperlyMapper<,>
+    ├── IAbpMapperlyMapper.cs                           — one-way & two-way contracts
+    ├── MapperBase.cs                                   — base classes you derive from
+    ├── MapExtraPropertiesAttribute.cs                  — opts a mapper into ExtraProperties mapping
+    └── MapperlyAutoObjectMappingProvider.cs            — resolves the right mapper at runtime
+```
+
+## The module
+
+```csharp
+[DependsOn(
+    typeof(AbpObjectMappingModule),
+    typeof(AbpObjectExtendingModule),
+    typeof(AbpAuditingModule)
+)]
+public class AbpMapperlyModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddConventionalRegistrar(new AbpMapperlyConventionalRegistrar());
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMapperlyObjectMapper();
+    }
+}
+
+public static class AbpAutoMapperServiceCollectionExtensions
+{
+    public static IServiceCollection AddMapperlyObjectMapper(this IServiceCollection services)
+        => services.Replace(ServiceDescriptor
+            .Transient<IAutoObjectMappingProvider, MapperlyAutoObjectMappingProvider>());
+
+    public static IServiceCollection AddMapperlyObjectMapper<TContext>(this IServiceCollection services)
+        => services.Replace(ServiceDescriptor
+            .Transient<IAutoObjectMappingProvider<TContext>, MapperlyAutoObjectMappingProvider<TContext>>());
+}
+```
+
+> The DI-extensions file is named `AbpAutoMapperServiceCollectionExtensions.cs` in the Mapperly package — the file name is a historical artefact; the method it exposes is `AddMapperlyObjectMapper`.
+
+## The mapper contracts
+
+```csharp
+public interface IAbpMapperlyMapper<in TSource, TDestination>
+{
+    TDestination Map(TSource source);
+    void Map(TSource source, TDestination destination);
+    void BeforeMap(TSource source);
+    void AfterMap(TSource source, TDestination destination);
+}
+
+public interface IAbpReverseMapperlyMapper<TSource, TDestination> : IAbpMapperlyMapper<TSource, TDestination>
+{
+    TSource ReverseMap(TDestination destination);
+    void ReverseMap(TDestination destination, TSource source);
+    void BeforeReverseMap(TDestination destination);
+    void AfterReverseMap(TDestination destination, TSource source);
+}
+```
+
+These are ABP's contract — not Mapperly's. Your mapper class derives from a base, marks the two `Map` methods with Mapperly's `[MapperIgnoreSource]` / `[UseStaticMapper]` attributes as needed, and Mapperly fills in the bodies via source generation.
+
+## `MapperBase<TSource, TDestination>`
+
+```csharp
+public abstract class MapperBase<TSource, TDestination>
+    : IAbpMapperlyMapper<TSource, TDestination>, ITransientDependency
+{
+    public abstract TDestination Map(TSource source);
+    public abstract void Map(TSource source, TDestination destination);
+
+    public virtual void BeforeMap(TSource source) { }
+    public virtual void AfterMap(TSource source, TDestination destination) { }
+}
+
+public abstract class TwoWayMapperBase<TSource, TDestination>
+    : MapperBase<TSource, TDestination>, IAbpReverseMapperlyMapper<TSource, TDestination>
+{
+    public abstract TSource ReverseMap(TDestination destination);
+    public abstract void ReverseMap(TDestination destination, TSource source);
+
+    public virtual void BeforeReverseMap(TDestination destination) { }
+    public virtual void AfterReverseMap(TDestination destination, TSource source) { }
+}
+```
+
+`MapperBase` implements `ITransientDependency`, so the conventional registrar picks the subclass up automatically. Authors write:
+
+```csharp
+using Riok.Mapperly.Abstractions;
+using Volo.Abp.Mapperly;
+
+[Mapper]
+public partial class BookToBookDtoMapper : MapperBase<Book, BookDto>
+{
+    public override partial BookDto Map(Book source);
+    public override partial void Map(Book source, BookDto destination);
+}
+```
+
+Mapperly's source generator emits the bodies for the two `partial` methods. `BeforeMap` / `AfterMap` stay user-overridable for custom logic that doesn't fit a property-by-property map.
+
+The two-way variant for round-trip mapping:
+
+```csharp
+[Mapper]
+public partial class BookMapper : TwoWayMapperBase<Book, BookDto>
+{
+    public override partial BookDto Map(Book source);
+    public override partial void Map(Book source, BookDto destination);
+    public override partial Book ReverseMap(BookDto destination);
+    public override partial void ReverseMap(BookDto destination, Book source);
+}
+```
+
+## `AbpMapperlyConventionalRegistrar`
+
+```csharp
+public class AbpMapperlyConventionalRegistrar : DefaultConventionalRegistrar
+{
+    protected override bool IsConventionalRegistrationDisabled(Type type)
+    {
+        return !type.GetInterfaces().Any(x => x.IsGenericType
+            && typeof(IAbpMapperlyMapper<,>) == x.GetGenericTypeDefinition())
+            || base.IsConventionalRegistrationDisabled(type);
+    }
+
+    protected override List<Type> GetExposedServiceTypes(Type type)
+    {
+        var exposedServiceTypes = base.GetExposedServiceTypes(type);
+        var mapperlyInterfaces = type.GetInterfaces().Where(x =>
+            x.IsGenericType &&
+            (typeof(IAbpMapperlyMapper<,>) == x.GetGenericTypeDefinition() ||
+             typeof(IAbpReverseMapperlyMapper<,>) == x.GetGenericTypeDefinition()));
+        return exposedServiceTypes.Union(mapperlyInterfaces).Distinct().ToList();
+    }
+}
+```
+
+Two effects:
+
+1. **Filter**: only types implementing `IAbpMapperlyMapper<,>` are handled. Everything else is skipped by this registrar (the default registrar still handles standard service types).
+2. **Service exposure**: the closed generic `IAbpMapperlyMapper<Book, BookDto>` (and `IAbpReverseMapperlyMapper<Book, BookDto>` if applicable) are added to the exposed services. So you can resolve the mapper via either the concrete class or the closed generic interface.
+
+## `MapperlyAutoObjectMappingProvider`
+
+```csharp
+public class MapperlyAutoObjectMappingProvider : IAutoObjectMappingProvider
+{
+    protected static readonly ConcurrentDictionary<string, Func<object, object, object, object?>> MapCache = new();
+    protected static readonly List<MethodInfo> MapMethods = typeof(MapperlyAutoObjectMappingProvider)
+        .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+        .Where(x => x.Name == nameof(Map)).ToList();
+
+    protected IServiceProvider ServiceProvider { get; }
+
+    public virtual TDestination Map<TSource, TDestination>(object source) { ... }
+    public virtual TDestination Map<TSource, TDestination>(TSource source, TDestination destination) { ... }
+}
+```
+
+The provider holds no compiled configuration — it's a runtime dispatcher.
+
+### Single-instance mapping flow
+
+```csharp
+public virtual TDestination Map<TSource, TDestination>(object source)
+{
+    if (TryToMapCollection<TSource, TDestination>((TSource)source, default, out var collectionResult))
+        return collectionResult;
+
+    var mapper = ServiceProvider.GetService<IAbpMapperlyMapper<TSource, TDestination>>();
+    if (mapper != null)
+    {
+        mapper.BeforeMap((TSource)source);
+        var destination = mapper.Map((TSource)source);
+        TryMapExtraProperties(mapper.GetType().GetSingleAttributeOrNull<MapExtraPropertiesAttribute>(),
+            (TSource)source, destination, GetExtraProperties(destination));
+        mapper.AfterMap((TSource)source, destination);
+        return destination;
+    }
+
+    var reverseMapper = ServiceProvider.GetService<IAbpReverseMapperlyMapper<TDestination, TSource>>();
+    if (reverseMapper != null) { /* mirror, via ReverseMap path */ }
+
+    throw GetNoMapperFoundException<TSource, TDestination>();
+}
+```
+
+The lookup order:
+
+1. **Collection short-circuit** — `TryToMapCollection` handles `IEnumerable<TSource>` → `IEnumerable<TDestination>` by resolving a per-element mapper and looping.
+2. **Forward mapper** — `IAbpMapperlyMapper<TSource, TDestination>` from DI.
+3. **Reverse mapper** — `IAbpReverseMapperlyMapper<TDestination, TSource>` from DI, used in reverse direction.
+4. **Failure** — a detailed `AbpException` with the source/destination type names and a pointer to docs.
+
+### `TryToMapCollection` — collection mapping
+
+```csharp
+protected virtual bool TryToMapCollection<TSource, TDestination>(TSource source, TDestination? destination,
+    out TDestination collectionResult)
+{
+    if (!ObjectMappingHelper.IsCollectionGenericType<TSource, TDestination>(
+            out var sourceArgumentType, out var destinationArgumentType, out var definitionGenericType))
+    {
+        collectionResult = default!;
+        return false;
+    }
+
+    var mapperType = typeof(IAbpMapperlyMapper<,>)
+        .MakeGenericType(sourceArgumentType, destinationArgumentType);
+    var mapper = ServiceProvider.GetService(mapperType);
+    if (mapper == null)
+    {
+        mapperType = typeof(IAbpReverseMapperlyMapper<,>)
+            .MakeGenericType(destinationArgumentType, sourceArgumentType);
+        mapper = ServiceProvider.GetService(mapperType);
+        if (mapper == null) { collectionResult = default!; return false; }
+    }
+
+    var invoker = MapCache.GetOrAdd(
+        $"{mapperType.FullName}_{(destination == null ? "MapMethodWithSingleParameter" : "MapMethodWithDoubleParameters")}",
+        _ => CreateMapDelegate(mapperType, sourceArgumentType, destinationArgumentType, destination != null));
+
+    // ... iterate source list, call invoker per element ...
+}
+```
+
+The provider compiles a single delegate per `(mapperType, signature)` pair via `Expression.Lambda<...>().Compile()` and caches it in a static `ConcurrentDictionary`. So collection mapping incurs reflection once per type pair; subsequent calls go through the compiled delegate.
+
+Collection semantics intentionally match AutoMapper:
+
+- If the destination is a generic list-like type and was passed in, it's `Clear()`-ed first and then re-populated in place.
+- If the destination is an array, a **new** array is allocated and returned — the existing array is left untouched.
+- If no destination is passed, a new generic collection is created from `definitionGenericType.MakeGenericType(destinationArgumentType)`.
+
+### Extra-properties handling
+
+```csharp
+[AttributeUsage(AttributeTargets.Class)]
+public class MapExtraPropertiesAttribute : Attribute
+{
+    public MappingPropertyDefinitionChecks DefinitionChecks { get; set; } = MappingPropertyDefinitionChecks.Null;
+    public string[]? IgnoredProperties { get; set; }
+    public bool MapToRegularProperties { get; set; }
+}
+```
+
+When you decorate a mapper class with `[MapExtraProperties]`, the provider calls `MapExtraProperties<TSource, TDestination>` after the user's `Map` runs:
+
+```csharp
+protected virtual void MapExtraProperties<TSource, TDestination>(
+    IHasExtraProperties source, IHasExtraProperties destination,
+    ExtraPropertyDictionary destinationExtraProperty,
+    MappingPropertyDefinitionChecks? definitionChecks = null,
+    string[]? ignoredProperties = null,
+    bool mapToRegularProperties = false)
+{
+    var result = destinationExtraProperty.IsNullOrEmpty()
+        ? new Dictionary<string, object?>()
+        : new Dictionary<string, object?>(destinationExtraProperty);
+
+    if (source.ExtraProperties != null && destination.ExtraProperties != null)
+    {
+        ExtensibleObjectMapper.MapExtraPropertiesTo(
+            typeof(TSource), typeof(TDestination),
+            source.ExtraProperties, result, definitionChecks, ignoredProperties);
+    }
+
+    ObjectHelper.TrySetProperty(destination, x => x.ExtraProperties,
+        () => new ExtraPropertyDictionary(result));
+    if (mapToRegularProperties)
+        destination.SetExtraPropertiesToRegularProperties();
+}
+```
+
+This routes through the same `ExtensibleObjectMapper.MapExtraPropertiesTo` used by the AutoMapper `MapExtraProperties()` extension, so extra-property mapping behaves identically across providers. Without the attribute, Mapperly handles only the regular properties — `ExtraProperties` stays whatever Mapperly itself produced (typically a shallow copy of the dictionary reference, which is why the provider re-clones to avoid alias bugs).
+
+## Picking which provider wins
+
+ABP's `Volo.Abp.ObjectMapping` registers a default `IAutoObjectMappingProvider`. Both `AbpAutoMapperModule.ConfigureServices` and `AbpMapperlyModule.ConfigureServices` call `services.Replace(...)` to swap in their own. The provider that runs **last** wins.
+
+You can also use them side-by-side **per context**: register `AddAutoMapperObjectMapper()` for the default, and `AddMapperlyObjectMapper<MyContext>()` for a specific context, then inject `IObjectMapper<MyContext>` where you want Mapperly and `IObjectMapper` where you want AutoMapper.
+
+## End-to-end: a typical module setup
+
+```csharp
+[DependsOn(typeof(AbpMapperlyModule))]
+public class MyApplicationModule : AbpModule { }
+
+[Mapper]
+[MapExtraProperties(MapToRegularProperties = true)]
+public partial class BookMapper : TwoWayMapperBase<Book, BookDto>
+{
+    public override partial BookDto Map(Book source);
+    public override partial void Map(Book source, BookDto destination);
+    public override partial Book ReverseMap(BookDto destination);
+    public override partial void ReverseMap(BookDto destination, Book source);
+}
+```
+
+That's the whole setup. `IObjectMapper.Map<Book, BookDto>(book)` resolves the generated mapper via DI and runs the source-generated code, with audit-time pre/post hooks and ExtraProperties handling layered around it.
+
+## Related
+
+- [`ddd/dtos-and-object-mapping`](/ddd/dtos-and-object-mapping) — `IObjectMapper`, `IAutoObjectMappingProvider`, and how Mapperly fits among the other providers.
+- [`integrations/automapper`](/integrations/automapper) — the reflection-based counterpart provider.

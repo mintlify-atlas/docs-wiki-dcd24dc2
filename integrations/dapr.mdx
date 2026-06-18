@@ -1,0 +1,372 @@
+---
+title: "Dapr integration: client factory, API tokens, MVC subscribe endpoint"
+sidebarTitle: "Dapr"
+description: "Volo.Abp.Dapr (client factory, AbpDaprOptions, IDaprApiTokenProvider, IDaprSerializer) plus the AspNetCore.Mvc.Dapr and AspNetCore.Mvc.Dapr.EventBus packages that validate Dapr app tokens and map subscribe handlers."
+---
+
+ABP's Dapr integration is split into three cooperating packages:
+
+| Package | Role |
+| --- | --- |
+| `Volo.Abp.Dapr` | Core `DaprClient` factory, options, API token provider, JSON serializer. |
+| `Volo.Abp.AspNetCore.Mvc.Dapr` | App-token validation in the ASP.NET Core pipeline. |
+| `Volo.Abp.AspNetCore.Mvc.Dapr.EventBus` | Maps `POST /api/abp/dapr/event` and emits `TopicAttribute` metadata so Dapr's `MapSubscribeHandler()` advertises ABP's distributed-event handlers. |
+
+The pub/sub bus that publishes events through these endpoints lives in `Volo.Abp.EventBus.Dapr`; see [`eventbus/dapr-integration`](/eventbus/dapr-integration). Distributed locking on top of Dapr lives in `Volo.Abp.DistributedLocking.Dapr`; see [`background/distributed-locking`](/background/distributed-locking).
+
+## Volo.Abp.Dapr
+
+### Files
+
+```
+framework/src/Volo.Abp.Dapr/Volo/Abp/Dapr/
+├── AbpDaprModule.cs           — module: binds AbpDaprOptions, picks up env vars
+├── AbpDaprOptions.cs          — HttpEndpoint, GrpcEndpoint, DaprApiToken, AppApiToken
+├── IAbpDaprClientFactory.cs   — CreateAsync / CreateHttpClientAsync
+├── AbpDaprClientFactory.cs    — default implementation (singleton)
+├── IDaprApiTokenProvider.cs   — GetDaprApiToken / GetAppApiToken
+├── DaprApiTokenProvider.cs    — reads from AbpDaprOptions
+├── IDaprSerializer.cs         — byte/string round-trip contract
+└── Utf8JsonDaprSerializer.cs  — IJsonSerializer-backed implementation
+```
+
+### `AbpDaprModule`
+
+```csharp
+[DependsOn(
+    typeof(AbpJsonModule),
+    typeof(AbpMultiTenancyAbstractionsModule),
+    typeof(AbpHttpClientModule)
+)]
+public class AbpDaprModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        ConfigureDaprOptions(configuration);
+    }
+}
+```
+
+`ConfigureDaprOptions` binds the `"Dapr"` configuration section to `AbpDaprOptions` and then, **only if the bound values are empty**, falls back to:
+
+1. `IConfiguration["DAPR_API_TOKEN"]` / `IConfiguration["APP_API_TOKEN"]`
+2. `Environment.GetEnvironmentVariable("DAPR_API_TOKEN")` / `Environment.GetEnvironmentVariable("APP_API_TOKEN")`
+
+This matches the conventions Dapr's own sidecar uses: when you run under `dapr run`, both environment variables are injected, so you get working tokens with zero extra configuration.
+
+### `AbpDaprOptions`
+
+```csharp
+public class AbpDaprOptions
+{
+    public string? HttpEndpoint { get; set; }   // e.g. http://localhost:3500
+    public string? GrpcEndpoint { get; set; }   // e.g. http://localhost:50001
+    public string? DaprApiToken { get; set; }   // sent to Dapr in dapr-api-token header
+    public string? AppApiToken { get; set; }    // expected from Dapr in dapr-api-token header
+}
+```
+
+Two distinct tokens:
+
+- `DaprApiToken` — what **your code** sends to the Dapr sidecar.
+- `AppApiToken` — what **Dapr** sends to your app. Used by `DaprAppApiTokenValidator` (below) to verify Dapr-originated requests.
+
+### `IDaprApiTokenProvider` and the default
+
+```csharp
+public interface IDaprApiTokenProvider
+{
+    string? GetDaprApiToken();
+    string? GetAppApiToken();
+}
+
+public class DaprApiTokenProvider : IDaprApiTokenProvider, ISingletonDependency
+{
+    public DaprApiTokenProvider(IOptions<AbpDaprOptions> options) { Options = options.Value; }
+
+    public virtual string? GetDaprApiToken() => Options.DaprApiToken;
+    public virtual string? GetAppApiToken() => Options.AppApiToken;
+}
+```
+
+A trivial pass-through. Override the provider (`[Dependency(ReplaceServices = true)]`) when tokens come from a secrets store rather than configuration.
+
+### `IAbpDaprClientFactory`
+
+```csharp
+public interface IAbpDaprClientFactory
+{
+    Task<DaprClient> CreateAsync(Action<DaprClientBuilder>? builderAction = null);
+
+    Task<HttpClient> CreateHttpClientAsync(
+        string? appId = null,
+        string? daprEndpoint = null,
+        string? daprApiToken = null);
+}
+```
+
+`AbpDaprClientFactory` is registered as a singleton and depends on:
+
+- `IOptions<AbpDaprOptions>` — endpoint and token config.
+- `IOptions<AbpSystemTextJsonSerializerOptions>` — used to build a `JsonSerializerOptions` for `DaprClientBuilder.UseJsonSerializationOptions`, so Dapr payloads share ABP's STJ configuration.
+- `IDaprApiTokenProvider` — for `UseDaprApiToken`.
+- `ICurrentTenant`, `ICorrelationIdProvider`, `IOptions<AbpCorrelationIdOptions>` — to inject tenant ID and correlation ID into outbound HTTP requests.
+- `IRemoteServiceHttpClientAuthenticator` — to attach bearer tokens for service-to-service auth.
+
+#### `CreateAsync`
+
+```csharp
+public virtual Task<DaprClient> CreateAsync(Action<DaprClientBuilder>? builderAction = null)
+{
+    var builder = new DaprClientBuilder()
+        .UseJsonSerializationOptions(JsonSerializerOptions);
+
+    if (!DaprOptions.HttpEndpoint.IsNullOrWhiteSpace())
+        builder.UseHttpEndpoint(DaprOptions.HttpEndpoint);
+
+    if (!DaprOptions.GrpcEndpoint.IsNullOrWhiteSpace())
+        builder.UseGrpcEndpoint(DaprOptions.GrpcEndpoint);
+
+    var apiToken = DaprApiTokenProvider.GetDaprApiToken();
+    if (!apiToken.IsNullOrWhiteSpace())
+        builder.UseDaprApiToken(apiToken);
+
+    builderAction?.Invoke(builder);
+    return Task.FromResult(builder.Build());
+}
+```
+
+Builds a `DaprClient` pre-wired with the configured endpoints, token, and STJ options. The `builderAction` lets callers tack on extra configuration without subclassing.
+
+#### `CreateHttpClientAsync`
+
+Builds an `HttpClient` whose base address routes through Dapr's invoke API (`DaprClient.CreateInvokeHttpClient`) and that carries:
+
+- `AbpCorrelationIdOptions.HttpHeaderName` → `ICorrelationIdProvider.Get()`
+- `__tenant` (the default tenant key) → `ICurrentTenant.Id` when present
+- `Accept-Language` → `CultureInfo.CurrentUICulture.Name`
+- `X-Requested-With: XMLHttpRequest`
+- A bearer token from `IRemoteServiceHttpClientAuthenticator`, when one is produced
+
+This is the HTTP path you want when invoking another ABP application **through** Dapr service invocation — it preserves the request context that ABP's remote-service stack normally injects.
+
+### `IDaprSerializer`
+
+```csharp
+public interface IDaprSerializer
+{
+    byte[] Serialize(object obj);
+    string SerializeToString(object obj);
+    object Deserialize(byte[] value, Type type);
+    object Deserialize(string value, Type type);
+}
+
+public class Utf8JsonDaprSerializer : IDaprSerializer, ITransientDependency
+{
+    public Utf8JsonDaprSerializer(IJsonSerializer jsonSerializer) { _jsonSerializer = jsonSerializer; }
+    // delegates to Volo.Abp.Json.IJsonSerializer + UTF-8 byte conversion
+}
+```
+
+Used by the event-bus subscribe endpoint (below) to decode Dapr's CloudEvent `data` payloads. Replace via `[Dependency(ReplaceServices = true)]` if you need a non-JSON encoding.
+
+## Volo.Abp.AspNetCore.Mvc.Dapr
+
+### Files
+
+```
+framework/src/Volo.Abp.AspNetCore.Mvc.Dapr/Volo/Abp/AspNetCore/Mvc/Dapr/
+├── AbpAspNetCoreMvcDaprModule.cs    — depends on Mvc + Dapr modules
+├── IDaprAppApiTokenValidator.cs     — Check / IsValid / GetOrNull
+├── DaprAppApiTokenValidator.cs      — singleton implementation
+└── DaprHttpContextExtensions.cs     — ValidateDaprAppApiToken / IsValidDaprAppApiToken
+```
+
+### `DaprAppApiTokenValidator`
+
+```csharp
+public virtual void CheckDaprAppApiToken()
+{
+    var expectedAppApiToken = GetConfiguredAppApiTokenOrNull();
+    if (expectedAppApiToken.IsNullOrWhiteSpace()) return;  // no token configured → allow
+
+    var headerAppApiToken = GetDaprAppApiTokenOrNull();
+    if (headerAppApiToken.IsNullOrWhiteSpace())
+        throw new AbpAuthorizationException(
+            "Expected Dapr App API Token is not provided! Dapr should set the 'dapr-api-token' HTTP header.");
+
+    if (expectedAppApiToken != headerAppApiToken)
+        throw new AbpAuthorizationException(
+            "The Dapr App API Token (provided in the 'dapr-api-token' HTTP header) doesn't match the expected value!");
+}
+```
+
+Reads the expected token from `IDaprApiTokenProvider.GetAppApiToken()` and the incoming token from the `dapr-api-token` request header. **When no token is configured, validation is a no-op** — important for local development under `dapr run` without explicit tokens.
+
+### `DaprHttpContextExtensions`
+
+```csharp
+public static void ValidateDaprAppApiToken(this HttpContext httpContext);
+public static bool IsValidDaprAppApiToken(this HttpContext httpContext);
+public static string? GetDaprAppApiTokenOrNull(HttpContext httpContext);
+```
+
+Three shortcuts that resolve `IDaprAppApiTokenValidator` from `HttpContext.RequestServices` and call through. Use these in any custom endpoint that should only accept Dapr-originated traffic.
+
+## Volo.Abp.AspNetCore.Mvc.Dapr.EventBus
+
+This single-file module wires Dapr pub/sub to ABP's distributed event bus.
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcDaprModule),
+    typeof(AbpEventBusDaprModule)
+)]
+public class AbpAspNetCoreMvcDaprEventBusModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        PostConfigure<AbpEndpointRouterOptions>(options =>
+        {
+            options.EndpointConfigureActions.Add(endpointContext =>
+            {
+                // 1. collect existing Topic metadata already on routes
+                var topicMetadatas = endpointContext.Endpoints.DataSources
+                    .SelectMany(x => x.Endpoints).OfType<RouteEndpoint>()
+                    .Where(e => e.Metadata.GetOrderedMetadata<ITopicMetadata>().Any(t => t.Name != null))
+                    .SelectMany(e => e.Metadata.GetOrderedMetadata<ITopicMetadata>())
+                    .ToList();
+
+                // 2. map the shared subscribe endpoint
+                var endpointConventionBuilder = endpointContext.Endpoints.MapPost(
+                    "/api/abp/dapr/event", HandleEventAsync);
+
+                // 3. attach one TopicAttribute per registered IDistributedEventHandler<TEto>
+                var abpEvents = GetAbpEvents(endpointContext);
+                foreach (var @event in abpEvents.Where(
+                    x => !topicMetadatas.Any(t => t.PubsubName == x.PubsubName && t.Name == x.Name)))
+                {
+                    endpointConventionBuilder.WithMetadata(new TopicAttribute(
+                        @event.PubsubName, @event.Name, true));
+                }
+
+                // 4. let Dapr advertise everything via /dapr/subscribe
+                endpointContext.Endpoints.MapSubscribeHandler();
+            });
+        });
+    }
+}
+```
+
+### What this accomplishes
+
+1. **One shared HTTP endpoint** (`POST /api/abp/dapr/event`) handles every ABP distributed event topic. There is no separate controller per event type.
+2. **Dapr's `[Topic]` metadata** is attached to that single endpoint, once per `(pubsubname, topic)` pair derived from registered handlers — duplicates already advertised by user-defined controllers are skipped, so you can mix `[Topic]` controllers with ABP's auto-wired handlers.
+3. `Dapr.AspNetCore`'s `MapSubscribeHandler()` exposes `GET /dapr/subscribe`, which Dapr's sidecar polls to discover subscriptions.
+
+### Topic discovery from registered handlers
+
+```csharp
+private List<TopicAttribute> GetAbpEvents(EndpointRouteBuilderContext endpointContext)
+{
+    var subscriptions = new List<TopicAttribute>();
+    var daprEventBusOptions = endpointContext.Endpoints.ServiceProvider
+        .GetRequiredService<IOptions<AbpDaprEventBusOptions>>().Value;
+
+    foreach (var @interface in endpointContext.Endpoints.ServiceProvider
+        .GetRequiredService<IOptions<AbpDistributedEventBusOptions>>().Value.Handlers
+        .SelectMany(x => x.GetInterfaces().Where(i => i.IsGenericType
+            && i.GetGenericTypeDefinition() == typeof(IDistributedEventHandler<>))))
+    {
+        var eventType = @interface.GetGenericArguments()[0];
+        var eventName = EventNameAttribute.GetNameOrDefault(eventType);
+        subscriptions.Add(new TopicAttribute(daprEventBusOptions.PubSubName, eventName));
+    }
+
+    return subscriptions;
+}
+```
+
+For every `IDistributedEventHandler<TEto>` registered through `AbpDistributedEventBusOptions.Handlers`, one `TopicAttribute(pubsubName, eventName)` is produced. The pub/sub name comes from `AbpDaprEventBusOptions.PubSubName`; the event name comes from `[EventName]` on the ETO or its fully-qualified type name.
+
+### Request handling
+
+```csharp
+private async static Task HandleEventAsync(HttpContext httpContext)
+{
+    httpContext.ValidateDaprAppApiToken();
+
+    var daprSerializer = httpContext.RequestServices.GetRequiredService<IDaprSerializer>();
+    var body = (await JsonDocument.ParseAsync(httpContext.Request.Body));
+
+    var pubSubName = body.RootElement.GetProperty("pubsubname").GetString();
+    var topic      = body.RootElement.GetProperty("topic").GetString();
+    var data       = body.RootElement.GetProperty("data").GetRawText();
+    // 400 if any missing ...
+
+    var distributedEventBus = httpContext.RequestServices
+        .GetRequiredService<DaprDistributedEventBus>();
+
+    if (IsAbpDaprEventData(data))
+    {
+        // The publisher was another ABP app — unwrap AbpDaprEventData
+        var daprEventData = daprSerializer
+            .Deserialize(data, typeof(AbpDaprEventData)).As<AbpDaprEventData>();
+        var eventType = distributedEventBus.GetEventType(daprEventData.Topic);
+        if (eventType != null)
+        {
+            var eventData = daprSerializer.Deserialize(daprEventData.JsonData, eventType);
+            await distributedEventBus.TriggerHandlersAsync(
+                eventType, eventData,
+                daprEventData.MessageId, daprEventData.CorrelationId);
+        }
+    }
+    else
+    {
+        // Foreign publisher — treat the raw data as the ETO
+        var eventType = distributedEventBus.GetEventType(topic);
+        if (eventType != null)
+        {
+            var eventData = daprSerializer.Deserialize(data, eventType);
+            await distributedEventBus.TriggerHandlersAsync(eventType, eventData);
+        }
+    }
+
+    httpContext.Response.StatusCode = 200;
+}
+```
+
+Three things to notice:
+
+- **App token is validated first** via the extension method from the `Mvc.Dapr` package.
+- The endpoint **transparently handles both ABP-published and foreign-published events** by sniffing for the five-property `AbpDaprEventData` envelope. If found, message ID and correlation ID are preserved; otherwise the raw `data` is deserialised straight into the ETO type.
+- Event-type lookup goes through `DaprDistributedEventBus.GetEventType(topic)`, which uses the same `[EventName]` resolution as the publish path.
+
+## How the pieces fit together
+
+```
+host appsettings
+   │
+   ▼ "Dapr": { HttpEndpoint, DaprApiToken, AppApiToken } / env vars
+AbpDaprModule ── binds AbpDaprOptions ──► DaprApiTokenProvider
+   │                                            │
+   ▼                                            ▼
+AbpDaprClientFactory (singleton)        Utf8JsonDaprSerializer
+   │                                            │
+   │  builds DaprClient + HttpClient with       │  used by:
+   │  tenant / correlation / bearer headers     │   • DaprDistributedEventBus (publish)
+   │                                            │   • /api/abp/dapr/event endpoint (subscribe)
+   ▼                                            ▼
+your code                              AbpAspNetCoreMvcDaprEventBusModule
+                                          │
+                                          │  for each IDistributedEventHandler<TEto>:
+                                          │  attaches [Topic(pubsubName, eventName)]
+                                          ▼
+                                       Dapr sidecar /dapr/subscribe
+```
+
+## Related
+
+- [`eventbus/dapr-integration`](/eventbus/dapr-integration) — `Volo.Abp.EventBus.Dapr`, the publish side and `DaprDistributedEventBus`.
+- [`background/distributed-locking`](/background/distributed-locking) — Dapr's distributed-lock building block, used by `Volo.Abp.DistributedLocking.Dapr`.

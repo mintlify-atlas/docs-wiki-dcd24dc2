@@ -1,0 +1,215 @@
+---
+title: "Features (Volo.Abp.Features)"
+description: "Per-tenant feature toggles: IFeatureChecker, FeatureDefinition providers, the Default/Configuration/Edition/Tenant value-provider chain, and [RequiresFeature]."
+---
+
+`Volo.Abp.Features` is the per-tenant feature-toggle subsystem. A *feature* is a named string value (commonly `"true"`/`"false"`, sometimes a numeric quota) that varies by tenant or edition. Features are declared statically by `IFeatureDefinitionProvider`s, resolved at runtime through an ordered chain of `IFeatureValueProvider`s, and enforced declaratively by `[RequiresFeature]` via `FeatureInterceptor`. Persistence of dynamic values is delegated to the `Feature Management` module — see `/modules/feature-management`.
+
+Source: `framework/src/Volo.Abp.Features/Volo/Abp/Features/`.
+
+## Module
+
+`AbpFeaturesModule` depends on `AbpLocalizationModule`, `AbpMultiTenancyModule`, `AbpValidationModule`, `AbpAuthorizationAbstractionsModule`. In `PreConfigureServices` it:
+
+1. Hooks `FeatureInterceptorRegistrar.RegisterIfNeeded` into `IServiceCollection.OnRegistered`.
+2. Auto-collects every `IFeatureDefinitionProvider` and adds it to `AbpFeatureOptions.DefinitionProviders`.
+
+In `ConfigureServices` it registers the built-in value providers, embeds `AbpFeatureResource` into the virtual file system, and maps the `Volo.Feature` exception-code namespace to that resource:
+
+```csharp
+options.ValueProviders.Add<DefaultValueFeatureValueProvider>();
+options.ValueProviders.Add<ConfigurationFeatureValueProvider>();
+options.ValueProviders.Add<EditionFeatureValueProvider>();
+options.ValueProviders.Add<TenantFeatureValueProvider>();
+```
+
+## `AbpFeatureOptions`
+
+| Property | Type | Role |
+| --- | --- | --- |
+| `DefinitionProviders` | `ITypeList<IFeatureDefinitionProvider>` | Static feature catalog. Auto-filled. |
+| `ValueProviders` | `ITypeList<IFeatureValueProvider>` | Runtime resolution chain. Order matters — see below. |
+| `DeletedFeatures` | `HashSet<string>` | Names hidden from `FeatureDefinitionManager.GetAllAsync()`. |
+| `DeletedFeatureGroups` | `HashSet<string>` | Group names hidden from the management UI. |
+
+## Defining features
+
+Subclass `FeatureDefinitionProvider` (which implements `IFeatureDefinitionProvider, ITransientDependency`):
+
+```csharp
+public class MyFeatureDefinitionProvider : FeatureDefinitionProvider
+{
+    public override void Define(IFeatureDefinitionContext context)
+    {
+        var group = context.AddGroup("MyApp", L("Features:MyApp"));
+
+        group.AddFeature(
+            "MyApp.PrintingEnabled",
+            defaultValue: "false",
+            displayName: L("Features:PrintingEnabled"),
+            valueType: new ToggleStringValueType());
+
+        group.AddFeature(
+            "MyApp.MaxUserCount",
+            defaultValue: "5",
+            valueType: new FreeTextStringValueType(new NumericValueValidator()));
+    }
+}
+```
+
+### `FeatureDefinition`
+
+| Property | Type | Notes |
+| --- | --- | --- |
+| `Name` | `string` | Unique identifier. |
+| `DisplayName` / `Description` | `ILocalizableString` | Used by the management UI. |
+| `DefaultValue` | `string?` | Read by `DefaultValueFeatureValueProvider`. |
+| `ValueType` | `IStringValueType` | Defaults to `ToggleStringValueType` (yes/no). Other types: `FreeTextStringValueType`, `SelectionStringValueType`. Drives the rendering + validation in the management UI. |
+| `IsVisibleToClients` | `bool` (default `true`) | Whether `IClientProxyFeatureChecker` exposes it. |
+| `IsAvailableToHost` | `bool` (default `true`) | Some features (e.g. quotas) make no sense for the host. |
+| `AllowedProviders` | `List<string>` | Restricts resolution to a subset of providers (e.g. only `"E"` for edition-only features). Empty = all allowed. |
+| `Parent`, `Children` | tree | A child is "enabled" only if its parent is enabled (enforced by the management UI / `IFeatureChecker` extensions in the management module). |
+| `Properties` | `Dictionary<string, object?>` | Bag for extra UI metadata. `WithProperty(key, value)` is a fluent setter. |
+
+### `FeatureGroupDefinition`
+
+`IFeatureDefinitionContext.AddGroup(name, displayName)` returns one. Has `AddFeature(...)` and `CreateChildFeature(...)` plus `GetFeaturesWithChildren()` (depth-first flatten).
+
+## Resolving feature values
+
+### `IFeatureChecker`
+
+```csharp
+public interface IFeatureChecker
+{
+    Task<string?> GetOrNullAsync(string name);
+    Task<bool> IsEnabledAsync(string name);
+}
+```
+
+`FeatureCheckerBase` implements `IsEnabledAsync` by parsing `bool.Parse(value)` on the result of `GetOrNullAsync`; if the string isn't a valid bool, it throws `AbpException`.
+
+`FeatureChecker : FeatureCheckerBase` resolves the value:
+
+1. Look up `FeatureDefinition` through `IFeatureDefinitionManager`.
+2. Get the configured providers from `IFeatureValueProviderManager`, reverse them (so the **last** provider added wins).
+3. If `featureDefinition.AllowedProviders` is non-empty, filter to that whitelist.
+4. Iterate providers; return the first non-null `GetOrNullAsync(featureDefinition)`.
+
+### Provider chain (in order they're added; reversed at lookup time)
+
+| Provider | `Name` | Source |
+| --- | --- | --- |
+| `DefaultValueFeatureValueProvider` | `"D"` | `feature.DefaultValue`. |
+| `ConfigurationFeatureValueProvider` | `"C"` | `IConfiguration["Features:" + name]`. |
+| `EditionFeatureValueProvider` | `"E"` | Calls `ICurrentPrincipalAccessor.Principal.FindEditionId()` (claim-based), falling back to `ITenantStore.FindAsync(currentTenantId).EditionId`. Then `IFeatureStore.GetOrNullAsync(name, "E", editionId.ToString())`. |
+| `TenantFeatureValueProvider` | `"T"` | `IFeatureStore.GetOrNullAsync(name, "T", currentTenantId.ToString())`. |
+
+Because the lookup *reverses* the list, **Tenant overrides Edition overrides Configuration overrides Default**. `EditionFeatureValueProvider.ProviderName = "E"` and `TenantFeatureValueProvider.ProviderName = "T"` are the conventional discriminators stored alongside values in `IFeatureStore`.
+
+### `IFeatureStore`
+
+```csharp
+public interface IFeatureStore
+{
+    Task<string?> GetOrNullAsync(string name, string? providerName, string? providerKey);
+}
+```
+
+`NullFeatureStore` (`[Dependency(TryRegister = true)] ISingletonDependency`) returns `null` for everything — it is the default. `FeatureManagementFeatureStore` from the `Feature Management` module replaces it and reads from the database with caching.
+
+### `FeatureValueProviderManager`
+
+`ISingletonDependency`. Resolves every type in `AbpFeatureOptions.ValueProviders` once (lazily), and throws if two providers share the same `Name`.
+
+## Definition lookup
+
+### `FeatureDefinitionManager`
+
+`ISingletonDependency`. Combines a static store (built from `IFeatureDefinitionProvider`s + cached via `IStaticDefinitionCache`) with a dynamic store (`IDynamicFeatureDefinitionStore`; the management module replaces `NullDynamicFeatureDefinitionStore` to read DB definitions). Static features always win over dynamic ones with the same name.
+
+### Static definitions
+
+`IFeatureDefinitionContext` provides `AddGroup`, `GetGroupOrNull`, `GetGroups`, `AddFeature`, `GetFeatureOrNull`, `GetFeatures`. `FeatureDefinitionContext` is the implementation, but you typically interact with `FeatureGroupDefinition` returned by `AddGroup`.
+
+## Declarative checks
+
+### `[RequiresFeature]`
+
+```csharp
+[AttributeUsage(AttributeTargets.Class | AttributeTargets.Method)]
+public class RequiresFeatureAttribute : Attribute
+{
+    public string[] Features { get; }
+    public bool RequiresAll { get; set; }  // default false → ANY
+}
+```
+
+### `FeatureInterceptor`
+
+`AbpInterceptor, ITransientDependency`. Skipped when `AbpCrossCuttingConcerns.IsApplied(target, AbpCrossCuttingConcerns.FeatureChecking)`. Otherwise opens a scope and calls `IMethodInvocationFeatureCheckerService.CheckAsync(new MethodInvocationFeatureCheckerContext(invocation.Method))`.
+
+### `MethodInvocationFeatureCheckerService`
+
+For each `RequiresFeatureAttribute` on the method (and on the declaring type when the method is public), `await _featureChecker.CheckEnabledAsync(requiresAll, features)`. `CheckEnabledAsync` (from `FeatureCheckerExtensions`) throws `AbpAuthorizationException` with `code: AbpFeatureErrorCodes.FeatureIsNotEnabled` and the feature name attached to `Data`.
+
+`[DisableFeatureCheck]` on the method skips the check entirely.
+
+### `FeatureInterceptorRegistrar`
+
+Adds `FeatureInterceptor` whenever the implementation type has `[RequiresFeature]` directly, or any method on it (public or non-public, instance) is decorated.
+
+## `RequireFeaturesSimpleStateChecker<TState>`
+
+For use with the `ISimpleStateChecker<TState>` system (powers menu visibility, permission definitions, etc.):
+
+```csharp
+permission.AddCheckers(new RequireFeaturesSimpleStateChecker<PermissionDefinition>("MyApp.PrintingEnabled"));
+```
+
+Returns `IsEnabledAsync == true` only when `IFeatureChecker.IsEnabledAsync(requiresAll, featureNames)` agrees.
+
+## Disabling temporarily
+
+Use `[DisableFeatureCheck]` on a method, or wrap the call in an `AbpCrossCuttingConcerns.Applying(target, AbpCrossCuttingConcerns.FeatureChecking)` scope (see `/core/dynamic-proxy-and-aspects`).
+
+## File-by-file enumeration
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpFeaturesModule.cs` | module | See above. |
+| `AbpFeatureOptions.cs` | options | See table above. |
+| `IFeatureChecker.cs` / `FeatureChecker.cs` / `FeatureCheckerBase.cs` | checker | Lookup + bool parsing. |
+| `FeatureCheckerExtensions.cs` | extensions | `GetAsync<T>`, `IsEnabledAsync(requiresAll, names)`, `CheckEnabledAsync(...)` which throws `AbpAuthorizationException` with `AbpFeatureErrorCodes.FeatureIsNotEnabled`. |
+| `IFeatureDefinitionManager.cs` / `FeatureDefinitionManager.cs` | catalog | Combines static + dynamic stores. |
+| `IFeatureDefinitionContext.cs` / `FeatureDefinitionContext.cs` | builder context | `AddGroup`, `GetFeatureOrNull`, etc. |
+| `IFeatureDefinitionProvider.cs` / `FeatureDefinitionProvider.cs` | extension point | Subclass and override `Define`. |
+| `FeatureDefinition.cs` | definition | Tree node; `Properties`, `WithProperty`, `WithProviders`, `CreateChild`, `RemoveChild`. |
+| `FeatureGroupDefinition.cs` | group | Holds `Features` list; `AddFeature(...)`. |
+| `FeatureValue.cs` | DTO | `Name`/`Value` pair. |
+| `IFeatureValueProvider.cs` / `FeatureValueProvider.cs` | provider base | Holds an `IFeatureStore`. |
+| `IFeatureValueProviderManager.cs` / `FeatureValueProviderManager.cs` | provider list | Lazy, duplicate-name detection. |
+| `DefaultValueFeatureValueProvider.cs` | `"D"` | `feature.DefaultValue`. |
+| `ConfigurationFeatureValueProvider.cs` | `"C"` | `IConfiguration["Features:" + name]`. |
+| `EditionFeatureValueProvider.cs` | `"E"` | Looks up edition via `Principal.FindEditionId()` or `ITenantStore`. |
+| `TenantFeatureValueProvider.cs` | `"T"` | Uses `ICurrentTenant.Id`. |
+| `IFeatureStore.cs` / `NullFeatureStore.cs` | store seam | Replaced by `FeatureManagementFeatureStore`. |
+| `IStaticFeatureDefinitionStore.cs` / static store | static cache | Built once from providers. |
+| `IDynamicFeatureDefinitionStore.cs` / `NullDynamicFeatureDefinitionStore.cs` | dynamic catalog | Replaced by the management module. |
+| `RequiresFeatureAttribute.cs` | declaration | `Features[]`, `RequiresAll`. |
+| `DisableFeatureCheckAttribute.cs` | opt out | Skip the check on this method. |
+| `FeatureInterceptor.cs` / `FeatureInterceptorRegistrar.cs` | DynamicProxy | See above. |
+| `IMethodInvocationFeatureCheckerService.cs` / `MethodInvocationFeatureCheckerService.cs` | logic | Aggregates attributes and calls the checker. |
+| `MethodInvocationFeatureCheckerContext.cs` | context | Wraps the `MethodInfo`. |
+| `RequireFeaturesSimpleStateChecker.cs` | simple-state hook | For menus/permissions/etc. |
+| `FeaturesSimpleStateCheckerSerializerContributor.cs` | serializer | Allows the simple-state checker to round-trip across the client proxy. |
+| `FeatureSimpleStateCheckerExtensions.cs` | extensions | `RequireFeature(...)` fluent helpers on `IHasSimpleStateCheckers<T>`. |
+| `AbpFeatureErrorCodes.cs` | constants | `Volo.Feature:010001` = `FeatureIsNotEnabled`. |
+| `Localization/AbpFeatureResource.cs` | localization | Default messages. |
+
+## Related
+
+- `/modules/feature-management` — DB persistence of feature values + the admin UI.
+- `/auth/permissions` — same `IDefinitionManager` + `ISimpleStateChecker` patterns.
+- `/multitenancy/current-tenant` — feeds `TenantFeatureValueProvider` and `EditionFeatureValueProvider`.
+- `/crosscut/global-features` — compile-time module toggles (different concept).

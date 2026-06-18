@@ -1,0 +1,100 @@
+---
+title: "Volo.Abp.Data"
+description: "Every type in framework/src/Volo.Abp.Data/Volo/Abp/Data — the provider-agnostic data abstractions consumed by every persistence package."
+---
+
+`Volo.Abp.Data` defines abstractions the rest of the data stack depends on. It has **no** dependency on EF Core, MongoDB, Dapper or any driver. It is depended on by `AbpUnitOfWorkModule` (transitively) and `AbpObjectExtendingModule`, and feeds the multi-tenancy and migration subsystems.
+
+Source: `framework/src/Volo.Abp.Data/Volo/Abp/Data/`.
+
+## Module — `AbpDataModule`
+
+File: `AbpDataModule.cs`.
+
+```csharp
+[DependsOn(
+    typeof(AbpObjectExtendingModule),
+    typeof(AbpUnitOfWorkModule),
+    typeof(AbpEventBusAbstractionsModule)
+)]
+public class AbpDataModule : AbpModule { ... }
+```
+
+`PreConfigureServices` scans the DI container via `IServiceCollection.OnRegistered` and collects every type assignable to `IDataSeedContributor` into `AbpDataSeedOptions.Contributors`. `ConfigureServices` binds `AbpDbConnectionOptions` from `IConfiguration` (so `appsettings.json`'s `ConnectionStrings` section is auto-wired) and registers the open generic singleton `IDataFilter<>` → `DataFilter<>`. `PostConfigureServices` calls `AbpDatabaseInfoDictionary.RefreshIndexes()` so connection-name lookups are O(1).
+
+## Connection strings
+
+| File | Type | Purpose |
+| --- | --- | --- |
+| `ConnectionStrings.cs` | `ConnectionStrings : Dictionary<string,string?>` | Strongly-typed bag. `DefaultConnectionStringName = "Default"` constant. |
+| `AbpDbConnectionOptions.cs` | `AbpDbConnectionOptions` | Holds `ConnectionStrings` and `AbpDatabaseInfoDictionary`. Method `GetConnectionStringOrNull(name, fallbackToDatabaseMappings, fallbackToDefault)` is the canonical resolve algorithm. |
+| `AbpDatabaseInfo.cs` | `AbpDatabaseInfo` | Logical database. `MappedConnections` HashSet, `IsUsedByTenants` flag (default `true`), `MapConnection(params string[])`. |
+| `AbpDatabaseInfoDictionary.cs` | `AbpDatabaseInfoDictionary : Dictionary<string,AbpDatabaseInfo>` | `Configure(name, action)` builder, `GetMappedDatabaseOrNull(connectionName)`, `RefreshIndexes()` (called by module). |
+| `ConnectionStringNameAttribute.cs` | `ConnectionStringNameAttribute` | Decorates `DbContext` types. Static helpers `GetConnStringName<T>()` / `GetConnStringName(Type)` fall back to `type.FullName`. |
+| `IConnectionStringResolver.cs` | `IConnectionStringResolver` | Async `ResolveAsync(name)` + obsolete sync `Resolve(name)`. |
+| `DefaultConnectionStringResolver.cs` | `DefaultConnectionStringResolver` | Transient. Reads `IOptionsMonitor<AbpDbConnectionOptions>.CurrentValue` and delegates to `GetConnectionStringOrNull`. |
+| `ConnectionStringResolverExtensions.cs` | extensions | `ResolveAsync<T>()` and `ResolveAsync(Type)` that pull the connection name from `ConnectionStringNameAttribute`. |
+| `IConnectionStringChecker.cs` | `IConnectionStringChecker` | `CheckAsync(connectionString) -> AbpConnectionStringCheckResult`. |
+| `DefaultConnectionStringChecker.cs` | default checker | Always returns `{ Connected = false, DatabaseExists = false }` — providers override (e.g. `SqlServerConnectionStringChecker`). |
+| `AbpConnectionStringCheckResult.cs` | result DTO | `Connected`, `DatabaseExists` booleans. |
+
+See `/data/connection-strings` for the full resolver chain (including `MultiTenantConnectionStringResolver`).
+
+## Data filters
+
+| File | Type | Notes |
+| --- | --- | --- |
+| `IDataFilter.cs` | `IDataFilter` (non-generic) and `IDataFilter<TFilter>` | Generic per-filter accessor. Methods: `Enable()`, `Disable()`, `bool IsEnabled`. |
+| `DataFilter.cs` | `DataFilter` (singleton) + `DataFilter<TFilter>` | `DataFilter` is a façade that caches `IDataFilter<TFilter>` in a `ConcurrentDictionary`. `DataFilter<TFilter>` keeps state in an `AsyncLocal<DataFilterState>` so the toggle does not leak across requests. |
+| `DataFilterState.cs` | `DataFilterState` | `IsEnabled` flag with `Clone()` for snapshotting. |
+| `AbpDataFilterOptions.cs` | `AbpDataFilterOptions` | `DefaultStates : Dictionary<Type, DataFilterState>` — set per-filter default during module configuration. |
+| `DataFilterExtensions.cs` | extensions | Variadic `Disable<T1,T2>()`, `Disable<T1,T2,T3>()`, ... that return a `CompositeDisposable`. |
+
+The default registration is in `AbpDataModule.ConfigureServices`:
+
+```csharp
+context.Services.AddSingleton(typeof(IDataFilter<>), typeof(DataFilter<>));
+```
+
+EF Core wires the filters into global query filters via `AbpDbContext.ShouldFilterEntity<TEntity>` and `CreateFilterExpression<TEntity>` (see `/data/data-filtering`).
+
+## Data seeding
+
+| File | Type | Notes |
+| --- | --- | --- |
+| `IDataSeeder.cs` | `IDataSeeder` | `Task SeedAsync(DataSeedContext)`. |
+| `DataSeeder.cs` | `DataSeeder : IDataSeeder, ITransientDependency` | The default implementation. `[UnitOfWork]` attribute on `SeedAsync`. Creates an `IServiceScope`, loops `AbpDataSeedOptions.Contributors`, and optionally opens a separate UoW per contributor (driven by `DataSeederExtensions.SeedInSeparateUow` properties on the context). |
+| `IDataSeedContributor.cs` | `IDataSeedContributor` | The hook each module implements. |
+| `DataSeedContext.cs` | `DataSeedContext` | `TenantId?`, `Properties : Dictionary<string,object?>`, indexer, `WithProperty(name, value)` fluent builder. |
+| `DataSeederExtensions.cs` | extensions | `SeedAsync(this IDataSeeder, Guid? tenantId)` + `SeedInSeparateUowAsync(..., AbpUnitOfWorkOptions, bool requiresNew)`. Defines the constants `SeedInSeparateUow`, `SeedInSeparateUowOptions`, `SeedInSeparateUowRequiresNew`. |
+| `AbpDataSeedOptions.cs` | `AbpDataSeedOptions` | Single property `Contributors : DataSeedContributorList`. |
+| `DataSeedContributorList.cs` | `DataSeedContributorList : TypeList<IDataSeedContributor>` | Ordered list of contributor types. |
+
+`AbpDataModule.AutoAddDataSeedContributors` uses `services.OnRegistered` to enroll every contributor automatically, so application code only needs to register a class implementing `IDataSeedContributor` — no manual hookup. The DbMigrator template then calls `IDataSeeder.SeedAsync(tenantId)`.
+
+## Data migration environment
+
+| File | Type | Notes |
+| --- | --- | --- |
+| `AbpDataMigrationEnvironment.cs` | empty marker class | Indicates the process is a DbMigrator (so modules can suppress runtime-only behaviour). |
+| `AbpDataMigrationEnvironmentExtensions.cs` | extensions | `AddDataMigrationEnvironment(this AbpApplicationCreationOptions)` / `IsDataMigrationEnvironment(IServiceCollection)` / same on `IServiceProvider`. Stored via `AddObjectAccessor<AbpDataMigrationEnvironment>`. |
+| `AppliedDatabaseMigrationsEto.cs` | `[Serializable, EventName("abp.data.applied_database_migrations")]` | Published after migrations finish. Carries `DatabaseName` + `TenantId?`. |
+| `ApplyDatabaseMigrationsEto.cs` | `[Serializable, EventName("abp.data.apply_database_migrations")] : EtoBase` | Requests migration of a tenant database. Carries `DatabaseName` + `TenantId?`. |
+
+See `/data/data-seeding-and-migrations` for the DbMigrator pattern and the event flow.
+
+## Misc
+
+| File | Type | Notes |
+| --- | --- | --- |
+| `AbpCommonDbProperties.cs` | static | `DbTablePrefix` (default `"Abp"`) and `DbSchema` (default `null`). Most module model builders read these. |
+| `AbpDbConcurrencyException.cs` | `AbpDbConcurrencyException : AbpException` | Thrown when `IHasConcurrencyStamp.ConcurrencyStamp` no longer matches. |
+| `ConcurrencyStampExtensions.cs` | `SetConcurrencyStampIfNotNull(this IHasConcurrencyStamp, string?)` | Used by `ObjectMapping` and DTO-to-entity assignments. |
+
+## Cross-references
+
+- `/data/connection-strings` — full resolver story and the multi-tenancy override.
+- `/data/data-filtering` — how `IDataFilter<TFilter>` plugs into EF Core global query filters.
+- `/data/data-seeding-and-migrations` — `IDataSeedContributor` examples and the DbMigrator workflow.
+- `/flows/unit-of-work-flow` — `[UnitOfWork]` on `DataSeeder.SeedAsync` is the standard entry point.
+- `/core/options-and-static-definitions` — how `AbpDbConnectionOptions` is consumed via `IOptionsMonitor`.

@@ -1,0 +1,319 @@
+---
+title: "Sending email: Volo.Abp.Emailing"
+sidebarTitle: "Emailing"
+description: "IEmailSender, EmailSenderBase, MailMessage, the SMTP default, the BackgroundEmailSendingJob queue path, AbpMailKitOptions and EmailSettingNames."
+---
+
+`framework/src/Volo.Abp.Emailing/` defines the email abstractions used by every ABP host. It ships:
+
+- A high-level `IEmailSender` interface that has both fire-and-forget (`SendAsync`) and queued (`QueueAsync`) overloads.
+- An `EmailSenderBase` that handles `MailMessage` normalization, the background-job hop, and attachment/CC fan-out.
+- A working `SmtpEmailSender` built on `System.Net.Mail.SmtpClient` (with a runtime log warning recommending [MailKit](./mailkit) for new code).
+- A `NullEmailSender` that just logs — used as a `[Dependency(TryRegister = true)]` style fallback when nothing else is wired.
+- `EmailSettingNames` + `EmailSettingProvider`, exposing SMTP settings through ABP's `ISettingProvider`.
+
+## Module
+
+`AbpEmailingModule` (`Volo/Abp/Emailing/AbpEmailingModule.cs`):
+
+```csharp
+[DependsOn(
+    typeof(AbpSettingsModule),
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpBackgroundJobsAbstractionsModule),
+    typeof(AbpLocalizationModule),
+    typeof(AbpTextTemplatingModule))]
+public class AbpEmailingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(o => o.FileSets.AddEmbedded<AbpEmailingModule>());
+
+        Configure<AbpLocalizationOptions>(o => o.Resources
+            .Add<EmailingResource>("en")
+            .AddVirtualJson("/Volo/Abp/Emailing/Localization"));
+
+        Configure<AbpBackgroundJobOptions>(o => o.AddJob<BackgroundEmailSendingJob>());
+    }
+}
+```
+
+Dependency notes:
+
+- The dependency on `AbpBackgroundJobsAbstractionsModule` is **abstractions only** — nothing in this package needs a real job store. If no provider is registered, `IBackgroundJobManager.IsAvailable()` returns `false` and `QueueAsync` degrades to a direct send (see below). See [Background jobs](/background/background-jobs).
+- The dependency on `AbpTextTemplatingModule` (`[Obsolete]` per the source `#pragma`) is what lets you pair `IEmailSender` with `ITextTemplateRenderer` to render Razor/Scriban email bodies. See [Text templating overview](/texttemplating/overview).
+
+## `IEmailSender`
+
+```csharp
+public interface IEmailSender
+{
+    Task SendAsync(string to, string? subject, string? body,
+        bool isBodyHtml = true, AdditionalEmailSendingArgs? additionalEmailSendingArgs = null);
+
+    Task SendAsync(string from, string to, string? subject, string? body,
+        bool isBodyHtml = true, AdditionalEmailSendingArgs? additionalEmailSendingArgs = null);
+
+    Task SendAsync(MailMessage mail, bool normalize = true);
+
+    Task QueueAsync(string to, string subject, string body,
+        bool isBodyHtml = true, AdditionalEmailSendingArgs? additionalEmailSendingArgs = null);
+
+    Task QueueAsync(string from, string to, string subject, string body,
+        bool isBodyHtml = true, AdditionalEmailSendingArgs? additionalEmailSendingArgs = null);
+}
+```
+
+`MailMessage` is the BCL type `System.Net.Mail.MailMessage`. ABP does **not** invent its own envelope — both the SMTP and MailKit senders accept the same `MailMessage` and translate as needed (MailKit converts via `MimeMessage.CreateFromMailMessage`).
+
+`AdditionalEmailSendingArgs` is the cross-cutting bag for things the BCL `MailMessage` API makes ugly:
+
+```csharp
+[Serializable]
+public class AdditionalEmailSendingArgs
+{
+    public List<string>? CC { get; set; }
+    public List<EmailAttachment>? Attachments { get; set; }
+    public ExtraPropertyDictionary? ExtraProperties { get; set; }
+}
+
+[Serializable]
+public class EmailAttachment
+{
+    public string? Name { get; set; }
+    public byte[]? File { get; set; }
+}
+```
+
+Attachments are bytes (not streams) because the type has to be JSON-serializable to round-trip through `IBackgroundJobManager.EnqueueAsync`.
+
+## `EmailSenderBase`
+
+`EmailSenderBase` (`Volo/Abp/Emailing/EmailSenderBase.cs`) is the abstract base that all senders derive from. It owns three responsibilities.
+
+### 1. Build a `MailMessage` from primitives
+
+```csharp
+protected virtual MailMessage BuildMailMessage(string? from, string to, string? subject,
+    string? body, bool isBodyHtml = true, AdditionalEmailSendingArgs? args = null)
+{
+    var message = from == null
+        ? new MailMessage { To = { to }, Subject = subject, Body = body, IsBodyHtml = isBodyHtml }
+        : new MailMessage(from, to, subject, body) { IsBodyHtml = isBodyHtml };
+
+    if (args?.Attachments != null)
+        foreach (var a in args.Attachments.Where(x => x.File != null))
+        {
+            var fs = new MemoryStream(a.File!);
+            fs.Seek(0, SeekOrigin.Begin);
+            message.Attachments.Add(new Attachment(fs, a.Name));
+        }
+
+    if (args?.CC != null)
+        foreach (var cc in args.CC) message.CC.Add(cc);
+
+    return message;
+}
+```
+
+Note: the `MemoryStream` for attachments is **not disposed** here — `MailMessage`/`Attachment` keep a reference and the BCL disposes them when the message is disposed. Senders wrap the `SmtpClient`/`MailKit.SmtpClient` in `using`, but if you ever call `BuildMailMessage` directly you're responsible for the message lifecycle.
+
+### 2. Normalize before sending
+
+```csharp
+public virtual async Task SendAsync(MailMessage mail, bool normalize = true)
+{
+    if (normalize) await NormalizeMailAsync(mail);
+    await SendEmailAsync(mail); // abstract
+}
+
+protected virtual async Task NormalizeMailAsync(MailMessage mail)
+{
+    if (mail.From == null || mail.From.Address.IsNullOrEmpty())
+    {
+        mail.From = new MailAddress(
+            await Configuration.GetDefaultFromAddressAsync(),
+            await Configuration.GetDefaultFromDisplayNameAsync(),
+            Encoding.UTF8);
+    }
+
+    mail.HeadersEncoding ??= Encoding.UTF8;
+    mail.SubjectEncoding ??= Encoding.UTF8;
+    mail.BodyEncoding    ??= Encoding.UTF8;
+}
+```
+
+**Default-sender behaviour.** If a caller leaves `mail.From` null, normalization fills it from the `Abp.Mailing.DefaultFromAddress` and `Abp.Mailing.DefaultFromDisplayName` settings (see `EmailSettingNames` below). `IEmailSenderConfiguration.GetDefaultFromAddressAsync()` throws `AbpException` if the setting resolves empty — you cannot silently send a `From: null` message.
+
+`SendEmailAsync(MailMessage)` is the single abstract method derived senders implement.
+
+### 3. Queue via background jobs
+
+```csharp
+public virtual async Task QueueAsync(string to, string subject, string body,
+    bool isBodyHtml = true, AdditionalEmailSendingArgs? args = null)
+{
+    await ValidateEmailAddressAsync(to);
+
+    if (!BackgroundJobManager.IsAvailable())
+    {
+        await SendAsync(to, subject, body, isBodyHtml, args); // fallback to inline send
+        return;
+    }
+
+    await BackgroundJobManager.EnqueueAsync(new BackgroundEmailSendingJobArgs
+    {
+        TenantId = CurrentTenant.Id,
+        To = to, Subject = subject, Body = body,
+        IsBodyHtml = isBodyHtml,
+        AdditionalEmailSendingArgs = args
+    });
+}
+```
+
+Three things to notice:
+
+1. **Validation runs synchronously.** `ValidateEmailAddressAsync` round-trips the address through `MailAddressCollection` and throws `ArgumentException` if it fails. Bad addresses don't get enqueued.
+2. **Tenant capture.** `TenantId = CurrentTenant.Id` is snapshotted at enqueue time. The job re-enters with the right tenant because `BackgroundEmailSendingJobArgs` implements `IMultiTenant` and the ABP background-job pipeline restores `ICurrentTenant` before `ExecuteAsync`.
+3. **Graceful degradation.** When `IBackgroundJobManager` is the no-op default (no Hangfire/Quartz/RabbitMQ provider installed), `QueueAsync` becomes an in-process `SendAsync`. This is what makes the Emailing module's dependency on _Abstractions_-only work.
+
+## `BackgroundEmailSendingJob`
+
+```csharp
+public class BackgroundEmailSendingJob
+    : AsyncBackgroundJob<BackgroundEmailSendingJobArgs>, ITransientDependency
+{
+    protected IEmailSender EmailSender { get; }
+
+    public async override Task ExecuteAsync(BackgroundEmailSendingJobArgs args)
+    {
+        if (args.From.IsNullOrWhiteSpace())
+            await EmailSender.SendAsync(args.To, args.Subject, args.Body, args.IsBodyHtml, args.AdditionalEmailSendingArgs);
+        else
+            await EmailSender.SendAsync(args.From!, args.To, args.Subject, args.Body, args.IsBodyHtml, args.AdditionalEmailSendingArgs);
+    }
+}
+```
+
+It's a trivial `AsyncBackgroundJob<T>` — meaning retry policy, isolation, and persistence are entirely the responsibility of whatever background-job provider you've installed. There's no provider-specific retry knob here.
+
+## `NullEmailSender`
+
+```csharp
+public class NullEmailSender : EmailSenderBase
+{
+    protected override Task SendEmailAsync(MailMessage mail)
+    {
+        Logger.LogWarning("USING NullEmailSender!");
+        Logger.LogDebug("SendEmailAsync:");
+        Logger.LogDebug(mail.To.ToString());
+        Logger.LogDebug(mail.CC.ToString());
+        Logger.LogDebug(mail.Subject);
+        Logger.LogDebug(mail.Body);
+        return Task.FromResult(0);
+    }
+}
+```
+
+`NullEmailSender` is **not** registered automatically by `AbpEmailingModule`. The default registered implementation is `SmtpEmailSender` (`[ITransientDependency]`); adding the MailKit module replaces it with `MailKitSmtpEmailSender` (`[Dependency(ReplaceServices = true)]`). Use `NullEmailSender` in tests by registering it manually with `services.Replace(...)`.
+
+## SMTP sender
+
+`Volo/Abp/Emailing/Smtp/SmtpEmailSender.cs` is the default. It builds a configured `SmtpClient` from `ISmtpEmailSenderConfiguration`:
+
+```csharp
+public async Task<SmtpClient> BuildClientAsync()
+{
+    var host = await SmtpConfiguration.GetHostAsync();
+    var port = await SmtpConfiguration.GetPortAsync();
+    var smtpClient = new SmtpClient(host, port);
+
+    if (await SmtpConfiguration.GetEnableSslAsync())
+        smtpClient.EnableSsl = true;
+
+    if (await SmtpConfiguration.GetUseDefaultCredentialsAsync())
+    {
+        smtpClient.UseDefaultCredentials = true;
+    }
+    else
+    {
+        smtpClient.UseDefaultCredentials = false;
+        var userName = await SmtpConfiguration.GetUserNameAsync();
+        if (!userName.IsNullOrEmpty())
+        {
+            var password = await SmtpConfiguration.GetPasswordAsync();
+            var domain   = await SmtpConfiguration.GetDomainAsync();
+            smtpClient.Credentials = !domain.IsNullOrEmpty()
+                ? new NetworkCredential(userName, password, domain)
+                : new NetworkCredential(userName, password);
+        }
+    }
+    return smtpClient;
+}
+```
+
+`SendEmailAsync` then logs a runtime warning ("We don't recommend that you use the SmtpClient class for new development ... Use MailKit ...") and calls `smtpClient.SendMailAsync(mail)`. Switch to `Volo.Abp.MailKit` for production — see [Sending email via MailKit](./mailkit).
+
+## Settings: `EmailSettingNames` and `EmailSettingProvider`
+
+`EmailSettingProvider : SettingDefinitionProvider` (registered through the standard ABP settings pipeline) defines:
+
+| Setting name | Default | Notes |
+| --- | --- | --- |
+| `Abp.Mailing.Smtp.Host` | `127.0.0.1` | |
+| `Abp.Mailing.Smtp.Port` | `25` | parsed via `.To<int>()` |
+| `Abp.Mailing.Smtp.UserName` | _(none)_ | required when `UseDefaultCredentials = false` |
+| `Abp.Mailing.Smtp.Password` | _(none)_ | `isEncrypted: true` — stored encrypted by the setting store |
+| `Abp.Mailing.Smtp.Domain` | _(none)_ | optional `NetworkCredential` domain |
+| `Abp.Mailing.Smtp.EnableSsl` | `false` | |
+| `Abp.Mailing.Smtp.UseDefaultCredentials` | `true` | when `true`, username/password are ignored |
+| `Abp.Mailing.DefaultFromAddress` | `noreply@abp.io` | used by `NormalizeMailAsync` |
+| `Abp.Mailing.DefaultFromDisplayName` | `ABP application` | |
+
+Because these are ABP _settings_ (not options), values can be overridden per-tenant or per-user without restarting, via whatever setting-management module you've installed.
+
+`ISmtpEmailSenderConfiguration : IEmailSenderConfiguration` exposes `GetHostAsync`/`GetPortAsync`/`GetUserNameAsync`/`GetPasswordAsync`/`GetDomainAsync`/`GetEnableSslAsync`/`GetUseDefaultCredentialsAsync`. The default implementation is `SmtpEmailSenderConfiguration : EmailSenderConfiguration`, which delegates to `ISettingProvider.GetOrNullAsync` and throws if a required value is empty:
+
+```csharp
+protected async Task<string> GetNotEmptySettingValueAsync(string name)
+{
+    var value = await SettingProvider.GetOrNullAsync(name);
+    if (value.IsNullOrEmpty())
+        throw new AbpException($"Setting value for '{name}' is null or empty!");
+    return value!;
+}
+```
+
+## Integration with `ITextTemplateRenderer`
+
+The Emailing module pulls in `AbpTextTemplatingModule` so you can compose `IEmailSender` with `ITextTemplateRenderer` for templated bodies. The canonical pattern is:
+
+```csharp
+public class WelcomeEmailer : ITransientDependency
+{
+    private readonly ITemplateRenderer _renderer;
+    private readonly IEmailSender _emailSender;
+
+    public async Task SendAsync(string to, string userName)
+    {
+        var body = await _renderer.RenderAsync(
+            "WelcomeEmail",                                // template name
+            new { name = userName });
+
+        await _emailSender.QueueAsync(
+            to: to,
+            subject: "Welcome",
+            body: body,
+            isBodyHtml: true);
+    }
+}
+```
+
+The template itself lives in your virtual file system (see [Razor templating](/texttemplating/razor) / [Scriban templating](/texttemplating/scriban)). Emailing knows nothing about templates — it just consumes whatever string body you render.
+
+## What's _not_ in this package
+
+- **No MIME / multipart handling.** That ships with the MailKit integration.
+- **No retry/dead-letter logic.** Retries are whatever your background-job provider does.
+- **No outbox.** If you need exactly-once delivery, wrap `QueueAsync` in a unit-of-work / outbox of your own — `AdditionalEmailSendingArgs.ExtraProperties` exists to ride correlation IDs through the job.
+- **No `AbpMailKitOptions`.** That type lives in `Volo.Abp.MailKit` (it controls `SecureSocketOptions`) — see the next page.

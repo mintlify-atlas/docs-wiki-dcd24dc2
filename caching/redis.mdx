@@ -1,0 +1,184 @@
+---
+title: "Redis cache provider"
+sidebarTitle: "Redis"
+description: "Volo.Abp.Caching.StackExchangeRedis — AbpCachingStackExchangeRedisModule, AbpRedisCache (subclass of RedisCache with ICacheSupportsMultipleItems), the Redis:IsEnabled / Redis:Configuration toggles, and instance-prefix handling."
+---
+
+The Redis provider replaces the default `Microsoft.Extensions.Caching.Distributed.IDistributedCache` registration with **`AbpRedisCache`**, a subclass of `Microsoft.Extensions.Caching.StackExchangeRedis.RedisCache` that adds pipelined multi-key operations via `ICacheSupportsMultipleItems`. Everything else (typed `IDistributedCache<T>`, key normalisation, serialisation) is the framework code described in [Distributed cache](/caching/distributed-cache).
+
+The package lives in `framework/src/Volo.Abp.Caching.StackExchangeRedis/`.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `AbpCachingStackExchangeRedisModule.cs` | Module — reads `Redis:IsEnabled` and `Redis:Configuration` from `IConfiguration`, calls `AddStackExchangeRedisCache`, then `Replace`s the `IDistributedCache` registration with `AbpRedisCache`. |
+| `AbpRedisCache.cs` | `RedisCache` subclass exposing `GetMany` / `SetMany` / `RefreshMany` / `RemoveMany` through reflected access to the base type's private hash fields, pipelining all operations through `StackExchange.Redis.IDatabase`. |
+| `AbpRedisExtensions.cs` | `IDatabase.HashMemberGetMany(keys, fields)` and async — sends `HGET` per key without awaiting in between, then collects. |
+
+## Module wiring
+
+```csharp
+[DependsOn(typeof(AbpCachingModule))]
+public class AbpCachingStackExchangeRedisModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        var redisEnabled = configuration["Redis:IsEnabled"];
+        if (string.IsNullOrEmpty(redisEnabled) || bool.Parse(redisEnabled))
+        {
+            context.Services.AddStackExchangeRedisCache(options =>
+            {
+                var redisConfiguration = configuration["Redis:Configuration"];
+                if (!redisConfiguration.IsNullOrEmpty())
+                {
+                    options.Configuration = redisConfiguration;
+                }
+            });
+
+            context.Services.Replace(
+                ServiceDescriptor.Singleton<IDistributedCache, AbpRedisCache>());
+        }
+    }
+}
+```
+
+Two things to notice:
+
+1. **`Redis:IsEnabled`** acts as a kill switch. If you set it to `false` in `appsettings.json`, the module skips both the `AddStackExchangeRedisCache` call and the `Replace`, leaving the `MemoryDistributedCache` registered by `AbpCachingModule` in place. Useful for tests and offline development without touching the dependency graph.
+2. The module only calls `AddStackExchangeRedisCache(o => …)`; it does not set `RedisCacheOptions.InstanceName`. To set an instance prefix add another configuration call in your own module:
+
+   ```csharp
+   Configure<RedisCacheOptions>(o =>
+   {
+       o.Configuration = "redis:6379";
+       o.InstanceName  = "myapp:";
+   });
+   ```
+
+   Anything passed in `InstanceName` is encoded to UTF-8 and prepended to every Redis key. This is **separate** from `AbpDistributedCacheOptions.KeyPrefix` — the latter sits between `k:` and the raw key inside the key string built by `DistributedCacheKeyNormalizer`; the former is a raw byte prefix attached at the Redis layer.
+
+## Required configuration
+
+```json
+{
+  "Redis": {
+    "IsEnabled": true,
+    "Configuration": "localhost:6379,abortConnect=false"
+  }
+}
+```
+
+`Redis:Configuration` is a `StackExchange.Redis.ConfigurationOptions` connection string. The module passes it directly to `RedisCacheOptions.Configuration`, which is what the upstream `RedisCache` uses to lazy-connect a `ConnectionMultiplexer`.
+
+## `AbpRedisCache`
+
+`AbpRedisCache` inherits from `Microsoft.Extensions.Caching.StackExchangeRedis.RedisCache`, so single-key `Get/Set/Refresh/Remove` and their async variants come from the base — identical wire protocol, identical hash schema (`absexp`, `sldexp`, `data` fields). What it adds is `ICacheSupportsMultipleItems`:
+
+```csharp
+public class AbpRedisCache : RedisCache, ICacheSupportsMultipleItems
+{
+    public virtual byte[]?[] GetMany(IEnumerable<string> keys);
+    public virtual Task<byte[]?[]> GetManyAsync(IEnumerable<string> keys, CancellationToken token);
+
+    public virtual void SetMany(IEnumerable<KeyValuePair<string, byte[]>> items,
+                                DistributedCacheEntryOptions options);
+    public virtual Task SetManyAsync(IEnumerable<KeyValuePair<string, byte[]>> items,
+                                     DistributedCacheEntryOptions options,
+                                     CancellationToken token);
+
+    public virtual void RefreshMany(IEnumerable<string> keys);
+    public virtual Task RefreshManyAsync(IEnumerable<string> keys, CancellationToken token);
+
+    public virtual void RemoveMany(IEnumerable<string> keys);
+    public virtual Task RemoveManyAsync(IEnumerable<string> keys, CancellationToken token);
+}
+```
+
+The generic `DistributedCache<,>` checks `if (cache is ICacheSupportsMultipleItems msi)` and uses it for `GetMany`/`SetMany`/`RefreshMany`/`RemoveMany`. Against `MemoryDistributedCache` (no `ICacheSupportsMultipleItems`) it falls back to per-key loops.
+
+### How the pipelining works
+
+`GetMany` reduces to a single `Connect()` round-trip plus N pipelined `HGET`s on the `StackExchange.Redis.IDatabase`:
+
+```csharp
+protected virtual byte[]?[] GetAndRefreshMany(IEnumerable<string> keys, bool getData)
+{
+    var cache = Connect();
+    var keyArray = keys.Select(key => InstancePrefix.Append(key)).ToArray();
+
+    var results = cache.HashMemberGetMany(keyArray, GetHashFields(getData));
+
+    Task.WaitAll(PipelineRefreshManyAndOutData(cache, keyArray, results, out var bytes));
+    return bytes;
+}
+```
+
+`HashMemberGetMany` (in `AbpRedisExtensions.cs`) issues all `HGETALL`-equivalent calls without awaiting, letting StackExchange.Redis pipeline them; the loop awaiting follows. `PipelineRefreshManyAndOutData` then schedules a `KeyExpireAsync` per key to honour the sliding window, computing the effective TTL as `min(absoluteRemaining, sliding)` exactly like the base `RedisCache` does for single-key reads.
+
+`SetMany`/`PipelineSetMany` likewise emits `HSET` (+ `EXPIRE` when there's a TTL) for each item without `await`s in between, then `Task.WhenAll`s them. Memory leases from `ReadOnlySequence<byte>` linearisation are returned to `ArrayPool<byte>.Shared`.
+
+### Reflection into the base class
+
+The base `RedisCache` keeps several useful pieces private (`_cache` field, `Connect`/`ConnectAsync` methods, `MapMetadata`, `GetAbsoluteExpiration`, `GetExpirationInSeconds`, `OnRedisError`, `Recycle`, and the field/key constants `AbsoluteExpirationKey` / `SlidingExpirationKey` / `DataKey` / `NotPresent`). `AbpRedisCache`'s static constructor reflects all of them once and stores `FieldInfo` / `MethodInfo` for hot use:
+
+```csharp
+static AbpRedisCache()
+{
+    var type = typeof(RedisCache);
+    RedisDatabaseField = type.GetField("_cache", BindingFlags.Instance | BindingFlags.NonPublic);
+    ConnectMethod      = type.GetMethod("Connect", …);
+    ConnectAsyncMethod = type.GetMethod("ConnectAsync", …);
+    MapMetadataMethod  = type.GetMethod("MapMetadata", …);
+    // …
+    AbsoluteExpirationKey = (string)type.GetField("AbsoluteExpirationKey", …).GetValue(null);
+    SlidingExpirationKey  = (string)type.GetField("SlidingExpirationKey", …).GetValue(null);
+    DataKey               = (string)type.GetField("DataKey", …).GetValue(null);
+}
+```
+
+This is intentionally brittle to the exact upstream version listed in `Volo.Abp.Caching.StackExchangeRedis.csproj`; pinning the package version when you upgrade is mandatory.
+
+## Instance prefix
+
+```csharp
+public AbpRedisCache(IOptions<RedisCacheOptions> optionsAccessor)
+    : base(optionsAccessor)
+{
+    var instanceName = optionsAccessor.Value.InstanceName;
+    if (!string.IsNullOrEmpty(instanceName))
+    {
+        InstancePrefix = (RedisKey)Encoding.UTF8.GetBytes(instanceName);
+    }
+}
+```
+
+`InstancePrefix.Append(key)` is used on every multi-key entry point. The base type already does the same for single-key methods, so the byte-level Redis keyspace looks like:
+
+```
+myapp:t:3fa…,c:user,k:42
+└──┘└────────────────────┘
+ instance      normalized key from DistributedCacheKeyNormalizer
+```
+
+## Integration with `IDistributedCache<TCacheItem>`
+
+Once `AbpRedisCache` is registered, nothing changes at the call site — `IDistributedCache<UserCacheItem>` still serialises with `Utf8JsonDistributedCacheSerializer` and keys with `DistributedCacheKeyNormalizer`. The only visible difference is:
+
+- `GetMany`/`SetMany`/`RefreshMany`/`RemoveMany` become single round-trips.
+- Failures bubble out of StackExchange.Redis. If `AbpDistributedCacheOptions.HideErrors` is true the typed cache layer catches and logs them; if false they escape (the `Development` default).
+
+## Operational notes
+
+- **One multiplexer per app**. `AddStackExchangeRedisCache` registers a singleton `RedisCacheOptions` and `RedisCache` shares one `ConnectionMultiplexer` per process. Don't `Replace` the `IDistributedCache` again after this module unless your replacement also implements `ICacheSupportsMultipleItems`, or you lose the pipelined many-key path.
+- **Connection failures**. The default StackExchange.Redis behaviour is to retry the multiplexer connection forever; combine with `abortConnect=false` and a sensible `connectTimeout` for cold starts.
+- **Memory-only fallback in tests**. Set `Redis:IsEnabled=false` so the module is a no-op; the base `AbpCachingModule` `AddDistributedMemoryCache()` registration stays in place.
+- **Sharing Redis with other services**. Use a non-empty `RedisCacheOptions.InstanceName` *and/or* `AbpDistributedCacheOptions.KeyPrefix` so your keys don't collide with another app's.
+
+## Cross-references
+
+- [Distributed cache](/caching/distributed-cache) — the typed API on top.
+- [BLOB storing — AWS](/blob/aws-s3), [Aliyun](/blob/aliyun-oss), [Bunny](/blob/bunny-cdn) — providers that cache short-lived credentials/storage zones in `IDistributedCache<…CacheItem>` and therefore benefit from Redis when the app is scaled out.
+- [Distributed event bus](/eventbus/distributed-event-bus) — separate concern but shares the Redis instance in many deployments; use different `InstanceName`s.

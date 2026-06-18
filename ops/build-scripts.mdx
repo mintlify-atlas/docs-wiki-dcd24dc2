@@ -1,0 +1,221 @@
+---
+title: "build/ scripts — building and testing every solution"
+sidebarTitle: "Build Scripts"
+description: "build/common.ps1 solution enumeration, build-all.ps1, build-all-release.ps1 and test-all.ps1 — how a single dotnet build of the whole repo actually fans out."
+---
+
+`abpframework/abp` is split into ~20 independent `.slnx`/`.sln` solutions under `framework/`, `modules/*`, `templates/*` and a few extras. The `build/` folder holds four tiny PowerShell scripts that loop over those solutions and shell out to `dotnet`. There is no MSBuild orchestrator and no Cake/Nuke build host — the entire local build surface is these four files. This page enumerates each script, what `$solutionPaths` resolves to, what flags are passed to `dotnet`, and how to reproduce the equivalent of CI locally.
+
+<Info>
+For the higher-level pipeline view (NuGet pack, npm publish, GitHub release) see [Build & Tooling overview](/overview/build-and-tooling) and [deploy-scripts](/ops/deploy-scripts).
+</Info>
+
+## Files in `build/`
+
+| File | Purpose |
+| --- | --- |
+| `common.ps1` | Dot-sourced helper; defines `$rootFolder` and `$solutionPaths` (the list of solutions to iterate). Toggled by `-f` (full) flag |
+| `build-all.ps1` | Debug build of every solution in `$solutionPaths` — `dotnet build` (default Debug, no extra flags) |
+| `build-all-release.ps1` | Release build of the **full** set (`common.ps1 -f`) — `dotnet build --configuration Release -- /maxcpucount` |
+| `test-all.ps1` | `dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"` per solution |
+
+All scripts run with the current directory pinned to `build/` (`Set-Location $rootFolder` is called after the loop to restore the cwd). Solution paths are relative to the `build/` folder, e.g. `../framework`, `../modules/identity`.
+
+## `common.ps1` — the source of truth
+
+`build/common.ps1` accepts a single positional arg. Pass `-f` to opt into the "full" set; omit it for "development mode" (which prints a yellow warning banner).
+
+### Default (development) solution set
+
+```powershell
+$solutionPaths = @(
+    "../framework",
+    "../modules/basic-theme",
+    "../modules/users",
+    "../modules/permission-management",
+    "../modules/setting-management",
+    "../modules/feature-management",
+    "../modules/identity",
+    "../modules/identityserver",
+    "../modules/openiddict",
+    "../modules/tenant-management",
+    "../modules/audit-logging",
+    "../modules/background-jobs",
+    "../modules/account",
+    "../modules/cms-kit",
+    "../modules/blob-storing-database"
+)
+```
+
+Fifteen solutions — every shipping framework + module pair you need to compile the core distribution. The day-to-day inner loop for a framework contributor lives here.
+
+### Full set (`-f`)
+
+When `$args[0]` equals `-f`, the script appends extras:
+
+```powershell
+$solutionPaths += (
+    "../modules/client-simulation",
+    "../modules/virtual-file-explorer",
+    "../modules/docs",
+    "../modules/blogging",
+    "../templates/module/aspnet-core",
+    "../templates/app/aspnet-core",
+    "../templates/console",
+    "../templates/app-nolayers/aspnet-core",
+    "../abp_io/AbpIoLocalization",
+    "../source-code"
+)
+if ($env:OS -eq "Windows_NT") {
+    $solutionPaths += "../templates/wpf"
+}
+```
+
+The Windows-only WPF template is gated on `$env:OS`. The `source-code` folder is the metadata-only NuGet projects that ship `*.SourceCode` packs (see [nuget-and-packaging](/ops/nuget-and-packaging)). `abp_io/AbpIoLocalization` is the localization satellite project for abp.io itself.
+
+| Condition | Solutions iterated |
+| --- | --- |
+| No arg | 15 (framework + 14 core modules) |
+| `-f` | 25 (above + templates + docs + blogging + ClientSimulation + VirtualFileExplorer + source-code + abp.io loc) |
+| `-f` on Windows | 26 (adds `templates/wpf`) |
+
+### Helpers used by other scripts
+
+`build/common.ps1` itself only defines `$rootFolder` and `$solutionPaths`. The richer helpers (`Write-Info`, `Seperator`, `Get-Current-Version`, `Get-Current-Branch`, `Read-File`, plus the longer `$solutions`/`$projects` lists) live in [`nupkg/common.ps1`](/ops/nuget-and-packaging) and are dot-sourced from the `deploy/` scripts. The two `common.ps1` files are **different** — keep that in mind when grepping.
+
+## `build-all.ps1` — debug build of everything
+
+```powershell
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+Write-Host $solutionPaths
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+Notes:
+
+- **Fail-fast.** The first failing `dotnet build` exits with `$LASTEXITCODE` and aborts the loop — CI never builds the remaining solutions if framework breaks.
+- **No configuration flag.** Default (Debug). Use `build-all-release.ps1` for Release output.
+- **No `--no-restore`.** Each solution restores against `Directory.Packages.props` (central package management) on every run.
+- **Pass-through of `-f`.** `.\build-all.ps1 -f` forwards `-f` into `common.ps1`, expanding to the 25-solution set.
+
+## `build-all-release.ps1` — release build of the full set
+
+```powershell
+. ".\common.ps1" -f
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build --configuration Release -- /maxcpucount
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+```
+
+Differences from `build-all.ps1`:
+
+| Aspect | `build-all.ps1` | `build-all-release.ps1` |
+| --- | --- | --- |
+| Solution set | Dev (or `-f`) | Always `-f` (hard-coded) |
+| Configuration | Default (Debug) | `--configuration Release` |
+| MSBuild parallelism | Default | `/maxcpucount` (one job per CPU) |
+| Used by | Local dev | `deploy/1-fetch-and-build.ps1` before `nuget pack` |
+
+The trailing `-- /maxcpucount` passes the flag through `dotnet build` to MSBuild (the `--` separator distinguishes it from `dotnet` CLI options).
+
+## `test-all.ps1` — `dotnet test` per solution
+
+```powershell
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"
+    if (-Not $?) {
+        Write-Host ("Test failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+```
+
+| Flag | Reason |
+| --- | --- |
+| `--no-build` | Assumes you ran `build-all.ps1` first (avoids rebuilding test projects) |
+| `--no-restore` | Same — restore already happened |
+| `--collect:"XPlat Code Coverage"` | Generates Cobertura XML next to each `*.Tests` csproj. `codecov.yml` at the repo root drives the upload step in CI |
+
+The coverage collector is `coverlet.collector` which is brought in transitively by ABP's `common.test.props`. Output appears in `**/TestResults/<guid>/coverage.cobertura.xml`.
+
+`test-all.ps1` runs xUnit (and Shouldly) via every `*.Tests.csproj` referenced by each solution. Test base classes come from `Volo.Abp.TestBase` and `Volo.Abp.AspNetCore.TestBase` — see [/ops/test-base](/ops/test-base).
+
+## Recipe: build the whole framework locally
+
+```bash
+# 1. Restore the pinned SDK
+cat global.json              # confirms 10.0.100 rollForward latestFeature
+
+# 2. (Optional) clean every bin/obj first
+pwsh delete-bin-obj.ps1
+
+# 3. Debug build of dev set (~15 minutes on a workstation)
+cd build
+pwsh build-all.ps1
+
+# 4. OR: full release build (what CI/release uses, ~30+ minutes)
+pwsh build-all-release.ps1
+
+# 5. Run every test suite with coverage
+pwsh test-all.ps1            # add -f to test the full template set too
+```
+
+If you only changed one module, `cd modules/<name> && dotnet build` is faster than the whole loop. The orchestration scripts are intentionally dumb so contributors can sidestep them.
+
+### Common failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `error NU1101: Unable to find package` | Missing `nuget.org` source (corporate proxy?) | Confirm `NuGet.Config` is in scope; see [nuget-and-packaging](/ops/nuget-and-packaging) |
+| `MSBUILD : error MSB1011: Specify which project or solution file to use` | More than one `*.sln*` in the folder | Pass an explicit `*.slnx` to `dotnet build` |
+| `error CS0006: Metadata file ... not found` mid-loop | Earlier solution failed silently because a prior PR added a project without updating its module's `.slnx` | Re-add the project to its `.slnx`; check `overview/solution-structure` |
+| `dotnet test` exits non-zero with no failing test | A `xunit.runner.json` overrides parallelism and one suite times out | Run that single project with `-v n` to surface the timeout |
+
+## What this page does *not* cover
+
+- The Visual Studio `*.slnx` / `*.abpmdl` schema → see [/overview/solution-structure](/overview/solution-structure)
+- Per-package NuGet packing → see [/ops/nuget-and-packaging](/ops/nuget-and-packaging)
+- The numbered release pipeline → see [/ops/deploy-scripts](/ops/deploy-scripts)
+- CLI commands (`abp new`, `abp install-libs`) → see [/cli/overview](/cli/overview)
+- Solution-template build/run flow → see [/templates/overview](/templates/overview)
+
+## Cross-links
+
+<CardGroup cols={2}>
+  <Card title="Build & Tooling overview" href="/overview/build-and-tooling" />
+  <Card title="NuGet packing & packaging" href="/ops/nuget-and-packaging" />
+  <Card title="Test base classes" href="/ops/test-base" />
+  <Card title="Deploy scripts" href="/ops/deploy-scripts" />
+  <Card title="CLI" href="/cli/overview" />
+  <Card title="Templates" href="/templates/overview" />
+</CardGroup>

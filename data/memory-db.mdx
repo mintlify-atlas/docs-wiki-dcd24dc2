@@ -1,0 +1,136 @@
+---
+title: "In-memory database (Volo.Abp.MemoryDb)"
+description: "An in-process IRepository<T> implementation used for tests, demos and quick prototyping — backed by serialised dictionaries."
+---
+
+`Volo.Abp.MemoryDb` is a fully in-process persistence provider with the same `IRepository<TEntity>` surface as EF Core and MongoDB. It is intended for **tests, demos and tutorials**. Production use is discouraged because every collection lives in a `Dictionary` in the singleton `MemoryDatabaseManager`.
+
+Source: `framework/src/Volo.Abp.MemoryDb/`. Constant: `AbpMemoryDbConsts.ProviderName = "Volo.Abp.MemoryDb"`.
+
+## Module — `AbpMemoryDbModule`
+
+File: `Volo/Abp/MemoryDb/AbpMemoryDbModule.cs`.
+
+```csharp
+[DependsOn(typeof(AbpDddDomainModule))]
+public class AbpMemoryDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.TryAddTransient(typeof(IMemoryDatabaseProvider<>), typeof(UnitOfWorkMemoryDatabaseProvider<>));
+        context.Services.TryAddTransient(typeof(IMemoryDatabaseCollection<>), typeof(MemoryDatabaseCollection<>));
+    }
+}
+```
+
+`UnitOfWorkMemoryDatabaseProvider<TMemoryDbContext>` lives under `Volo/Abp/Uow/MemoryDb/`. It hands every UoW the same `IMemoryDatabase` singleton (lookup via `MemoryDatabaseManager.Get(databaseName)`), so writes inside the UoW are immediately visible to subsequent reads in the same UoW — there is no "save changes" round-trip.
+
+## `MemoryDbContext`
+
+File: `Volo/Abp/MemoryDb/MemoryDbContext.cs`. You subclass it like an EF Core or Mongo context:
+
+```csharp
+[ConnectionStringName("Default")]
+public class MyMemoryDbContext : MemoryDbContext { }
+```
+
+It carries no schema metadata — collection lookup is purely by type.
+
+## `IMemoryDatabase`
+
+File: `Volo/Abp/Domain/Repositories/MemoryDb/IMemoryDatabase.cs`.
+
+```csharp
+public interface IMemoryDatabase
+{
+    IMemoryDatabaseCollection<TEntity> Collection<TEntity>() where TEntity : class, IEntity;
+    TKey GenerateNextId<TEntity, TKey>();
+}
+```
+
+The default implementation `MemoryDatabase` (`Volo/Abp/Domain/Repositories/MemoryDb/MemoryDatabase.cs`) keeps a `ConcurrentDictionary<Type, object>` of `IMemoryDatabaseCollection<T>` instances. `GenerateNextId<TEntity, TKey>()` defers to `InMemoryIdGenerator` which supports `int`, `long`, `Guid`, and `string` keys.
+
+## `IMemoryDatabaseCollection<TEntity>`
+
+File: `IMemoryDatabaseCollection.cs`.
+
+```csharp
+public interface IMemoryDatabaseCollection<TEntity> : IEnumerable<TEntity>
+{
+    void Add(TEntity entity);
+    void Update(TEntity entity);
+    void Remove(TEntity entity);
+}
+```
+
+`MemoryDatabaseCollection<TEntity>` (file `MemoryDatabaseCollection.cs`) backs this with a `Dictionary<TKey, TEntity>` and serialises every entity through `IMemoryDbSerializer` (default `Utf8JsonMemoryDbSerializer`, file `Utf8JsonMemoryDbSerializer.cs`) so updates are deep copies — preventing accidental aliasing between test arrange/assert phases.
+
+`Utf8JsonMemoryDbSerializerOptions` (`Utf8JsonMemoryDbSerializerOptions.cs`) lets you customise the `JsonSerializerOptions` used.
+
+## `MemoryDatabaseManager`
+
+File: `Volo/Abp/Domain/Repositories/MemoryDb/MemoryDatabaseManager.cs`.
+
+```csharp
+public class MemoryDatabaseManager : ISingletonDependency
+{
+    private readonly ConcurrentDictionary<string, IMemoryDatabase> _databases = new();
+    public IMemoryDatabase Get(string databaseName)
+        => _databases.GetOrAdd(databaseName, _ => _serviceProvider.GetRequiredService<IMemoryDatabase>());
+}
+```
+
+Singleton: same database survives between UoWs in the same process. For tests that need isolation, replace `MemoryDatabaseManager` per test, or use a separate `IServiceProvider`/`AbpApplication` per test class.
+
+## `MemoryDbRepository<TMemoryDbContext, TEntity[, TKey]>`
+
+File: `Volo/Abp/Domain/Repositories/MemoryDb/MemoryDbRepository.cs`. Implements `IMemoryDbRepository<TEntity>` (`IMemoryDbRepository.cs`) plus `IRepository<TEntity, TKey>` via `RepositoryBase`.
+
+Highlights:
+
+- Pulls services lazily via `IAbpLazyServiceProvider` (`LocalEventBus`, `DistributedEventBus`, `IEntityChangeEventHelper`, `IGuidGenerator`, `IAuditPropertySetter`).
+- `InsertAsync`:
+  - Calls `IAuditPropertySetter.SetCreationProperties(entity)`.
+  - If `IEntity<Guid>` and `Id == default`, assigns from `IGuidGenerator`.
+  - For non-`Guid` keys, calls `IMemoryDatabase.GenerateNextId<TEntity, TKey>()`.
+  - Publishes `EntityCreatedEvent` via the change-event helper.
+- `UpdateAsync` — calls `SetModificationProperties`, publishes `EntityUpdatedEvent`.
+- `DeleteAsync` — soft delete (`ISoftDelete.IsDeleted = true`) or actual remove.
+- `GetQueryable()` filters out `ISoftDelete.IsDeleted == true` rows when `IDataFilter<ISoftDelete>` is enabled and applies `IMultiTenant.TenantId == CurrentTenant.Id` when `IDataFilter<IMultiTenant>` is enabled — replicating EF Core's global filter semantics in LINQ-to-objects.
+
+`MemoryDbCoreRepositoryExtensions.cs` exposes shortcuts on the read-only repository.
+
+## `InMemoryIdGenerator`
+
+File: `InMemoryIdGenerator.cs`. Thread-safe sequence generator for `int`, `long`, `Guid` (sequential), `string` (GUID-to-string). Used by `MemoryDatabase.GenerateNextId`.
+
+## DI registration
+
+File: `Microsoft/Extensions/DependencyInjection/AbpMemoryDbServiceCollectionExtensions.cs`. Exposes `AddMemoryDbContext<TContext>(options)` mirroring EF Core's API:
+
+```csharp
+context.Services.AddMemoryDbContext<MyMemoryDbContext>(options =>
+{
+    options.AddDefaultRepositories(includeAllEntities: true);
+});
+```
+
+`AbpMemoryDbContextRegistrationOptions` (`Volo/Abp/MemoryDb/DependencyInjection/`) and `IAbpMemoryDbContextRegistrationOptionsBuilder` are the option-builder pair.
+
+## When to use it
+
+| Scenario | Verdict |
+| --- | --- |
+| Application-service integration tests | ✅ Fast and isolation-friendly with a per-test container. |
+| Sample / tutorial code without a real DB | ✅ Reduces friction. |
+| Local prototype | ⚠️ Acceptable but data evaporates on process exit. |
+| Production | ❌ Singleton dictionaries; no persistence, no consistency guarantees. |
+
+Use `Volo.Abp.EntityFrameworkCore.Sqlite` for tests that require relational behaviour (FK constraints, real SQL) — see `Sqlite/AbpUnitTestSqliteConnection.cs` for the helper that keeps a `:memory:` SQLite connection alive across a test.
+
+## Cross-references
+
+- `/data/unit-of-work` — `UnitOfWorkMemoryDatabaseProvider` adds a `MemoryDbDatabaseApi` to the active UoW.
+- `/data/data-filtering` — `MemoryDbRepository.GetQueryable()` consults `IDataFilter` just like EF Core does.
+- `/data/ef-core-providers` — `Sqlite` is usually a better choice when you need realistic SQL semantics in tests.
+- `/ddd/repositories` — `IRepository<TEntity>` contract.

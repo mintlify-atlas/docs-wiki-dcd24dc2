@@ -1,0 +1,261 @@
+---
+title: "Account UI: @abp/ng.account and @abp/ng.account.core"
+sidebarTitle: "Account"
+description: "Login, register, manage-profile, password reset, and the shared AuthWrapper/TenantBox primitives behind every ABP theme implementation."
+---
+
+`@abp/ng.account` ships the bundled login / register / forgot-password / reset-password / manage-profile UI. `@abp/ng.account.core` is the smaller companion that holds primitives every theme (Basic, Lepton, Lepton-X) reuses — `AuthWrapperService` and `TenantBoxService` — and the generated proxies for the `Volo.Abp.Account` and `Volo.Abp.Identity` Web HTTP APIs. This page walks the source tree under [`npm/ng-packs/packages/account/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/account) and [`packages/account-core/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/account-core).
+
+## Packages at a glance
+
+| NPM package | Source | Depends on |
+| --- | --- | --- |
+| `@abp/ng.account.core` | `packages/account-core` | `@abp/ng.core`, `@abp/ng.theme.shared` |
+| `@abp/ng.account` | `packages/account` | `@abp/ng.account.core`, `@abp/ng.theme.shared` |
+
+`account-core` is intentionally UI-free. It provides the data layer and primitive services so a theme can render its own login chrome without re-deriving the multi-tenant or "local login enabled" rules. `@abp/ng.account` and `@abp/ng.theme.basic` consume it; `@abp/ng.theme.lepton-x` does too.
+
+## Lazy-load route configuration
+
+The package exports `createRoutes(options)` and a backing `provideAccount(options)` provider function. Both live in `packages/account/src/lib/account.routes.ts`.
+
+```typescript
+// app.routes.ts (consumer)
+import { Routes } from '@angular/router';
+
+export const APP_ROUTES: Routes = [
+  {
+    path: 'account',
+    loadChildren: () =>
+      import('@abp/ng.account').then(m =>
+        m.createRoutes({
+          isPersonalSettingsChangedConfirmationActive: true,
+        }),
+      ),
+  },
+];
+```
+
+`createRoutes` produces the following route table (under your chosen `path`):
+
+| Path | Component slot | Guard | Title key |
+| --- | --- | --- | --- |
+| `''` → `login` | redirect | — | — |
+| `login` | `eAccountComponents.Login` → `LoginComponent` | `authenticationFlowGuard` | `AbpAccount::Login` |
+| `register` | `eAccountComponents.Register` → `RegisterComponent` | `authenticationFlowGuard` | `AbpAccount::Register` |
+| `forgot-password` | `eAccountComponents.ForgotPassword` → `ForgotPasswordComponent` | `authenticationFlowGuard` | `AbpAccount::ForgotPassword` |
+| `reset-password` | `eAccountComponents.ResetPassword` → `ResetPasswordComponent` | none (token-based) | `AbpAccount::ResetPassword` |
+| `manage` | `eAccountComponents.ManageProfile` → `ManageProfileComponent` | `authGuard` + `accountExtensionsResolver` | `AbpAccount::MyAccount` |
+
+The `reset-password` route additionally sets `data.tenantBoxVisible = false` so the layout hides the tenant-switcher box (the link was emailed and already encodes the tenant).
+
+<Note>
+Every route uses `ReplaceableRouteContainerComponent` (from `@abp/ng.core`). To swap the bundled `LoginComponent` for your own, register against `eAccountComponents.Login` — see [`angular/core#replaceable-components`](/angular/core#replaceable-components).
+</Note>
+
+### Configuration options
+
+`AccountConfigOptions` (from `models/config-options.ts`) supports:
+
+```typescript
+export interface AccountConfigOptions {
+  isPersonalSettingsChangedConfirmationActive?: boolean; // default true
+  editFormPropContributors?: AccountEditFormPropContributors;
+  redirectUrl?: string;
+}
+```
+
+`provideAccount` wires three DI tokens:
+
+| Token | Source |
+| --- | --- |
+| `ACCOUNT_CONFIG_OPTIONS` | The raw options object |
+| `'ACCOUNT_OPTIONS'` | Factory result of `accountConfigOptionsFactory(options)` (applies defaults) |
+| `RE_LOGIN_CONFIRMATION_TOKEN` | `options.isPersonalSettingsChangedConfirmationActive ?? true` |
+| `ACCOUNT_EDIT_FORM_PROP_CONTRIBUTORS` | The contributor map used by the extensible form on the manage-profile page |
+
+## Component inventory
+
+Under `packages/account/src/lib/components/`:
+
+| Folder | Component | Role |
+| --- | --- | --- |
+| `login` | `LoginComponent` | Username + password, multi-tenancy aware. Calls `AuthService.login(...)`. |
+| `register` | `RegisterComponent` | Self-registration if `Abp.Account.IsSelfRegistrationEnabled` setting is `true`. |
+| `forgot-password` | `ForgotPasswordComponent` | Triggers password-reset email through `ProfileService`. |
+| `reset-password` | `ResetPasswordComponent` | Consumes the `userId` + `resetToken` query params. |
+| `manage-profile` | `ManageProfileComponent` | Tabbed container hosting Personal Settings + Change Password. |
+| `personal-settings` | `PersonalSettingsComponent`, `PersonalSettingsHalfRowComponent` | Editable name, surname, email, phone, username; reactive form with `editFormPropContributors`. |
+| `change-password` | `ChangePasswordComponent` | Old + new + confirm password form. |
+
+Every component is `standalone` and listed in `components/index.ts`. Selectors follow the `abp-<name>` convention.
+
+## Services and resolvers
+
+| File | Symbol | Purpose |
+| --- | --- | --- |
+| `services/manage-profile.state.service.ts` | `ManageProfileStateService` | Holds the current profile DTO + tab state; injected at the route level. |
+| `resolvers/account-extensions.resolver.ts` | `accountExtensionsResolver` | Triggers `ExtensionsService.applyExtensions` for the manage-profile editable fields. |
+| `guards/authentication-flow.guard.ts` | `authenticationFlowGuard` | Redirects already-authenticated users away from `/account/login` etc. |
+| `guards/extensions.guard.ts` | `AccountExtensionsGuard` | Legacy class form of the resolver. |
+| `utils/factory-utils.ts` | `accountConfigOptionsFactory` | Merges defaults into `AccountConfigOptions`. |
+
+## `@abp/ng.account.core` primitives
+
+### `AuthWrapperService`
+
+`packages/account-core/src/lib/auth-wrapper.service.ts` exposes the reactive state every login layout needs:
+
+```typescript
+@Injectable()
+export class AuthWrapperService {
+  readonly multiTenancy = inject(MultiTenancyService);
+  private configState = inject(ConfigStateService);
+
+  isMultiTenancyEnabled$ = this.configState.getDeep$('multiTenancy.isEnabled');
+
+  get enableLocalLogin$(): Observable<boolean> {
+    return this.configState
+      .getSetting$('Abp.Account.EnableLocalLogin')
+      .pipe(map(value => value?.toLowerCase() !== 'false'));
+  }
+
+  tenantBoxKey = 'Account.TenantBoxComponent';
+}
+```
+
+A theme imports it, asks `isMultiTenancyEnabled$ | async` whether to show the tenant box, and `enableLocalLogin$` whether to render the username/password form (false in pure social-login deployments).
+
+### `TenantBoxService`
+
+`tenant-box.service.ts` handles the tenant switch flow:
+
+1. Subscribes to `SessionStateService.getTenant$`.
+2. Calls the generated `AbpTenantService.findTenantByName(name)` (proxy in `packages/core/src/lib/proxy/pages/abp/multi-tenancy/abp-tenant.service.ts`).
+3. On match, calls `SessionStateService.setTenant(tenant)` which writes the `__tenant` cookie.
+
+This is the same flow the legacy MVC tenant-box uses; see [`/multitenancy/tenant-resolution`](/multitenancy/tenant-resolution).
+
+### Generated proxies
+
+`packages/account-core/proxy/src/lib/proxy/` contains:
+
+```
+account/
+├── account.service.ts        # Volo.Abp.Account.AccountAppService (register, sendPasswordResetCode, reset…)
+├── profile.service.ts        # Volo.Abp.Account.ProfileAppService (get, update, changePassword)
+├── models.ts                 # RegisterDto, ResetPasswordDto, ProfileDto, ChangePasswordInput
+└── web/                      # Web-API specific endpoints (recaptcha, settings)
+identity/
+├── models.ts                 # IdentityUserDto subset reused by personal settings
+└── ...
+```
+
+These are produced by `nx g @abp/ng.schematics:proxy-add --module account --apiName AbpAccount`. See [`angular/schematics-and-generators`](/angular/schematics-and-generators).
+
+## Extension points
+
+The manage-profile / personal-settings form is extensible. Three contributors plug in:
+
+```typescript
+// app.config.ts
+import { provideAccount } from '@abp/ng.account';
+import {
+  ePropType,
+  ePersonalSettingsComponents,
+  EntityProp,
+  FormProp,
+} from '@abp/ng.components/extensible';
+
+const extendProfileForm = (propList: any) => {
+  propList.addAfter(
+    new FormProp({
+      type: ePropType.String,
+      name: 'jobTitle',
+      displayName: 'AbpAccount::JobTitle',
+    }),
+    'surname',
+    (a, b) => a.name === b,
+  );
+};
+
+providers: [
+  provideAccount({
+    editFormPropContributors: {
+      [ePersonalSettingsComponents.PersonalSettings]: [extendProfileForm],
+    },
+  }),
+],
+```
+
+The `editFormPropContributors` map is honoured by `accountExtensionsResolver` before the `PersonalSettingsComponent` renders.
+
+## Login flow end-to-end
+
+```mermaid
+graph TD
+  user[User submits credentials]
+  comp[LoginComponent.submit]
+  authsvc[AuthService.login]
+  strat[AuthFlowStrategy\n@abp/ng.oauth]
+  oidc[angular-oauth2-oidc\nOAuthService]
+  authority[Identity authority\nOpenIddict / IdentityServer]
+  tokens[Access + refresh tokens]
+  cookie[BrowserTokenStorageService\ndocument.cookie]
+  appcfg[ConfigStateService.refreshAppState]
+  redirect[Redirect to returnUrl]
+
+  user --> comp
+  comp --> authsvc
+  authsvc --> strat
+  strat --> oidc
+  oidc --> authority
+  authority --> tokens
+  tokens --> cookie
+  tokens --> appcfg
+  appcfg --> redirect
+```
+
+For the password grant the round trip is one HTTP call to `/connect/token`; for the code+PKCE flow `navigateToLogin(...)` opens the authority's login page and the strategy finalises the redirect on the way back via `oAuthService.tryLogin()`.
+
+## Replaceable component identifiers
+
+`packages/account/src/lib/enums/components.ts`:
+
+```typescript
+export enum eAccountComponents {
+  Login          = 'Account.LoginComponent',
+  Register       = 'Account.RegisterComponent',
+  ForgotPassword = 'Account.ForgotPasswordComponent',
+  ResetPassword  = 'Account.ResetPasswordComponent',
+  ManageProfile  = 'Account.ManageProfileComponent',
+}
+
+export enum ePersonalSettingsComponents {
+  PersonalSettings = 'Account.PersonalSettingsComponent',
+  ChangePassword   = 'Account.ChangePasswordComponent',
+}
+```
+
+Use the values with `ReplaceableComponentsService.add({ key, component })` to swap any page or tab.
+
+## Module class (legacy)
+
+`AccountModule.forChild(options)` (in `account.module.ts`) is the older `NgModule`-based form retained for non-standalone bootstrap. It registers the same providers as `provideAccount`. New code should prefer `createRoutes(options)` because it composes correctly with `loadChildren` and tree-shakes unused components.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Core: AuthService contract" href="/angular/core#guards-and-route-protection">
+    `LoginComponent` and `RegisterComponent` call the abstract `AuthService.login(...)`.
+  </Card>
+  <Card title="OAuth strategies" href="/angular/oauth">
+    `@abp/ng.oauth` is what actually performs the OIDC/password-grant on submit.
+  </Card>
+  <Card title="Account module backend" href="/modules/account">
+    Endpoints behind `account.service.ts` and `profile.service.ts`.
+  </Card>
+  <Card title="Tenant resolution" href="/multitenancy/tenant-resolution">
+    The `__tenant` cookie + header convention `TenantBoxService` uses.
+  </Card>
+</CardGroup>

@@ -1,0 +1,220 @@
+---
+title: "ASP.NET Core MVC — Newtonsoft.Json opt-in formatter"
+sidebarTitle: "MVC Newtonsoft"
+description: "Opt-in Volo.Abp.AspNetCore.Mvc.NewtonsoftJson package: when to use it, AbpAspNetCoreMvcNewtonsoftModule and the ABP camelCase resolver."
+---
+
+ABP defaults to `System.Text.Json` for MVC content negotiation (registered by `AbpJsonSystemTextJsonModule` via `mvcCoreBuilder.AddAbpJson()` inside `AbpAspNetCoreMvcModule`). The `framework/src/Volo.Abp.AspNetCore.Mvc.NewtonsoftJson/` package adds Newtonsoft.Json as an additional formatter for hosts that need its broader feature surface — typically because they integrate with libraries (OData, JsonPatch, OpenIddict legacy responses, third-party SDKs) that only understand `Newtonsoft.Json` semantics. When the module is added to the dependency list, ABP keeps `System.Text.Json` as the primary formatter and registers Newtonsoft alongside it with ABP-flavoured contract resolver and converters.
+
+## When to take a dependency on this module
+
+| Situation | Add `AbpAspNetCoreMvcNewtonsoftModule`? |
+| --- | --- |
+| Pure HTTP API with DTOs only | No — `System.Text.Json` covers it. |
+| Need `JsonPatchDocument<T>` | Yes — JSON Patch requires Newtonsoft. |
+| Integrating with `Microsoft.AspNetCore.OData` | Yes — OData v8/v9 use Newtonsoft for `EdmModel` formatters. |
+| Existing client expects `$type` polymorphic markers | Yes — Newtonsoft's `TypeNameHandling` differs from `System.Text.Json`. |
+| Modules using `JObject`/`JArray` in DTOs | Yes — `JObject` does not serialize cleanly through `System.Text.Json`. |
+| Server returns very large object graphs | Probably no — STJ is faster and uses less memory. |
+
+The module is **not** in any default solution template; you opt in by adding the NuGet reference and the `[DependsOn]` attribute.
+
+## Module definition
+
+`Volo/Abp/AspNetCore/Mvc/NewtonsoftJson/AbpAspNetCoreMvcNewtonsoftModule.cs`:
+
+```csharp
+[DependsOn(typeof(AbpJsonNewtonsoftModule), typeof(AbpAspNetCoreMvcModule))]
+public class AbpAspNetCoreMvcNewtonsoftModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMvcCore().AddNewtonsoftJson();
+
+        context.Services.AddAbpOptions<MvcNewtonsoftJsonOptions>()
+            .Configure<IServiceProvider>((options, rootServiceProvider) =>
+            {
+                options.SerializerSettings.ContractResolver =
+                    new AbpCamelCasePropertyNamesContractResolver(
+                        rootServiceProvider.GetRequiredService<AbpDateTimeConverter>());
+            });
+    }
+}
+```
+
+Three things to note:
+
+1. `[DependsOn(typeof(AbpJsonNewtonsoftModule), ...)]` — the framework-agnostic Newtonsoft module is the actual contributor of `IJsonSerializer` for `Newtonsoft`. The MVC module only wires the formatter into ASP.NET Core MVC.
+2. `AddMvcCore().AddNewtonsoftJson()` — adds the Newtonsoft formatter to MVC's `MvcOptions.InputFormatters` / `OutputFormatters`. It does **not** remove the existing `System.Text.Json` formatters; instead it joins them with lower priority. Content negotiation picks based on `Accept` headers.
+3. The configure block patches `MvcNewtonsoftJsonOptions.SerializerSettings.ContractResolver` to `AbpCamelCasePropertyNamesContractResolver`. This is what unifies the behaviour with `System.Text.Json`:
+   - camelCase property names
+   - special-cases collections so element types are preserved
+   - delegates `DateTime` serialisation to `AbpDateTimeConverter` (timezone-aware via `IClock`)
+
+## `AbpCamelCasePropertyNamesContractResolver`
+
+The class lives in `Volo.Abp.Json.Newtonsoft` (the framework-agnostic Newtonsoft module). It derives from `CamelCasePropertyNamesContractResolver` and:
+
+- Honours `[JsonProperty]` overrides explicitly placed by application code.
+- Skips `IObjectExtension` underlying dictionaries when configured to.
+- Plugs the supplied `AbpDateTimeConverter` so every `DateTime`/`DateTimeOffset` is normalised through `IClock` (UTC handling consistent with the rest of the framework).
+
+`AbpDateTimeConverter` itself reads `AbpClockOptions.Kind` (`Local`/`Utc`/`Unspecified`) and uses `IClock.Normalize(...)` to ensure round-tripped DateTimes match the clock kind chosen by the application.
+
+## Coexistence with System.Text.Json
+
+Because both formatters are registered, the `Accept` header decides:
+
+| Request `Accept` | Selected formatter |
+| --- | --- |
+| `application/json` | First registered — `System.Text.Json` (matches MVC's `JsonOptions`). |
+| `application/json; charset=utf-8` | Same. |
+| `application/*+json` (JSON Patch, JSON Problem) | Newtonsoft (it handles `*+json` patterns). |
+| `application/json-patch+json` | Newtonsoft, used by `JsonPatchDocument`. |
+
+For request bodies, MVC tries each `InputFormatter` until one accepts the payload's content type. The Newtonsoft formatter is the only one that can deserialise `JsonPatchDocument<T>`, so adding the module is the conventional way to enable JSON Patch endpoints.
+
+### Forcing Newtonsoft for a specific action
+
+```csharp
+[HttpPatch("{id}")]
+[Consumes("application/json-patch+json")]
+public Task UpdateAsync(Guid id, [FromBody] JsonPatchDocument<BookDto> patch) { ... }
+```
+
+The `Consumes` attribute forces the negotiation to `application/json-patch+json`, which only Newtonsoft handles.
+
+### Forcing System.Text.Json for all output
+
+If you want Newtonsoft only for input (e.g. JSON Patch) and keep STJ for output, remove the Newtonsoft output formatters in a post-configure:
+
+```csharp
+PostConfigure<MvcOptions>(options =>
+{
+    options.OutputFormatters.RemoveType<NewtonsoftJsonOutputFormatter>();
+});
+```
+
+## Interplay with the framework `IJsonSerializer`
+
+`Volo.Abp.Json` exposes `IJsonSerializer` as the canonical abstraction for service-layer JSON. With this module installed, `IJsonSerializer` is still resolved from `AbpJsonOptions.UseHybridSerializer` choice (default — try STJ first, fall back to Newtonsoft for `JObject` etc.). `AbpJsonSystemTextJsonModule` is still active; you usually do not need to change `IJsonSerializer` defaults when only MVC formatters need Newtonsoft.
+
+## Files in `Volo.Abp.Json.Newtonsoft` (framework dependency)
+
+The MVC formatter module pulls in `AbpJsonNewtonsoftModule` from `framework/src/Volo.Abp.Json.Newtonsoft/`. The most relevant types it contributes are:
+
+| Type | Role |
+| --- | --- |
+| `AbpJsonNewtonsoftModule` | Module entry; registers `IJsonSerializer` Newtonsoft variant. |
+| `AbpCamelCasePropertyNamesContractResolver` | Custom contract resolver used by `MvcNewtonsoftJsonOptions`. |
+| `AbpDateTimeConverter` | DateTime converter aware of `IClock`. |
+| `AbpDateTimeOffsetConverter` | `DateTimeOffset` variant. |
+| `AbpExtraPropertiesDictionaryJsonConverter` | Serialises object-extension extra properties. |
+| `NewtonsoftJsonSerializer` | `IJsonSerializer` implementation. |
+
+ABP's hybrid `IJsonSerializer` (registered by `AbpJsonModule`) picks the System.Text.Json or Newtonsoft implementation per call based on `AbpJsonOptions.UseHybridSerializer` and per-type opt-ins (e.g. `IObjectExtension` always goes through Newtonsoft because `JObject` does not survive STJ's strict mode).
+
+## Common pitfalls
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `JsonPatchDocument<T>` parameters always null | Newtonsoft module not referenced. | Add `[DependsOn(typeof(AbpAspNetCoreMvcNewtonsoftModule))]`. |
+| All DateTime values shifted by tenant TZ when they shouldn't be | The `AbpDateTimeConverter` is applied. | Set `AbpClockOptions.Kind = DateTimeKind.Utc` and ensure callers post `Z`-suffixed timestamps. |
+| Property names appear PascalCased in JSON | A custom `MvcNewtonsoftJsonOptions` override removed `AbpCamelCasePropertyNamesContractResolver`. | Restore the resolver via the same `AddAbpOptions<MvcNewtonsoftJsonOptions>` pattern. |
+| Object extension `ExtraProperties` keys missing from responses | Newtonsoft contract resolver skipping the dictionary. | Verify `AbpCamelCasePropertyNamesContractResolver` is current and `ExtraPropertyDictionaryConverts` are wired in `AbpHttpClientProxyingOptions`. |
+
+## End-to-end registration example
+
+```csharp
+// In MyAppHttpApiHostModule.cs
+
+[DependsOn(
+    typeof(MyAppApplicationModule),
+    typeof(MyAppEntityFrameworkCoreModule),
+    typeof(MyAppHttpApiModule),
+    typeof(AbpAspNetCoreMvcNewtonsoftModule),    // <-- add here
+    // ...other deps
+)]
+public class MyAppHttpApiHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        // No further setup needed — the module pre-configures the
+        // ContractResolver and registers Newtonsoft as an additional MVC formatter.
+    }
+}
+```
+
+After this single change:
+
+| Surface | Behaviour |
+| --- | --- |
+| `application/json` requests | Still handled by `System.Text.Json` (faster). |
+| `application/*+json` requests (`application/json-patch+json`, `application/problem+json`) | Newtonsoft picks them up. |
+| `JsonPatchDocument<T>` action parameters | Bind correctly. |
+| `JObject` / `JArray` properties in DTOs | Serialise/deserialise round-trip cleanly. |
+| Camel-case + ABP timezone handling | Preserved via `AbpCamelCasePropertyNamesContractResolver`. |
+
+## Inspecting which formatter handled a request
+
+For debugging negotiation issues, log the selected formatter through a custom `IActionFilter`:
+
+```csharp
+public class FormatterDiagnosticsFilter : IActionFilter
+{
+    public void OnActionExecuted(ActionExecutedContext context)
+    {
+        if (context.Result is ObjectResult objectResult)
+        {
+            var negotiator = context.HttpContext.RequestServices
+                .GetRequiredService<IOutputFormatterSelector>();
+            // Use the negotiator to determine which formatter was selected,
+            // then add it to the response headers for inspection.
+        }
+    }
+    public void OnActionExecuting(ActionExecutingContext context) { }
+}
+```
+
+In practice the Newtonsoft formatter exposes a `SupportedMediaTypes` collection — by default `application/json`, `text/json`, `application/*+json`. The order in `MvcOptions.OutputFormatters` decides ties.
+
+## Coexistence with FluentValidation, JsonPatch and OData
+
+| Library | Why Newtonsoft is needed | Notes |
+| --- | --- | --- |
+| `Microsoft.AspNetCore.JsonPatch` | The `JsonPatchDocument<T>` model binder requires `Newtonsoft.Json` types internally. | Adding `AbpAspNetCoreMvcNewtonsoftModule` is the canonical fix. |
+| `Microsoft.AspNetCore.OData` (8.x, 9.x) | OData uses Newtonsoft for `EdmModel`'s JSON output formatters. | Add this module before adding OData services. |
+| `FluentValidation.AspNetCore` (legacy) | Hooks into MVC's model validation; no direct Newtonsoft requirement. | Module-agnostic. |
+| `Microsoft.AspNetCore.Mvc.Versioning` reading bodies | Versioned API description endpoints round-trip via STJ. | Works without this module. |
+
+## Disabling the module per environment
+
+For environments where you want to keep the module reference but avoid the Newtonsoft formatter (e.g. memory-constrained edge nodes), post-configure `MvcOptions`:
+
+```csharp
+PostConfigure<MvcOptions>(options =>
+{
+    if (!IsJsonPatchUsed()) // your own predicate
+    {
+        options.InputFormatters.RemoveType<NewtonsoftJsonPatchInputFormatter>();
+        options.OutputFormatters.RemoveType<NewtonsoftJsonOutputFormatter>();
+    }
+});
+```
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="MVC integration" href="/aspnetcore/mvc-integration">
+    Where the default `System.Text.Json` formatter is registered.
+  </Card>
+  <Card title="Serialization & JSON" href="/crosscut/serialization-and-json">
+    `IJsonSerializer`, `AbpJsonOptions`, hybrid serializer.
+  </Card>
+  <Card title="Timing" href="/crosscut/timing">
+    `IClock` semantics relied on by `AbpDateTimeConverter`.
+  </Card>
+  <Card title="Object extending" href="/ddd/object-extending">
+    Extra-property serialisation via Newtonsoft.
+  </Card>
+</CardGroup>

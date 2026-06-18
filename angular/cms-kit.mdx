@@ -1,0 +1,252 @@
+---
+title: "CMS Kit UI: Admin and Public Angular Packages"
+sidebarTitle: "CMS Kit"
+description: "Inside @abp/ng.cms-kit: admin pages for blogs, pages, comments, tags, menus, the editors, and proxies under volo/cms-kit/admin."
+---
+
+`@abp/ng.cms-kit` is the Angular UI for the [CMS Kit module](/modules/cms-kit). It is structured as three secondary entry points — `/admin` (the back-office UI), `/public` (a small placeholder for public-facing fragments), and the umbrella `@abp/ng.cms-kit` (shared utilities, the `ToastUI Editor` and `CodeMirror` editor wrappers). Sources: [`npm/ng-packs/packages/cms-kit/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/cms-kit).
+
+## Package layout
+
+```
+packages/cms-kit/
+├── package.json           # @abp/ng.cms-kit
+├── src/                   # umbrella entry point
+│   ├── components/
+│   │   ├── toast-ui/toastui-editor.component.ts
+│   │   └── code-mirror-editor/code-mirror-editor.component.ts
+│   └── utils/
+├── admin/                 # @abp/ng.cms-kit/admin
+│   └── src/
+│       ├── cms-kit-admin.routes.ts
+│       ├── components/    # blog-posts/, blogs/, cms-settings/, comments/,
+│       │                  # global-resources/, menus/, pages/, tags/
+│       ├── defaults/
+│       ├── enums/
+│       ├── models/
+│       ├── resolvers/
+│       ├── services/
+│       └── tokens/
+├── public/                # @abp/ng.cms-kit/public (placeholder routes today)
+└── proxy/                 # @abp/ng.cms-kit/proxy
+```
+
+| NPM entry point | Purpose |
+| --- | --- |
+| `@abp/ng.cms-kit` | Editor wrappers + shared utilities |
+| `@abp/ng.cms-kit/admin` | Back-office routes + components |
+| `@abp/ng.cms-kit/public` | Public-page wrapper (consumer code adds routes here) |
+| `@abp/ng.cms-kit/proxy` | Generated services |
+
+Runtime dependencies include `@toast-ui/editor` ^3 and `codemirror` ^6 — the umbrella package wraps them as Angular components.
+
+## Lazy-load configuration
+
+```typescript
+// app.routes.ts
+{
+  path: 'cms-kit',
+  loadChildren: () =>
+    import('@abp/ng.cms-kit/admin').then(m => m.createRoutes()),
+},
+{
+  path: 'cms',
+  loadChildren: () =>
+    import('@abp/ng.cms-kit/public').then(m => m.createRoutes()),
+},
+```
+
+## Admin routes
+
+`packages/cms-kit/admin/src/cms-kit-admin.routes.ts` builds the table below. Every route is `[authGuard, permissionGuard]`-protected, wrapped by `ReplaceableRouteContainerComponent`, and resolved by `cmsKitAdminExtensionsResolver`.
+
+| Path | Required policy | Default component | Replaceable key |
+| --- | --- | --- | --- |
+| `comments` | `CmsKit.Comments` | `CommentListComponent` | `eCmsKitAdminComponents.CommentList` |
+| `comments/:id` | `CmsKit.Comments` | `CommentDetailsComponent` | `eCmsKitAdminComponents.CommentDetails` |
+| `tags` | `CmsKit.Tags` | `TagListComponent` | `eCmsKitAdminComponents.Tags` |
+| `pages` | `CmsKit.Pages` | `PageListComponent` | `eCmsKitAdminComponents.Pages` |
+| `pages/create` | `CmsKit.Pages.Create` | `PageFormComponent` | `eCmsKitAdminComponents.PageForm` |
+| `pages/update/:id` | `CmsKit.Pages.Update` | `PageFormComponent` | `eCmsKitAdminComponents.PageForm` |
+| `blogs` | `CmsKit.Blogs` | `BlogListComponent` | `eCmsKitAdminComponents.Blogs` |
+| `blog-posts` | `CmsKit.BlogPosts` | `BlogPostListComponent` | `eCmsKitAdminComponents.BlogPosts` |
+| `blog-posts/create` | `CmsKit.BlogPosts.Create` | `BlogPostFormComponent` | `eCmsKitAdminComponents.BlogPostForm` |
+| `blog-posts/update/:id` | `CmsKit.BlogPosts.Update` | `BlogPostFormComponent` | `eCmsKitAdminComponents.BlogPostForm` |
+| `menus` | `CmsKit.Menus` | `MenuItemListComponent` | `eCmsKitAdminComponents.Menus` |
+| `global-resources` | (settings policy) | `GlobalResourcesComponent` | `eCmsKitAdminComponents.GlobalResources` |
+
+`enums/components.ts`:
+
+```typescript
+export enum eCmsKitAdminComponents {
+  CommentList     = 'CmsKit.Admin.CommentList',
+  CommentDetails  = 'CmsKit.Admin.CommentDetails',
+  Tags            = 'CmsKit.Admin.Tags',
+  Pages           = 'CmsKit.Admin.Pages',
+  PageForm        = 'CmsKit.Admin.PageForm',
+  Blogs           = 'CmsKit.Admin.Blogs',
+  BlogPosts       = 'CmsKit.Admin.BlogPosts',
+  BlogPostForm    = 'CmsKit.Admin.BlogPostForm',
+  Menus           = 'CmsKit.Admin.Menus',
+  GlobalResources = 'CmsKit.Admin.GlobalResources',
+}
+```
+
+## Component inventory
+
+Under `packages/cms-kit/admin/src/components/`:
+
+| Folder | Components |
+| --- | --- |
+| `blog-posts` | `BlogPostListComponent`, `BlogPostFormComponent` (rich editor + tag picker) |
+| `blogs` | `BlogListComponent`, `BlogFormComponent`, blog-feature toggle integration |
+| `cms-settings` | Settings sub-page hosting reaction / comment / global-feature toggles |
+| `comments` | `CommentListComponent`, `CommentDetailsComponent`, reply form |
+| `global-resources` | `GlobalResourcesComponent` (`<style>` + `<script>` editor backed by CodeMirror) |
+| `menus` | `MenuItemListComponent`, `MenuItemFormComponent`, public-layout switcher |
+| `pages` | `PageListComponent`, `PageFormComponent` (slug + ToastUI markdown body) |
+| `tags` | `TagListComponent`, `TagFormComponent` |
+
+### Editor wrappers (`@abp/ng.cms-kit` umbrella)
+
+| Component | File | Role |
+| --- | --- | --- |
+| `ToastUiEditorComponent` | `src/components/toast-ui/toastui-editor.component.ts` | Wraps `@toast-ui/editor` for markdown + rich-text editing |
+| `CodeMirrorEditorComponent` | `src/components/code-mirror-editor/code-mirror-editor.component.ts` | Wraps CodeMirror 6 for syntax-highlighted code blocks (CSS, JS, HTML in Global Resources) |
+
+Both are `standalone` and lazy-import their heavy peers so they do not block initial bundles.
+
+## Services
+
+`packages/cms-kit/admin/src/services/`:
+
+| Service | Purpose |
+| --- | --- |
+| `BlogPostFormService` | Wraps the create/update form state, tag autocomplete, slug validation |
+| `PageFormService` | Same pattern for the Pages form |
+| `CommentEntityService` | Resolves the entity a comment belongs to (so the detail page can link back) |
+
+## Generated proxies
+
+`packages/cms-kit/proxy/src/lib/proxy/volo/cms-kit/admin/`:
+
+| File | Service | Backed by |
+| --- | --- | --- |
+| `blogs/blog-admin.service.ts` | `BlogAdminService` | `IBlogAdminAppService` |
+| `blogs/blog-feature-admin.service.ts` | `BlogFeatureAdminService` | `IBlogFeatureAdminAppService` |
+| `blogs/blog-post-admin.service.ts` | `BlogPostAdminService` | `IBlogPostAdminAppService` |
+| `comments/comment-admin.service.ts` | `CommentAdminService` | `ICommentAdminAppService` |
+| `global-resources/global-resource-admin.service.ts` | `GlobalResourceAdminService` | `IGlobalResourceAdminAppService` |
+| `media-descriptors/media-descriptor-admin.service.ts` | `MediaDescriptorAdminService` | `IMediaDescriptorAdminAppService` |
+| `menus/menu-item-admin.service.ts` | `MenuItemAdminService` | `IMenuItemAdminAppService` |
+| `pages/page-admin.service.ts` | `PageAdminService` | `IPageAdminAppService` |
+| `tags/tag-admin.service.ts` | `TagAdminService` | `ITagAdminAppService` |
+| `tags/entity-tag-admin.service.ts` | `EntityTagAdminService` | `IEntityTagAdminAppService` |
+
+`apiName = 'CmsKit'` for the umbrella endpoints; the admin module uses the same name. Routes are `/api/cms-kit-admin/...`.
+
+## Configuration options
+
+`CmsKitAdminConfigOptions` (`admin/src/models/config-options.ts`) supports the standard five contributor maps:
+
+```typescript
+{
+  entityActionContributors?, toolbarActionContributors?,
+  entityPropContributors?,
+  createFormPropContributors?, editFormPropContributors?,
+}
+```
+
+`createRoutes(config)` wires them into the tokens declared in `tokens/extensions.token.ts`:
+
+- `CMS_KIT_ADMIN_ENTITY_ACTION_CONTRIBUTORS`
+- `CMS_KIT_ADMIN_TOOLBAR_ACTION_CONTRIBUTORS`
+- `CMS_KIT_ADMIN_ENTITY_PROP_CONTRIBUTORS`
+- `CMS_KIT_ADMIN_CREATE_FORM_PROP_CONTRIBUTORS`
+- `CMS_KIT_ADMIN_EDIT_FORM_PROP_CONTRIBUTORS`
+
+`cmsKitAdminExtensionsResolver` applies them before each child route activates.
+
+## Public entry point
+
+`packages/cms-kit/public/src/lib/cms-kit-public.routes.ts` is currently a scaffold:
+
+```typescript
+export function createRoutes(config: CmsKitPublicConfigOptions = {}): Routes {
+  return [
+    {
+      path: '',
+      component: RouterOutletComponent,
+      providers: provideCmsKitPublicContributors(config),
+      children: [ /* Routes will be added here */ ],
+    },
+  ];
+}
+```
+
+Public-facing blog/page renderers are normally implemented by the host application, but the wrapper + the proxies under `proxy/src/lib/proxy/volo/cms-kit/` (non-admin variants) are available for that purpose.
+
+## Form services
+
+The Pages and Blog Posts forms are reactive forms with a non-trivial number of fields (slug, title, content, status, tags, layout, blog selection). The package isolates that complexity in dedicated form-state services:
+
+| Service | File | Role |
+| --- | --- | --- |
+| `PageFormService` | `admin/src/services/page-form.service.ts` | Holds the create/update form group, slug uniqueness validator, content sanitiser, and toggles between markdown / HTML editing modes |
+| `BlogPostFormService` | `admin/src/services/blog-post-form.service.ts` | Same for blog posts plus tag autocomplete and blog picker |
+| `CommentEntityService` | `admin/src/services/comment-entity.service.ts` | Resolves the entity a comment belongs to so the detail view can deep-link back into the source page or blog post |
+
+Each service is provided at the form-component level (not `root`), so navigating away discards the in-progress state without leaking.
+
+## Settings
+
+The `cms-settings/` folder hosts a settings sub-page that contributes to `SettingTabsService` from `@abp/ng.setting-management/config`. It groups:
+
+- *Comments* (max nesting depth, anonymous comments)
+- *Reactions* (allowed reaction types)
+- *Global features* (toggle whole sub-features such as Reactions and Comments at deployment level)
+
+The tab is registered through the same provider pattern documented in [`angular/setting-management#settingtabsservice`](/angular/setting-management#settingtabsservice).
+
+## Editor wiring
+
+`PageFormComponent` and `BlogPostFormComponent` both compose the editor:
+
+```html
+<abp-toastui-editor
+  [(ngModel)]="content"
+  [previewStyle]="'vertical'"
+  [height]="'500px'"
+  [initialEditType]="'markdown'"
+  [usageStatistics]="false">
+</abp-toastui-editor>
+```
+
+`GlobalResourcesComponent` instead uses CodeMirror for the CSS and JS panels:
+
+```html
+<abp-code-mirror-editor
+  [(ngModel)]="css"
+  [language]="'css'"
+  [theme]="'dark'">
+</abp-code-mirror-editor>
+```
+
+Both wrappers lazy-load their underlying libraries (`@toast-ui/editor` and `codemirror`) via dynamic `import()`, so the initial bundle does not pay the editor cost.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="CMS Kit module" href="/modules/cms-kit">
+    Backend domain + application services.
+  </Card>
+  <Card title="Extensible primitives" href="/angular/components">
+    Tables and forms used by every admin list / edit page.
+  </Card>
+  <Card title="Proxy generation" href="/angular/schematics-and-generators">
+    `proxy-add` / `generate-proxy` for the `apiName: CmsKit` endpoints.
+  </Card>
+  <Card title="Theme shared" href="/angular/theme-basic-shared">
+    Modal, confirmation, toast services used by the admin UI.
+  </Card>
+</CardGroup>

@@ -1,0 +1,72 @@
+---
+title: "FluentValidation integration (Volo.Abp.FluentValidation)"
+description: "Bridges FluentValidation IValidator<T> implementations into the ABP IObjectValidator pipeline via a contributor and a conventional registrar."
+---
+
+`Volo.Abp.FluentValidation` plugs [FluentValidation](https://docs.fluentvalidation.net) into the same `IObjectValidator` pipeline used by `Volo.Abp.Validation`. Reference the package, declare your validators as `AbstractValidator<TDto>` next to the DTOs, and the framework discovers and runs them automatically on every application-service call.
+
+Source: `framework/src/Volo.Abp.FluentValidation/Volo/Abp/FluentValidation/`.
+
+## Module
+
+`AbpFluentValidationModule` depends on `AbpValidationModule`. In `PreConfigureServices` it appends `AbpFluentValidationConventionalRegistrar` to `IServiceCollection`'s conventional registrar chain. It does not configure any options.
+
+## File-by-file
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpFluentValidationModule.cs` | module | Adds the conventional registrar. |
+| `AbpFluentValidationConventionalRegistrar.cs` | `DefaultConventionalRegistrar` subclass | Decides which types get registered and as which services. Disabled for any type that doesn't implement an `IValidator<>`; sets `ServiceLifetime.Transient`; exposes the type *and* `IValidator<TDto>` where `TDto` is the first generic argument of the closed `AbstractValidator<TDto>`. |
+| `FluentObjectValidationContributor.cs` | `IObjectValidationContributor, ITransientDependency` | The bridge. Resolves `IValidator<TActualType>` from DI for `context.ValidatingObject.GetType()`, runs it asynchronously, converts each `FluentValidation.Results.ValidationFailure` to a `System.ComponentModel.DataAnnotations.ValidationResult` (`error.ErrorMessage` + `new[] { error.PropertyName }`), and appends them to `context.Errors`. If no `IValidator` is registered for the runtime type, the contributor is a no-op. |
+
+## How the registrar exposes validators
+
+`AbpFluentValidationConventionalRegistrar` overrides three methods of `DefaultConventionalRegistrar`:
+
+- `IsConventionalRegistrationDisabled(type)` — returns `true` unless `type` implements any closed `IValidator<>`. This means non-validator types fall through to the *other* registrars (e.g. the default convention) and are not double-registered.
+- `GetDefaultLifeTimeOrNull(type)` — always returns `Transient`.
+- `GetExposedServiceTypes(type)` — returns the concrete type *and* `IValidator<TDto>` where `TDto` is the first generic argument found by recursively unwrapping base classes up to 8 levels deep (so `MyDtoValidator : AbstractValidator<MyDto>` is exposed as both `MyDtoValidator` and `IValidator<MyDto>`).
+
+Because every conventional registrar runs as part of `AbpApplicationFactory.BuildModuleAsync` → `IServiceCollection.AddAssembly`, validators are discovered as soon as you call `services.AddAssemblyOf<MyDto>()` (or any of the standard auto-registration entry points). You do not need a separate `services.AddValidatorsFromAssembly(...)` call.
+
+## How the contributor plugs in
+
+`AbpValidationModule.PreConfigureServices` auto-collects every implementation of `IObjectValidationContributor` registered in DI. Because `FluentObjectValidationContributor` is `ITransientDependency`, it is added to `AbpValidationOptions.ObjectValidationContributors` automatically — *after* `DataAnnotationObjectValidationContributor`. So a DTO with both `[Required]` attributes and a FluentValidation rule set has *both* sets of errors collected into a single `AbpValidationException`.
+
+## Authoring validators
+
+```csharp
+public class CreateBookDtoValidator : AbstractValidator<CreateBookDto>
+{
+    public CreateBookDtoValidator()
+    {
+        RuleFor(x => x.Name)
+            .NotEmpty()
+            .MaximumLength(BookConsts.MaxNameLength);
+
+        RuleFor(x => x.Price)
+            .GreaterThan(0);
+    }
+}
+```
+
+No registration code is required. Drop the validator anywhere in an assembly that participates in conventional registration (typically `.Application.Contracts` or `.Application`) and the next application-service call that takes a `CreateBookDto` parameter will trigger it.
+
+## Validation flow with FluentValidation enabled
+
+1. `ValidationInterceptor` resolves `IMethodInvocationValidator` and runs the pipeline (see `/crosscut/validation`).
+2. `MethodInvocationValidator` calls `IObjectValidator.GetErrorsAsync(dto, paramName, allowNulls)`.
+3. `ObjectValidator` opens a scope and runs every `IObjectValidationContributor` in `AbpValidationOptions.ObjectValidationContributors`:
+   - `DataAnnotationObjectValidationContributor` — DataAnnotations + `IValidatableObject`.
+   - `FluentObjectValidationContributor` — looks up `IValidator<RuntimeType>` and runs it.
+4. Errors are merged into one `AbpValidationException`.
+
+## Calling validators directly
+
+You can also resolve `IValidator<TDto>` and call it yourself for ad-hoc validation; the registrar exposes it the same way. The contributor is only invoked for objects passed through `IObjectValidator`, so manual `Validate(...)` calls and the pipeline don't double-fire when you only validate one way.
+
+## Related
+
+- `/crosscut/validation` — the host pipeline this module plugs into.
+- `/core/dependency-injection` — `DefaultConventionalRegistrar` and the `IsConventionalRegistrationDisabled` extension points.
+- `/ddd/application-services` — `ApplicationService` implements `IValidationEnabled`, which is what causes the interceptor to fire.

@@ -1,0 +1,172 @@
+---
+title: "Localization (Volo.Abp.Localization)"
+description: "Dictionary-backed IStringLocalizer over LocalizationResource, JSON virtual files, inherited resources, base-culture fallback, and the external/dynamic resource store."
+---
+
+`Volo.Abp.Localization` replaces ASP.NET Core's `ResourceManagerStringLocalizerFactory` with a dictionary-based `AbpStringLocalizerFactory` that resolves strings from `LocalizationResource`s. Each resource is a *class* (a marker type) plus one or more `ILocalizationResourceContributor`s that load JSON files out of the virtual file system. Resources can inherit from one another, fall back along culture chains (`tr-TR → tr → en`), and be extended at runtime via `IExternalLocalizationStore`.
+
+Source: `framework/src/Volo.Abp.Localization/Volo/Abp/Localization/` and `framework/src/Volo.Abp.Localization.Abstractions/Volo/Abp/Localization/`.
+
+## Modules
+
+`AbpLocalizationAbstractionsModule` (in `Volo.Abp.Localization.Abstractions`) ships only the `ILocalizableString` family, `LocalizableString`, `FixedLocalizableString`, `IAsyncLocalizableString`, `LocalizationResourceNameAttribute`, `IAbpStringLocalizerFactory` (the async extension over `IStringLocalizerFactory`), and `LocalizableStringExtensions`. Domain-shared and contracts projects depend on this so they can carry localizable strings without needing the resource pipeline.
+
+`AbpLocalizationModule` depends on `AbpVirtualFileSystemModule`, `AbpSettingsModule`, `AbpLocalizationAbstractionsModule`, `AbpThreadingModule`. In `ConfigureServices` it:
+
+1. Replaces `IStringLocalizerFactory` with `AbpStringLocalizerFactory` (via `AbpStringLocalizerFactory.Replace(services)`).
+2. Embeds its own assembly into `AbpVirtualFileSystemOptions.FileSets`.
+3. Configures `AbpLocalizationOptions.Resources` to include the framework's own `DefaultResource` and `AbpLocalizationResource` with `AddVirtualJson("/Localization/Resources/AbpLocalization")`.
+
+## `AbpLocalizationOptions`
+
+| Property | Type | Role |
+| --- | --- | --- |
+| `Resources` | `LocalizationResourceDictionary` | The catalog of `LocalizationResource`s keyed by name. Mutated via `Add<TResource>(defaultCulture)` and chained with `.AddVirtualJson(path)` / `.AddBaseTypes(...)`. |
+| `DefaultResourceType` | `Type?` | When `LocalizableString` has no specific resource attached, this is used. Falls back to `DefaultResource` when null. |
+| `GlobalContributors` | `ITypeList<ILocalizationResourceContributor>` | Contributors attached to *every* resource (e.g. dynamic translations). Added when each resource's `AbpDictionaryBasedStringLocalizer` is constructed. |
+| `Languages` | `List<LanguageInfo>` | The languages the host advertises (`CultureName`, `UiCultureName`, `DisplayName`, `TwoLetterISOLanguageName`). Drives `DefaultLanguageProvider`. |
+| `LanguagesMap`, `LanguageFilesMap` | `Dictionary<string, List<NameValue>>` | Per-module culture → physical-file name mapping. Used by the localization-key synchronizer / dictionary builders. |
+| `TryToGetFromBaseCulture` | `bool` (default `true`) | If `tr-TR` is missing a key, try `tr`. |
+| `TryToGetFromDefaultCulture` | `bool` (default `true`) | If `tr` is still missing, try the resource's `DefaultCultureName`. |
+
+## Defining a resource
+
+```csharp
+[LocalizationResourceName("MyApp")]
+public class MyAppResource
+{
+}
+```
+
+Register it once in your module's `ConfigureServices`:
+
+```csharp
+Configure<AbpLocalizationOptions>(options =>
+{
+    options.Resources
+        .Add<MyAppResource>("en")
+        .AddVirtualJson("/Localization/MyApp")
+        .AddBaseTypes(typeof(AbpUiResource));   // inherit translations
+});
+
+Configure<AbpVirtualFileSystemOptions>(options =>
+{
+    options.FileSets.AddEmbedded<MyAppModule>();
+});
+```
+
+Place JSON files under `Localization/MyApp/en.json`, `tr.json`, … and embed them. Each file looks like:
+
+```json
+{
+  "culture": "en",
+  "texts": {
+    "Welcome": "Welcome to MyApp",
+    "Greeting": "Hello, {0}!"
+  }
+}
+```
+
+`JsonLocalizationFile` has only two fields — `Culture` (string) and `Texts` (dictionary). `JsonLocalizationDictionaryBuilder.BuildFromJsonString` flattens nested objects/arrays into `Parent__Child__0` keys using the `__` separator. Duplicates throw `AbpException`.
+
+## Using strings in code
+
+The factory is just `IStringLocalizerFactory` — inject `IStringLocalizer<MyAppResource>` directly:
+
+```csharp
+public class HelloService : ITransientDependency
+{
+    private readonly IStringLocalizer<MyAppResource> _l;
+    public HelloService(IStringLocalizer<MyAppResource> l) => _l = l;
+
+    public string Greet(string name) => _l["Greeting", name];
+}
+```
+
+For abstractions and domain-shared code that can't depend on `IStringLocalizer` directly, use `LocalizableString`:
+
+```csharp
+var s = LocalizableString.Create<MyAppResource>("Welcome");
+// later, in a service that has IStringLocalizerFactory:
+var localized = s.Localize(stringLocalizerFactory);     // sync
+var localized2 = await s.LocalizeAsync(stringLocalizerFactory); // async — needed for dynamic/external stores
+```
+
+`LocalizableString` stores `ResourceType?` and/or `ResourceName?` plus the `Name` key. If both lookups miss, it falls back to `IStringLocalizerFactory.CreateDefaultOrNull()` (i.e. `AbpLocalizationOptions.DefaultResourceType`). `FixedLocalizableString(string value)` is the constant-string escape hatch — it returns its own value unchanged.
+
+## File-by-file enumeration
+
+### `Volo.Abp.Localization.Abstractions`
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpLocalizationAbstractionsModule.cs` | module | dependency marker. |
+| `ILocalizableString.cs` / `LocalizableString.cs` / `FixedLocalizableString.cs` | DTO + helpers | As described above. |
+| `IAsyncLocalizableString.cs` | async variant | `Task<LocalizedString> LocalizeAsync(factory)`. |
+| `LocalizableStringExtensions.cs` | extensions | `Localize(factory)` / `LocalizeAsync(factory)` convenience. |
+| `LocalizationResourceNameAttribute.cs` | attribute | Sets the resource's wire name. `GetName(type)` returns the attribute value or `type.FullName`. |
+| `IHasNameWithLocalizableDisplayName.cs` / `HasNameWithLocalizableDisplayNameExtensions.cs` | convention | For enum-like definitions that carry an `ILocalizableString DisplayName`. |
+| `Microsoft.Extensions.Localization/IAbpStringLocalizerFactory.cs` | factory extension | Adds `CreateByResourceNameOrNull(string)`, `CreateByResourceNameOrNullAsync`, `CreateDefaultOrNull()`. |
+| `Microsoft.Extensions.Localization/AbpStringLocalizerFactoryExtensions.cs` | extensions | Convenience overloads on `IStringLocalizerFactory`. |
+
+### `Volo.Abp.Localization`
+
+| File | Type | Role |
+| --- | --- | --- |
+| `AbpLocalizationModule.cs` | module | See above. |
+| `AbpLocalizationOptions.cs` | options | See table above. |
+| `AbpStringLocalizerFactory.cs` | `IStringLocalizerFactory, IAbpStringLocalizerFactory` | Caches one `AbpDictionaryBasedStringLocalizer` per resource. Looks up the resource from `AbpLocalizationOptions.Resources` first, then `IExternalLocalizationStore.GetResourceOrNullAsync`. Initialization runs every contributor once (`Initialize(LocalizationResourceInitializationContext)`), with a `SemaphoreSlim` to guard concurrent first-touches. |
+| `AbpDictionaryBasedStringLocalizer.cs` | `IAbpStringLocalizer` | Implements `IStringLocalizer` by walking the contributor list. Per-name lookup tries the requested culture, then base culture (`tr-TR → tr`) if `TryToGetFromBaseCulture`, then `Resource.DefaultCultureName` if `TryToGetFromDefaultCulture`, then `BaseLocalizers` (inherited resources), finally falls back to a `LocalizedString(name, name, resourceNotFound: true)`. `GetAllStrings` merges in priority: inherited resources first, then default culture, then base culture, then current culture overwrites — guarantees the most specific value wins. The inner `CultureWrapperStringLocalizer` lets `WithCulture(...)` produce per-culture proxies. |
+| `LocalizationResource.cs` | `LocalizationResource : LocalizationResourceBase` | Marker-type resource. Constructor also reads `IInheritedResourceTypesProvider` attributes (`[InheritResource(typeof(AbpUiResource))]`) and adds their names to `BaseResourceNames`. |
+| `LocalizationResourceBase.cs` | base | `ResourceName`, `BaseResourceNames`, `DefaultCultureName`, `Contributors`. |
+| `NonTypedLocalizationResource.cs` | resource | Resource without a marker type — used by dynamic store / module-level resources keyed by string. |
+| `DefaultResource.cs` | `[LocalizationResourceName("Default")]` | The fallback resource. Used when `LocalizableString` has no specific resource. |
+| `LocalizationResourceDictionary.cs` | `Dictionary<string, LocalizationResourceBase>` | The catalog. `Add<TResource>("en", contributor?)` builder. |
+| `LocalizationResourceContributorList.cs` | list | Aggregates `ILocalizationResourceContributor`s, iterates in **reverse** order so later additions override earlier ones. `Fill` / `FillAsync` for bulk pull, `GetOrNull` for one-name lookup. `GetSupportedCulturesAsync` unions cultures across contributors. |
+| `ILocalizationResourceContributor.cs` | contributor contract | `IsDynamic`, `Initialize(context)`, `GetOrNull(culture, name)`, `Fill(culture, dict)`, `FillAsync`, `GetSupportedCulturesAsync`. |
+| `LocalizationResourceInitializationContext.cs` | DI scope | What `Initialize` receives — `Resource`, `ServiceProvider`. |
+| `Json/JsonLocalizationFile.cs` | DTO | `Culture` + `Texts`. |
+| `Json/JsonLocalizationDictionaryBuilder.cs` | static | Parses one JSON file/string into an `ILocalizationDictionary` (a `StaticLocalizationDictionary`). Handles nested objects/arrays by flattening with `__`. |
+| `VirtualFiles/Json/JsonVirtualFileLocalizationResourceContributor.cs` | `ILocalizationResourceContributor` | Iterates `IFileProvider` files under the given virtual path, parses each `*.json` through `JsonLocalizationDictionaryBuilder`, and stores per-culture `ILocalizationDictionary`s. Added by `LocalizationResourceExtensions.AddVirtualJson`. |
+| `VirtualFiles/VirtualFileLocalizationResourceContributorBase.cs` | abstract | Implements the contributor over an `IVirtualFileProvider` so format-specific subclasses (JSON, XML, …) just override `CreateDictionaryFromFileContent`. |
+| `LocalizationResourceExtensions.cs` | extensions | `AddVirtualJson`, `AddBaseTypes(params Type[])`, `AddBaseResources(params string[])`. |
+| `InheritResourceAttribute.cs` | `IInheritedResourceTypesProvider` | Class-level attribute used by `LocalizationResource` to populate `BaseResourceNames` declaratively. |
+| `AbpStringLocalizerExtensions.cs` | extensions | `GetString(name, args)`, `GetInternalLocalizer()`, etc. |
+| `AbpEnumLocalizer.cs` / `AbpEnumLocalizerExtensions.cs` / `IAbpEnumLocalizer.cs` | enum support | Localizes enum members through the same factory: looks up `Enum:{EnumType.Name}.{EnumValue}` etc. |
+| `DefaultLanguageProvider.cs` | `ILanguageProvider, ITransientDependency` | Returns `AbpLocalizationOptions.Languages`. Replaced by `LanguageProvider` in `LanguageManagement` when present. |
+| `LanguageInfo.cs` / `LanguageInfoExtensions.cs` / `ILanguageInfo.cs` | DTO | `CultureName`, `UiCultureName`, `DisplayName`, `TwoLetterISOLanguageName`. |
+| `LocalizationSettingNames.cs` / `LocalizationSettingProvider.cs` | settings | Defines `Abp.Localization.DefaultLanguage`. The current language is resolved by the ASP.NET Core integration through `RequestLocalizationOptions`. |
+| `LocalizationSettingHelper.cs` | static | Parses the per-tenant default language. |
+| `LanguageChangedEto.cs` | distributed event | Fired by `LanguageManagement` when the per-tenant language changes. |
+| `LocalizableStringSerializer.cs` / `ILocalizableStringSerializer.cs` | JSON/wire | Round-trips `LocalizableString` through `{ "name": ..., "resource": ... }` for static-definitions transport. |
+| `ITemplateLocalizer.cs` | template hook | For `Volo.Abp.TextTemplating`. |
+| `External/IExternalLocalizationStore.cs` / `NullExternalLocalizationStore.cs` | dynamic resources | The seam for runtime-added resources. `NullExternalLocalizationStore` is the default; `LanguageManagement` replaces it. `GetResourceOrNull(name)` and `GetResourceOrNullAsync(name)` return a `LocalizationResourceBase` (typically `NonTypedLocalizationResource`) constructed from DB rows. |
+| `Resources/AbpLocalization/*` | embedded resource | Default English strings for the framework's own messages. |
+
+## Resource resolution order
+
+For `AbpDictionaryBasedStringLocalizer[name]` with culture `c1` and the resource's `DefaultCultureName == "en"`:
+
+1. `Resource.Contributors.GetOrNull(c1, name)` — original culture.
+2. If `c1` contains `-` and `TryToGetFromBaseCulture`, `Resource.Contributors.GetOrNull(baseCulture(c1), name)`.
+3. If `TryToGetFromDefaultCulture` and `Resource.DefaultCultureName` is set, `Resource.Contributors.GetOrNull(DefaultCultureName, name)`.
+4. For each inherited resource in `BaseLocalizers`, `(baseLocalizer)[name]` under `CultureHelper.Use(...)`.
+5. Otherwise `new LocalizedString(name, name, resourceNotFound: true)` — the raw key is returned.
+
+Inside `Resource.Contributors`, lookups iterate **in reverse** insertion order, so later-added contributors (e.g. `AddVirtualJson` added in a downstream module) win over earlier ones from upstream modules. That is how downstream apps override framework strings.
+
+## Dynamic / external resources
+
+`IExternalLocalizationStore` lets language management write resources to the database and expose them through the same `AbpStringLocalizerFactory`. The factory always checks the static catalog first; if nothing is found, it calls `ExternalLocalizationStore.GetResourceOrNullAsync(name)` and caches the result in `LocalizerCache`. Contributors returned by an external store should set `IsDynamic = true` so the per-call `includeDynamicContributors` flag can exclude them when needed.
+
+## Virtual-file integration
+
+Localization files live in the same virtual file system as views, scripts, and other static assets. `AbpLocalizationModule` embeds the framework's own files (`Volo.Abp` / `Volo/Abp`). Downstream modules embed their own assembly and call `AddVirtualJson("/Localization/Foo")` so files under `Localization/Foo/*.json` in the assembly get picked up. See `/core/virtual-file-system`.
+
+## Related
+
+- `/core/virtual-file-system` — how JSON files are discovered.
+- `/aspnetcore/mvc-integration` — `AbpRequestLocalizationOptions` and the ASP.NET Core `RequestLocalizationMiddleware` integration.
+- `/crosscut/settings` — `Abp.Localization.DefaultLanguage` is a setting.
+- `/cli/mcp-and-translate` — `volo translate` CLI uses these same JSON files.
+- `/crosscut/multilingual-objects` — translate aggregate roots (rows), not strings.

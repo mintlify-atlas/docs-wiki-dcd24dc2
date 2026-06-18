@@ -1,0 +1,218 @@
+---
+title: "MAUI client integration — Volo.Abp.Maui.Client"
+sidebarTitle: "MAUI client"
+description: "The Volo.Abp.Maui.Client module: app-startup wiring, ApplicationConfigurationCache, MauiCachedApplicationConfigurationClient, and how a native .NET MAUI app (no Blazor) consumes ABP's HTTP API client proxies, current-user/tenant/setting infrastructure and OAuth flow."
+---
+
+`Volo.Abp.Maui.Client` is the **non-Blazor** MAUI integration. It targets pure-MAUI apps (Xamarin.Forms successor) that build native UI in XAML/C# but still want to call ABP application services through generated HTTP client proxies and reuse ABP's `ICurrentUser` / `ICurrentTenant` / settings / localization infrastructure on the device.
+
+If your app is MAUI *with* Blazor inside a `BlazorWebView`, you want [`/ui/blazor-maui`](/ui/blazor-maui) instead — that stack composes `Volo.Abp.AspNetCore.Components.MauiBlazor` *on top of* MAUI's hosting model. `Volo.Abp.Maui.Client` covers the leaner native-only case.
+
+## Module composition
+
+`framework/src/Volo.Abp.Maui.Client/Volo/Abp/Maui/Client/AbpMauiClientModule.cs`:
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreMvcClientCommonModule))]
+public class AbpMauiClientModule : AbpModule
+{
+    public async Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        await context.ServiceProvider.GetRequiredService<IClientScopeServiceProviderAccessor>()
+            .ServiceProvider.GetRequiredService<MauiCachedApplicationConfigurationClient>()
+            .InitializeAsync();
+    }
+}
+```
+
+The dependency on `AbpAspNetCoreMvcClientCommonModule` brings in the dynamic client-proxy machinery (`AbpApplicationConfigurationClientProxy`, `AbpApplicationLocalizationClientProxy`, the dynamic HTTP client factory). On app start, the module:
+
+1. Resolves `IClientScopeServiceProviderAccessor` — the singleton holding the app's scoped service provider.
+2. Calls `MauiCachedApplicationConfigurationClient.InitializeAsync()` to populate the cached `ApplicationConfigurationDto` (current user claims, settings, features, localization resources, tenant info).
+
+After that single call:
+
+- `ICurrentUser` reflects the authenticated principal (from `ApplicationConfigurationDto.CurrentUser`).
+- `ICurrentTenant` reflects the resolved tenant (driven by `CurrentTenantAccessor.Current`).
+- `ISettingProvider`, `IFeatureChecker`, `IStringLocalizer` all read from the same cached DTO.
+- `HttpClient` proxies emit requests authenticated with whatever token provider you've registered.
+
+## `MauiCachedApplicationConfigurationClient`
+
+`Volo/Abp/Maui/Client/MauiCachedApplicationConfigurationClient.cs`:
+
+```csharp
+public class MauiCachedApplicationConfigurationClient : ICachedApplicationConfigurationClient, ISingletonDependency
+{
+    protected AbpApplicationConfigurationClientProxy ApplicationConfigurationClientProxy { get; }
+    protected AbpApplicationLocalizationClientProxy ApplicationLocalizationClientProxy { get; }
+    protected ApplicationConfigurationCache Cache { get; }
+    protected ICurrentTenantAccessor CurrentTenantAccessor { get; }
+
+    public virtual async Task<ApplicationConfigurationDto> InitializeAsync()
+    {
+        var configurationDto = await ApplicationConfigurationClientProxy.GetAsync(
+            new ApplicationConfigurationRequestOptions
+            {
+                IncludeLocalizationResources = false,
+            });
+
+        var localizationDto = await ApplicationLocalizationClientProxy.GetAsync(
+            new ApplicationLocalizationRequestDto
+            {
+                CultureName = configurationDto.Localization.CurrentCulture.Name,
+                OnlyDynamics = true
+            });
+
+        configurationDto.Localization.Resources = localizationDto.Resources;
+
+        CurrentTenantAccessor.Current = new BasicTenantInfo(
+            configurationDto.CurrentTenant.Id,
+            configurationDto.CurrentTenant.Name);
+
+        Cache.Set(configurationDto);
+        return configurationDto;
+    }
+
+    public virtual ApplicationConfigurationDto Get()
+        => AsyncHelper.RunSync(GetAsync);
+
+    public virtual async Task<ApplicationConfigurationDto> GetAsync()
+    {
+        var configurationDto = Cache.Get();
+        if (configurationDto is null)
+            return await InitializeAsync();
+        return configurationDto;
+    }
+}
+```
+
+Two design points:
+
+- **Separate config + localization fetches.** The first call asks for everything *except* localization (`IncludeLocalizationResources = false`); a follow-up call fetches **only dynamic** localization resources (`OnlyDynamics = true`). Dynamic resources are values stored in the database via the Language Management module — the static resources are already embedded in the app via the virtual file system. Splitting the call keeps the initial payload small.
+- **`CurrentTenantAccessor` seeded** from the server's resolved tenant. After a tenant-switch the host code calls `InitializeAsync()` again to refresh.
+
+## `ApplicationConfigurationCache`
+
+`Volo/Abp/Maui/Client/ApplicationConfigurationCache.cs`:
+
+```csharp
+public class ApplicationConfigurationCache : ISingletonDependency
+{
+    protected ApplicationConfigurationDto? Configuration { get; set; }
+    public event Action? ApplicationConfigurationChanged;
+
+    public virtual ApplicationConfigurationDto? Get() => Configuration;
+
+    public void Set(ApplicationConfigurationDto configuration)
+    {
+        Configuration = configuration;
+        ApplicationConfigurationChanged?.Invoke();
+    }
+}
+```
+
+The `ApplicationConfigurationChanged` event lets MAUI ViewModels subscribe and react to a re-init (e.g. after login, refresh the menu / hide-show options). A typical pattern in the host app:
+
+```csharp
+public partial class MainPageViewModel
+{
+    public MainPageViewModel(ApplicationConfigurationCache cache, ICurrentUser currentUser)
+    {
+        cache.ApplicationConfigurationChanged += () =>
+        {
+            IsAuthenticated = currentUser.IsAuthenticated;
+            OnPropertyChanged(nameof(IsAuthenticated));
+        };
+    }
+}
+```
+
+## Auth providers
+
+`Volo.Abp.Maui.Client` itself does **not** pick an authentication provider — it just trusts that some `IAbpAccessTokenProvider` is registered so the proxy clients can include `Authorization: Bearer ...` headers. The two common choices:
+
+| Package | When |
+| --- | --- |
+| `Volo.Abp.Http.Client.IdentityModel.MauiBlazor` | OAuth code-with-PKCE flow against an OpenIddict / IdentityServer host. Provides `MauiBlazorAbpAccessTokenProvider` and `MauiIBlazorIdentityModelRemoteServiceHttpClientAuthenticator`. |
+| Custom | Plug your own `IAbpAccessTokenProvider` reading from `SecureStorage`. |
+
+The MAUI app generally:
+
+1. Performs the OAuth flow via `WebAuthenticator.AuthenticateAsync(...)`.
+2. Persists `access_token` / `refresh_token` to `Microsoft.Maui.Storage.SecureStorage`.
+3. Registers an `IAbpAccessTokenProvider` that reads from `SecureStorage`.
+4. Calls `MauiCachedApplicationConfigurationClient.InitializeAsync()` to refresh state.
+
+## Theming
+
+There is **no theming abstraction** here — MAUI's `Application.Current.Resources` / `App.xaml` is the theming surface. ABP's MVC/Blazor theme modules are irrelevant. What you *do* get:
+
+- **Branding** through `IBrandingProvider` (from `Volo.Abp.UI`) — replace it to centralise `AppName` / logo URLs and bind XAML controls to those properties.
+- **Localization** through `IStringLocalizer<T>` — works the same as on every other ABP stack; the cached `ApplicationConfigurationDto.Localization.Resources` feeds the localizer factory.
+- **Layout hooks** are not applicable (XAML doesn't have a hook system); use MAUI's `<ContentPage.Resources>` / templates instead.
+
+## DI hookup
+
+A MAUI program file plugging ABP in:
+
+```csharp
+public static class MauiProgram
+{
+    public static MauiApp CreateMauiApp()
+    {
+        var builder = MauiApp.CreateBuilder()
+            .UseMauiApp<App>()
+            .ConfigureFonts(...);
+
+        // Add the ABP application to MAUI's service collection
+        builder.Services.AddApplicationAsync<MyMauiClientModule>(opts =>
+        {
+            opts.Configuration.AddConfiguration(/* from embedded appsettings */);
+        }).GetAwaiter().GetResult();
+
+        var app = builder.Build();
+
+        // Initialize the ABP application using MAUI's IServiceProvider
+        app.Services.GetRequiredService<IAbpApplicationWithExternalServiceProvider>()
+            .InitializeApplicationAsync(app.Services).GetAwaiter().GetResult();
+
+        return app;
+    }
+}
+
+[DependsOn(
+    typeof(AbpMauiClientModule),
+    typeof(AbpHttpClientIdentityModelMauiBlazorModule) /* if using OAuth */
+)]
+public class MyMauiClientModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        // Configure RemoteServices, your typed proxies, etc.
+        Configure<AbpRemoteServiceOptions>(o =>
+        {
+            o.RemoteServices.Default = new RemoteServiceConfiguration("https://api.example.com");
+        });
+
+        context.Services.AddSingleton<MyAuthService>();
+    }
+}
+```
+
+`AbpMauiClientModule.OnApplicationInitializationAsync` then runs as part of `InitializeApplicationAsync` and pre-warms the configuration cache before the first `Page` is shown.
+
+## What it explicitly does *not* do
+
+- It does not register a `BlazorWebView` or theme. That's the MauiBlazor package.
+- It does not bundle CSS/JS. Native MAUI has no asset bundling.
+- It does not configure menu rendering — `IMenuManager` still works, you just iterate the resulting `ApplicationMenu` from your view model.
+- It does not own the OAuth flow — the IdentityModel.MauiBlazor (or your own) package does.
+
+## Related pages
+
+- [`/ui/blazor-maui`](/ui/blazor-maui) — Blazor-inside-MAUI alternative.
+- [`/comm/http-client`](/comm/http-client) — `AbpRemoteServiceOptions` and dynamic proxy generation that this stack uses.
+- [`/aspnetcore/mvc-client-proxies`](/aspnetcore/mvc-client-proxies) — static client proxy generation (the proxies `MauiCachedApplicationConfigurationClient` calls into).
+- [`/auth/oauth`](/auth/oauth), [`/auth/openid-connect`](/auth/openid-connect) — auth flows MAUI typically uses.
+- [`/ui/navigation-menus`](/ui/navigation-menus) — `IMenuManager` works the same in MAUI.

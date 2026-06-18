@@ -1,0 +1,414 @@
+---
+title: "Background jobs with IBackgroundJobManager and BackgroundJobInfo"
+sidebarTitle: "Background jobs"
+description: "ABP's persistent fire-and-forget background jobs: IBackgroundJobManager, BackgroundJobInfo, the polling BackgroundJobWorker, retries, serialization and storage."
+---
+
+ABP's **background jobs** subsystem provides persistent, retried, fire-and-forget execution of typed work units. A producer calls `IBackgroundJobManager.EnqueueAsync<TArgs>(args, priority, delay)`, the manager serializes `args` and inserts a `BackgroundJobInfo` row through `IBackgroundJobStore`, and a polling `BackgroundJobWorker` (a periodic background worker) picks waiting rows up and dispatches them to your `IBackgroundJob<TArgs>` or `IAsyncBackgroundJob<TArgs>` implementation. This page is a deep dive into the default in-process implementation that lives under `framework/src/Volo.Abp.BackgroundJobs/`.
+
+The abstractions are in `framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/`. The default implementation, the in-memory store and the polling worker live in `framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/`. The official `Volo.Abp.BackgroundJobs` application module ships a real persistent store at `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs`.
+
+## End-to-end flow
+
+```mermaid
+sequenceDiagram
+    participant App as Application code
+    participant Mgr as DefaultBackgroundJobManager
+    participant Ser as IBackgroundJobSerializer
+    participant Store as IBackgroundJobStore
+    participant Worker as BackgroundJobWorker
+    participant Lock as IAbpDistributedLock
+    participant Exec as BackgroundJobExecuter
+    participant Job as IAsyncBackgroundJob&lt;TArgs&gt;
+
+    App->>Mgr: EnqueueAsync(args, priority, delay)
+    Mgr->>Ser: Serialize(args)
+    Mgr->>Store: InsertAsync(BackgroundJobInfo)
+    Note over Store: NextTryTime = Clock.Now (+ delay)
+    loop every JobPollPeriod ms
+        Worker->>Lock: TryAcquireAsync("AbpBackgroundJobWorker")
+        alt acquired
+            Worker->>Store: GetWaitingJobsAsync(app, MaxJobFetchCount)
+            loop each waiting job
+                Worker->>Exec: ExecuteAsync(JobExecutionContext)
+                Exec->>Job: ExecuteAsync(args)
+                alt success
+                    Worker->>Store: DeleteAsync(jobId)
+                else BackgroundJobExecutionException
+                    Worker->>Worker: CalculateNextTryTime (exponential)
+                    Worker->>Store: UpdateAsync(jobInfo)
+                end
+            end
+        else not acquired
+            Worker->>Worker: await Task.Delay(JobPollPeriod * 12)
+        end
+    end
+```
+
+## The producer side
+
+### `IBackgroundJobManager`
+
+`framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/IBackgroundJobManager.cs` is a deliberately small interface:
+
+```csharp
+public interface IBackgroundJobManager
+{
+    Task<string> EnqueueAsync<TArgs>(
+        TArgs args,
+        BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+        TimeSpan? delay = null
+    );
+}
+```
+
+The returned `string` is the manager-specific identifier (a `Guid` for the default, a Hangfire job id for `HangfireBackgroundJobManager`, etc.). `BackgroundJobPriority` is a `byte`-backed enum in `BackgroundJobPriority.cs` with values `Low = 5`, `BelowNormal = 10`, `Normal = 15`, `AboveNormal = 20`, `High = 25` — note the gaps, which leave room for intermediate values.
+
+The framework registers `NullBackgroundJobManager` by default in the abstractions module; concrete managers (`DefaultBackgroundJobManager` and every provider) replace it via `[Dependency(ReplaceServices = true)]`. The helper `BackgroundJobManagerExtensions.IsAvailable(this IBackgroundJobManager)` in `BackgroundJobManagerExtensions.cs` returns `false` only when the resolved instance unwraps (via `ProxyHelper.UnProxy`) to `NullBackgroundJobManager`, which is useful for opt-in features.
+
+### `DefaultBackgroundJobManager`
+
+`framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/DefaultBackgroundJobManager.cs` is the in-process implementation. Its `EnqueueAsync<TArgs>` builds a `BackgroundJobInfo`:
+
+```csharp
+var jobInfo = new BackgroundJobInfo
+{
+    Id              = GuidGenerator.Create(),
+    ApplicationName = BackgroundJobWorkerOptions.Value.ApplicationName,
+    JobName         = jobName,                  // typically args type FullName
+    JobArgs         = Serializer.Serialize(args),
+    Priority        = priority,
+    CreationTime    = Clock.Now,
+    NextTryTime     = Clock.Now
+};
+
+if (delay.HasValue) jobInfo.NextTryTime = Clock.Now.Add(delay.Value);
+
+await Store.InsertAsync(jobInfo);
+return jobInfo.Id;
+```
+
+Key invariants encoded here:
+
+- **`JobName` is the args-type-derived string**, not the job-type name. `BackgroundJobOptions.Value.GetBackgroundJobName(typeof(TArgs))` defaults to `BackgroundJobNameAttribute.GetName(typeof(TArgs))`, which returns the attribute value if present or `typeof(TArgs).FullName` otherwise. The worker uses this string to look up the executor — so renaming the args type without an attribute is a breaking change.
+- **`ApplicationName` is read at enqueue time** from `AbpBackgroundJobWorkerOptions.ApplicationName`. The polling worker filters its query by the *same* application name, enabling multi-application sharding on a shared database.
+- **`NextTryTime` is the only delay primitive.** Priority does not affect *when* a job runs, only the order within a poll batch (`OrderByDescending(Priority)` in the store).
+
+## Job definitions
+
+### `IBackgroundJob<TArgs>` vs `IAsyncBackgroundJob<TArgs>`
+
+`framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/IBackgroundJob.cs` defines the sync entry point and `IAsyncBackgroundJob.cs` defines the async one:
+
+```csharp
+public interface IBackgroundJob<in TArgs>
+{
+    void Execute(TArgs args);
+}
+
+public interface IAsyncBackgroundJob<in TArgs>
+{
+    Task ExecuteAsync(TArgs args);
+}
+```
+
+A concrete job inherits either `BackgroundJob<TArgs>` or `AsyncBackgroundJob<TArgs>` (in the same folder) — both are abstract base classes that pull in `IAbpLazyServiceProvider`, `Logger` and `LoggerFactory`. Example:
+
+```csharp
+public class EmailSendingJob : AsyncBackgroundJob<EmailSendingArgs>, ITransientDependency
+{
+    private readonly IEmailSender _sender;
+    public EmailSendingJob(IEmailSender sender) => _sender = sender;
+
+    public override async Task ExecuteAsync(EmailSendingArgs args)
+    {
+        await _sender.SendAsync(args.To, args.Subject, args.Body);
+    }
+}
+```
+
+You enqueue it by sending the **args** instance, not the job:
+
+```csharp
+await _backgroundJobManager.EnqueueAsync(new EmailSendingArgs
+{
+    To = "user@example.com",
+    Subject = "Hello",
+    Body = "..."
+});
+```
+
+### Naming and configuration
+
+`BackgroundJobNameAttribute` (file `BackgroundJobNameAttribute.cs`) is placed on the **args** type to override the auto-generated full-type-name. The base method walks all custom attributes implementing `IBackgroundJobNameProvider`, picks the first, and falls back to `jobArgsType.FullName`. This lets you rename args types without invalidating queued rows.
+
+`AbpBackgroundJobOptions` (`AbpBackgroundJobOptions.cs`) keeps two parallel dictionaries keyed by args type and by job name. `AddJob<TJob>()` uses `BackgroundJobArgsHelper.GetJobArgsType(jobType)` (which reflects the `IBackgroundJob<>`/`IAsyncBackgroundJob<>` interface) to derive the args type. ABP modules conventionally call `Configure<AbpBackgroundJobOptions>(o => o.AddJob<EmailSendingJob>())` in `ConfigureServices`. The options class also has the kill switch `IsJobExecutionEnabled` (default `true`): turning it off keeps `EnqueueAsync` working (jobs are still inserted), but skips registration of the `BackgroundJobWorker` in `AbpBackgroundJobsModule.OnApplicationInitializationAsync`.
+
+<Tip>
+  When `IsJobExecutionEnabled = false` you still publish to the store — useful for the producer side of a multi-app deployment where a single "worker" app does the executing. Just set `ApplicationName` on both sides to the same value (or `null`).
+</Tip>
+
+## The data model
+
+### `BackgroundJobInfo`
+
+`framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/BackgroundJobInfo.cs` is the DTO used by `IBackgroundJobStore` implementations:
+
+```csharp
+public class BackgroundJobInfo
+{
+    public Guid Id { get; set; }
+    public virtual string? ApplicationName { get; set; }
+    public virtual string JobName { get; set; }       // args type name
+    public virtual string JobArgs { get; set; }       // serialized args
+    public virtual short TryCount { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+    public virtual DateTime NextTryTime { get; set; }
+    public virtual DateTime? LastTryTime { get; set; }
+    public virtual bool IsAbandoned { get; set; }     // tombstone for "give up"
+    public virtual BackgroundJobPriority Priority { get; set; } = Normal;
+}
+```
+
+The persistent module mirrors this 1:1 in `BackgroundJobRecord : AggregateRoot<Guid>, IHasCreationTime` at `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobRecord.cs`. Mapping between the two is done by Mapperly: see `BackgroundJobsDomainMapperlyMappers.cs` registered via `AddMapperlyObjectMapper<AbpBackgroundJobsDomainModule>` in `AbpBackgroundJobsDomainModule.cs`.
+
+### `IBackgroundJobStore`
+
+`framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/IBackgroundJobStore.cs` is the storage contract:
+
+```csharp
+public interface IBackgroundJobStore
+{
+    Task<BackgroundJobInfo> FindAsync(Guid jobId);
+    Task InsertAsync(BackgroundJobInfo jobInfo);
+    Task<List<BackgroundJobInfo>> GetWaitingJobsAsync(string? applicationName, int maxResultCount);
+    Task DeleteAsync(Guid jobId);
+    Task UpdateAsync(BackgroundJobInfo jobInfo);
+}
+```
+
+The XML doc on `GetWaitingJobsAsync` codifies the contract every implementation must honour:
+
+> Conditions: `ApplicationName == applicationName && !IsAbandoned && NextTryTime <= Clock.Now`.
+> Order by: `Priority DESC, TryCount ASC, NextTryTime ASC`.
+> Maximum result: `maxResultCount`.
+
+### `InMemoryBackgroundJobStore`
+
+`InMemoryBackgroundJobStore.cs` (registered as `ISingletonDependency`) backs the store with a `ConcurrentDictionary<Guid, BackgroundJobInfo>`. Its `GetWaitingJobsAsync` implements the contract verbatim:
+
+```csharp
+return _jobs.Values
+    .Where(t => t.ApplicationName == applicationName)
+    .Where(t => !t.IsAbandoned && t.NextTryTime <= Clock.Now)
+    .OrderByDescending(t => t.Priority)
+    .ThenBy(t => t.TryCount)
+    .ThenBy(t => t.NextTryTime)
+    .Take(maxResultCount)
+    .ToList();
+```
+
+Note its `UpdateAsync`: if `IsAbandoned`, it **deletes** the row instead of keeping a tombstone — the in-memory store can afford to forget abandoned jobs because there is no audit trail. A persistent store typically keeps them.
+
+### `BackgroundJobStore` (persistent)
+
+`modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs` delegates to `IBackgroundJobRepository` (an `IRepository<BackgroundJobRecord, Guid>` extension) and maps via Mapperly. The interesting case is `UpdateAsync`: it re-fetches the `BackgroundJobRecord` aggregate, applies `ObjectMapper.Map(jobInfo, record)` to preserve concurrency tokens and ABP auditing fields, and only then calls `UpdateAsync(record)`.
+
+<Warning>
+  When you load `Volo.Abp.BackgroundJobs.Domain` (the application module), its `BackgroundJobStore` becomes the active `IBackgroundJobStore` via standard ABP DI ordering — both `InMemoryBackgroundJobStore` and `BackgroundJobStore` are registered, but the persistent one is registered later (because the module depends on `AbpBackgroundJobsModule`) and wins.
+</Warning>
+
+## The serializer
+
+`framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/IBackgroundJobSerializer.cs`:
+
+```csharp
+public interface IBackgroundJobSerializer
+{
+    string Serialize(object obj);
+    object Deserialize(string value, Type type);
+}
+```
+
+The default implementation, `JsonBackgroundJobSerializer.cs`, delegates to the framework-wide `IJsonSerializer` (Newtonsoft- or System.Text.Json-based depending on which `AbpJsonModule` you composed). The store always sees a **string** payload, which keeps `BackgroundJobInfo` schema-free on the DB side. To swap formats (e.g. MessagePack), replace `IBackgroundJobSerializer` — the args round-trip uses no type metadata other than the `JobName` lookup, so you have full control.
+
+## The polling worker
+
+### `BackgroundJobWorker`
+
+`framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/BackgroundJobWorker.cs` extends `AsyncPeriodicBackgroundWorkerBase` and implements `IBackgroundJobWorker`. The constructor wires `Timer.Period = WorkerOptions.JobPollPeriod` so the inherited `AbpAsyncTimer` fires `DoWorkAsync` on schedule.
+
+The work loop:
+
+```csharp
+await using (var handler = await DistributedLock.TryAcquireAsync(
+    WorkerOptions.DistributedLockName, cancellationToken: StoppingToken))
+{
+    if (handler != null)
+    {
+        var store      = sp.GetRequiredService<IBackgroundJobStore>();
+        var waitingJobs = await store.GetWaitingJobsAsync(WorkerOptions.ApplicationName,
+                                                          WorkerOptions.MaxJobFetchCount);
+        if (!waitingJobs.Any()) return;
+
+        var jobExecuter = sp.GetRequiredService<IBackgroundJobExecuter>();
+        var clock       = sp.GetRequiredService<IClock>();
+        var serializer  = sp.GetRequiredService<IBackgroundJobSerializer>();
+
+        foreach (var jobInfo in waitingJobs)
+        {
+            jobInfo.TryCount++;
+            jobInfo.LastTryTime = clock.Now;
+            ...
+        }
+    }
+    else
+    {
+        try { await Task.Delay(WorkerOptions.JobPollPeriod * 12, StoppingToken); }
+        catch (TaskCanceledException) { }
+    }
+}
+```
+
+Salient points:
+
+- **Distributed lock first.** Multiple instances polling the same store would otherwise race. `WorkerOptions.DistributedLockName` (default `"AbpBackgroundJobWorker"`) is normalized via `IDistributedLockKeyNormalizer`, which prepends `AbpDistributedLockOptions.KeyPrefix`.
+- **Sleep-on-contention.** When the lock cannot be acquired the worker waits 12× the poll period before retrying, preventing a thundering herd against the lock provider.
+- **Per-job try increment is unconditional.** Both `TryCount++` and `LastTryTime = clock.Now` happen *before* execution. That means: if your job throws a non-`BackgroundJobExecutionException` exception (which is wrapped by `BackgroundJobExecuter` and shouldn't normally reach this layer), the outer `catch` block sets `IsAbandoned = true` immediately.
+
+### `BackgroundJobExecuter`
+
+`framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/BackgroundJobExecuter.cs` is the bridge from raw context to your job class. It:
+
+1. Resolves the job from DI: `context.ServiceProvider.GetService(context.JobType)`.
+2. Reflects either `Execute` or `ExecuteAsync` on the type.
+3. Reads `ICurrentTenant` and switches tenant scope: `CurrentTenant.Change(GetJobArgsTenantId(jobArgs))`. If your args type implements `IMultiTenant`, its `TenantId` overrides; otherwise the current tenant at enqueue time is preserved through serialization (you have to put it on the args yourself).
+4. Pushes the `CancellationToken` from the worker into `ICancellationTokenProvider.Use(context.CancellationToken)`.
+5. Invokes `Execute`/`ExecuteAsync` reflectively.
+6. On exception: logs, calls `IExceptionNotifier.NotifyAsync`, and **wraps in `BackgroundJobExecutionException`** with `JobType` and `JobArgs` populated, then re-throws — this is the signal `BackgroundJobWorker` needs to differentiate "retry" from "abandon".
+
+### Retry and exponential backoff
+
+`BackgroundJobWorker.CalculateNextTryTime` implements the backoff:
+
+```csharp
+var nextWaitDuration = WorkerOptions.DefaultFirstWaitDuration *
+                       (Math.Pow(WorkerOptions.DefaultWaitFactor, jobInfo.TryCount - 1));
+var nextTryDate = jobInfo.LastTryTime?.AddSeconds(nextWaitDuration)
+                  ?? clock.Now.AddSeconds(nextWaitDuration);
+
+if (nextTryDate.Subtract(jobInfo.CreationTime).TotalSeconds > WorkerOptions.DefaultTimeout)
+    return null;   // → IsAbandoned = true
+
+return nextTryDate;
+```
+
+With the **defaults** from `AbpBackgroundJobWorkerOptions` (`DefaultFirstWaitDuration = 60s`, `DefaultWaitFactor = 2.0`, `DefaultTimeout = 172800s ≈ 2 days`):
+
+| `TryCount` after increment | Wait formula | Wait (s) | Cumulative (s) |
+|---|---|---|---|
+| 1 | 60 × 2⁰ | 60 | 60 |
+| 2 | 60 × 2¹ | 120 | 180 |
+| 3 | 60 × 2² | 240 | 420 |
+| 4 | 60 × 2³ | 480 | 900 |
+| 5 | 60 × 2⁴ | 960 | 1860 |
+| … | … | … | … |
+| ≈ 12 | 60 × 2¹¹ | 122 880 | exceeds 172 800 → abandoned |
+
+So a job is automatically marked `IsAbandoned = true` once its next try would be more than `DefaultTimeout` seconds after its `CreationTime`. The check is **against creation time**, not last try time — a long-running outage will not extend the retry window.
+
+<Tip>
+  Tune `Configure<AbpBackgroundJobWorkerOptions>(o => { o.DefaultFirstWaitDuration = 10; o.DefaultWaitFactor = 1.5; o.DefaultTimeout = 3600; })` for fast-failing jobs (e.g. webhooks). Tune in the other direction for slow batch operations.
+</Tip>
+
+### Update-after-failure safety
+
+If `store.UpdateAsync(jobInfo)` itself throws (e.g. database transient), the worker swallows the exception in `TryUpdateAsync` and just logs it. The next poll will retry — `NextTryTime` may be slightly stale but the row is still picked up because `<= Clock.Now`. This is a deliberate "fail-open" choice in `BackgroundJobWorker.cs`.
+
+## `AbpBackgroundJobWorkerOptions` reference
+
+| Property | Default | Effect |
+|---|---|---|
+| `ApplicationName` | `null` | Used as the discriminator in `BackgroundJobInfo.ApplicationName` at enqueue and in `IBackgroundJobStore.GetWaitingJobsAsync` at dequeue. |
+| `JobPollPeriod` | `5000` (ms) | Period of the inner `AbpAsyncTimer`. |
+| `MaxJobFetchCount` | `1000` | Max rows per poll. |
+| `DefaultFirstWaitDuration` | `60` (s) | Initial backoff. |
+| `DefaultTimeout` | `172800` (s, ~2 days) | When `CreationTime + nextWait` exceeds this, `IsAbandoned = true`. |
+| `DefaultWaitFactor` | `2.0` | Backoff multiplier. |
+| `DistributedLockName` | `"AbpBackgroundJobWorker"` | Lock key for serialising pollers. |
+
+## Putting it together
+
+<Steps>
+  <Step title="Define args and job">
+    Place a `BackgroundJobNameAttribute` on the args type for stability:
+
+    ```csharp
+    [BackgroundJobName("email-sending")]
+    public class EmailSendingArgs { public string To; public string Subject; public string Body; }
+
+    public class EmailSendingJob : AsyncBackgroundJob<EmailSendingArgs>, ITransientDependency
+    {
+        public override async Task ExecuteAsync(EmailSendingArgs args) { ... }
+    }
+    ```
+  </Step>
+  <Step title="Register the job">
+    In your module:
+
+    ```csharp
+    Configure<AbpBackgroundJobOptions>(o => o.AddJob<EmailSendingJob>());
+    ```
+
+    `AbpBackgroundJobOptions.AddJob<TJob>` internally reflects `IAsyncBackgroundJob<EmailSendingArgs>` and stores a `BackgroundJobConfiguration` indexed by both args type and job name.
+  </Step>
+  <Step title="Pick a store">
+    For production, add the application module:
+    ```text
+    [DependsOn(typeof(AbpBackgroundJobsEntityFrameworkCoreModule))]
+    ```
+    Then your `IBackgroundJobStore` becomes `BackgroundJobStore` backed by `EfCoreBackgroundJobRepository`. For tests, leave the default `InMemoryBackgroundJobStore`.
+  </Step>
+  <Step title="Enqueue">
+    ```csharp
+    public class OrderAppService { 
+      public OrderAppService(IBackgroundJobManager bjm) { _bjm = bjm; }
+      public async Task PlaceOrderAsync(...) {
+        await _bjm.EnqueueAsync(new EmailSendingArgs { ... },
+                                priority: BackgroundJobPriority.AboveNormal,
+                                delay: TimeSpan.FromMinutes(5));
+      }
+    }
+    ```
+  </Step>
+  <Step title="Verify execution">
+    With logging at `Debug`, `BackgroundWorkerBase.StartAsync` will emit `Started background worker: Volo.Abp.BackgroundJobs.BackgroundJobWorker`. Each successful execution is followed by `IBackgroundJobStore.DeleteAsync`. Failures log via `IExceptionNotifier` (which integrates with the exception subsystem).
+  </Step>
+</Steps>
+
+## Extending the subsystem
+
+<Accordion title="Replacing the store">
+  Implement `IBackgroundJobStore` and register with `[Dependency(ReplaceServices = true)]`. The contract is fully documented on the interface — pay attention to the ordering (`Priority DESC, TryCount ASC, NextTryTime ASC`) and the filter conditions. Anything that violates them will create starvation or duplicate execution.
+</Accordion>
+
+<Accordion title="Replacing the serializer">
+  Implement `IBackgroundJobSerializer`. Because the store sees a plain `string`, you can switch to base64-encoded binary formats by exposing a `string` wrapper. Make sure deserialization is robust against schema evolution: `BackgroundJobInfo.JobArgs` rows from older builds may still be in the store.
+</Accordion>
+
+<Accordion title="Customising the executor">
+  Replace `IBackgroundJobExecuter` to add cross-cutting behaviour (tracing, custom UoW). The existing `BackgroundJobExecuter` already handles `ICurrentTenant` switching and `ICancellationTokenProvider`; preserve those when subclassing.
+</Accordion>
+
+<Accordion title="Multiple worker apps">
+  Run multiple instances against the same database. Set the same `AbpBackgroundJobWorkerOptions.ApplicationName` (or leave it `null`) on the worker apps, and a distributed lock provider on top of `IAbpDistributedLock` (`MedallionAbpDistributedLock` with a Redis or SQL provider). The default `LocalAbpDistributedLock` is in-process only and will permit concurrent polls across instances.
+</Accordion>
+
+## Related reading
+
+- [Background workers](/background/background-workers) — the underlying periodic timer infrastructure used by `BackgroundJobWorker`.
+- [Distributed locking](/background/distributed-locking) — required for multi-instance polling.
+- [Hangfire](/background/hangfire), [Quartz](/background/quartz), [RabbitMQ](/background/rabbitmq-jobs), [TickerQ](/background/tickerq) — drop-in replacements of `IBackgroundJobManager`.
+- [Background-jobs application module](/modules/background-jobs-module) — the EF Core / Mongo `BackgroundJobStore` + management UI.
+- [Background job execution flow](/flows/background-job-execution) — end-to-end trace including `ICurrentTenant` and `ICancellationTokenProvider`.
+- [Threading and async helpers](/core/threading-and-async) — `AbpAsyncTimer` powering the polling loop.

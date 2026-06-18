@@ -1,0 +1,228 @@
+---
+title: "ABP Framework Glossary: Modules, DDD, Infra Terms"
+sidebarTitle: "Glossary"
+description: "Every recurring ABP term — Module, AppService, UoW, CurrentTenant, IBlobContainer, .abpmdl — with its defining file, symbol and deeper wiki link."
+---
+
+This page is the terminology reference for `abpframework/abp`. Every term defined here appears repeatedly across the codebase — in module names, attributes, interfaces and metadata files — and each is grounded in a concrete file or symbol an agent can open. Use it as a lookup index when reading other wiki pages: every other overview/flow/module page assumes these meanings.
+
+## How to read this glossary
+
+<Info>
+Each table row lists: **term** (canonical wording), **definition** (one paragraph, ABP-specific not generic DDD), **defining file or symbol** (clickable when local), **related wiki page** (deeper dive). When a term has parallel "abstractions" and "implementation" packages, both are listed.
+</Info>
+
+## Module system
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **ABP Module** | A unit of composition. A class deriving from `AbpModule` that registers services in `ConfigureServices` and runs init code in `OnApplicationInitialization`. NuGet packages typically ship one module class each. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModule.cs`, `AbpModule.cs` | `/overview/architecture`, `/core/overview` |
+| **Module Class** | Concrete class name ending in `Module` (e.g. `AbpIdentityDomainModule`). Marked with `[DependsOn(typeof(OtherModule), …)]`. | `AbpModule.IsAbpModule(Type)` in `AbpModule.cs` | `/overview/architecture` |
+| **[DependsOn]** | Attribute declaring static dependencies between modules. Read by `IModuleLoader` to topologically order initialization. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/DependsOnAttribute.cs` | `/overview/architecture` |
+| **Startup Module** | The single root module type passed to `AbpApplicationFactory.CreateAsync<T>` / `builder.AddApplicationAsync<T>`. Pulls in every other module transitively. | `AbpApplicationBase.StartupModuleType` in `AbpApplicationBase.cs` | `/flows/application-startup` |
+| **AbpApplication** | The runtime object owning `Services`, `ServiceProvider`, `Modules`, `InstanceId`, lifecycle methods. Abstract; created by `AbpApplicationFactory`. | `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs`, `IAbpApplication.cs` | `/overview/architecture` |
+| **IModuleLoader** | Walks the `[DependsOn]` graph and emits a topologically ordered `IReadOnlyList<IAbpModuleDescriptor>`. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleLoader.cs`, `ModuleLoader.cs` | `/flows/application-startup` |
+| **IModuleManager** | Runs lifecycle contributors over the descriptor list (`Pre`/`Configure`/`Post` services, `Pre`/`On`/`Post` initialization, shutdown). | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IModuleManager.cs`, `ModuleManager.cs` | `/flows/application-startup` |
+| **ServiceConfigurationContext** | Passed to `AbpModule.ConfigureServices`. Exposes `Services` (`IServiceCollection`) and `Items` for cross-module hand-off. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ServiceConfigurationContext.cs` | `/core/overview` |
+| **ApplicationInitializationContext** | Passed to `OnApplicationInitialization`. Holds the root `IServiceProvider` and a typed `GetEnvironment()`-style helper. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ApplicationInitializationContext.cs` | `/flows/application-startup` |
+| **PlugIn source** | Optional dynamic module assembly (folder, type-list) added via `options.PlugInSources` in `AbpApplicationCreationOptions`. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/` | `/core/overview` |
+
+## DDD layers
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **Domain.Shared** | Layer of constants, enums, error codes and shared localization. Referenced by **every other layer**. Has zero dependencies on persistence. | Per-module `Volo.Abp.<X>.Domain.Shared` csproj. Framework base: `Volo.Abp.Ddd.Domain.Shared` | `/ddd/overview` |
+| **Domain** | Aggregate roots, entities, value objects, domain services, repository **interfaces**. Depends on `Domain.Shared`. | Framework base: `framework/src/Volo.Abp.Ddd.Domain/` | `/ddd/overview` |
+| **Application.Contracts** | Application service **interfaces**, DTOs, permission/feature/setting definitions. Shipped to clients (e.g. Blazor WebAssembly) along with `HttpApi.Client`. | Framework base: `framework/src/Volo.Abp.Ddd.Application.Contracts/` | `/ddd/overview` |
+| **Application** | Application service **implementations**. Coordinates domain services and infrastructure. Exposed to UI through `HttpApi` controllers. | Framework base: `framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/ApplicationService.cs` | `/ddd/overview` |
+| **HttpApi** | ASP.NET Core controllers translating Application services into REST endpoints. | Module pattern: `modules/identity/src/Volo.Abp.Identity.HttpApi/` | `/ddd/overview` |
+| **HttpApi.Client** | Dynamic C# proxies for remote consumption, with embedded `*generate-proxy.json` swagger. | `common.props` block `Condition="$(AssemblyName.EndsWith('HttpApi.Client'))"` | `/modules/overview` |
+| **DDD Layer** | Generic label for any of the seven canonical layers above. Encoded in `.abppkg` `role` field (e.g. `lib.domain`). | `modules/identity/src/Volo.Abp.Identity.Domain/Volo.Abp.Identity.Domain.abppkg` = `{ "role": "lib.domain" }` | `/overview/solution-structure` |
+| **Aggregate Root** | Cluster entity with a global identity that is the consistency boundary. Inherit from `AggregateRoot<TKey>` (with auditing) or `BasicAggregateRoot<TKey>` (no auditing). | `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/AggregateRoot.cs`, `BasicAggregateRoot.cs` | `/ddd/overview` |
+| **Entity** | Has identity but is not an aggregate root. Inherit from `Entity<TKey>`. | `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/Entity.cs`, `IEntity.cs` | `/ddd/overview` |
+| **Value Object** | Identity-less object compared by value. Inherit from `ValueObject` (records equality logic). | `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Values/ValueObject.cs` | `/ddd/overview` |
+| **Domain Event** | Event raised by an aggregate (`AddLocalEvent`/`AddDistributedEvent`). Dispatched on SaveChanges via the event bus. | `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/Events/`, `IGeneratesDomainEvents.cs` | `/eventbus/overview` |
+
+## Application services
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **Application Service** | Base class for use-case implementations. Provides `ObjectMapper`, `CurrentUser`, `CurrentTenant`, `Logger`, `L` (localization), `AuthorizationService`. | `framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/ApplicationService.cs` | `/ddd/overview` |
+| **CrudAppService** | Generic CRUD over a `IRepository<TEntity, TKey>`: `GetAsync`, `GetListAsync`, `CreateAsync`, `UpdateAsync`, `DeleteAsync`. | `framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/CrudAppService.cs` | `/ddd/overview` |
+| **ReadOnlyAppService** | CRUD subset exposing only the read methods. | `framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/ReadOnlyAppService.cs` | `/ddd/overview` |
+| **AbstractKeyCrudAppService** | Variant for entities whose key is composite (not a single TKey). | `framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/AbstractKeyCrudAppService.cs` | `/ddd/overview` |
+
+## Repositories & Unit of Work
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **Repository** | Persistence-agnostic collection of aggregates. Generic `IRepository<TEntity, TKey>` extends `IQueryable<TEntity>`. EF Core and Mongo provide implementations. | `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/IRepository.cs`, `RepositoryBase.cs` | `/data/overview` |
+| **IBasicRepository** | Minimal API: `Insert`, `Update`, `Delete`, `Get`, `Find`. For aggregates not exposed as queryables. | `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/IBasicRepository.cs` | `/data/overview` |
+| **IReadOnlyRepository** | Marker interface causing EF Core implementation to set `AsNoTracking()`. | `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/IReadOnlyRepository.cs` | `/data/overview` |
+| **Unit of Work** | Ambient transaction-and-change-tracking scope. Begins automatically around controller actions / app service calls. | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWork.cs`, `IUnitOfWorkManager.cs`, `AmbientUnitOfWork.cs` | `/data/overview` |
+| **`[UnitOfWork]`** | Attribute to start a UoW explicitly on a non-Service method, set `IsTransactional`, `Timeout`, etc. | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkAttribute.cs` | `/data/overview` |
+| **IDatabaseApi / ITransactionApi** | Per-database handles attached to the UoW: EF's `DbContext` is an `IDatabaseApi`, the EF transaction is an `ITransactionApi`. | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IDatabaseApi.cs`, `ITransactionApi.cs` | `/data/overview` |
+| **Specification** | Encapsulated predicate over entities. Combine with `And`/`Or`/`Not`. Used as `IRepository.GetListAsync(ISpecification<T>)`. | `framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ISpecification.cs`, `Specification.cs` | `/ddd/overview` |
+
+## Cross-cutting infra
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **Auditing** | Automatic capture of who/when changed which entity. Implement `IAuditedObject` or just inherit `AggregateRoot<TKey>`. `[Audited]` attribute records request-level audit logs. | `framework/src/Volo.Abp.Auditing/`, `IAuditingManager.cs`, `AuditedAttribute.cs`, `IAuditedObject.cs` | `/core/overview` |
+| **Permission** | Authorization unit declared by `PermissionDefinitionProvider`, checked via `IPermissionChecker.IsGrantedAsync("MyPerm")` or `[Authorize("MyPerm")]`. | `framework/src/Volo.Abp.Authorization/Volo/Abp/Authorization/Permissions/IPermissionChecker.cs`, `PermissionDefinitionProvider.cs` | `/core/overview` |
+| **Feature** | Tenant-scoped flag/value defined by `FeatureDefinitionProvider`. Read via `IFeatureChecker.IsEnabledAsync("MyFeature")` or `[RequiresFeature("MyFeature")]`. | `framework/src/Volo.Abp.Features/Volo/Abp/Features/IFeatureChecker.cs`, `FeatureDefinitionProvider.cs` | `/core/overview` |
+| **Setting** | Named string value with override hierarchy (default → global → tenant → user). Defined by `SettingDefinitionProvider`, read via `ISettingProvider.GetOrNullAsync("My.Setting")`. | `framework/src/Volo.Abp.Settings/Volo/Abp/Settings/ISettingProvider.cs`, `SettingDefinitionProvider.cs` | `/core/overview` |
+| **Current Tenant** | Ambient `ICurrentTenant` exposing `Id`, `Name`, `IsAvailable`. `Change(tenantId)` opens an `IDisposable` scope. | `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/CurrentTenant.cs`, `AsyncLocalCurrentTenantAccessor.cs` | `/multitenancy/overview` |
+| **Tenant Resolve Contributor** | Pluggable step that inspects the request (header, claim, host, querystring, cookie, route) to determine `TenantId`. Chained until one yields. | `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/TenantResolver.cs`, `TenantResolveContributorBase.cs`, `CurrentUserTenantResolveContributor.cs`, `ActionTenantResolveContributor.cs` | `/multitenancy/overview` |
+| **Multi-Tenant Connection String** | `IConnectionStringResolver` that picks per-tenant database. ABP ships `MultiTenantConnectionStringResolver`. | `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/MultiTenantConnectionStringResolver.cs` | `/multitenancy/overview` |
+| **Data Filter** | Toggle-able global query filter (`ISoftDelete`, `IMultiTenant`). Enable/disable via `IDataFilter.Enable<T>()` / `Disable<T>()` returning `IDisposable`. | `framework/src/Volo.Abp.Data/Volo/Abp/Data/IDataFilter.cs`, `DataFilter.cs` | `/data/overview` |
+| **MultiLingual Object** | Pattern for entities with translatable fields: a translation collection + helper `IMultiLingualObjectManager`. | `framework/src/Volo.Abp.MultiLingualObjects/` | `/data/overview` |
+| **IObjectMapper** | Abstraction over object-to-object mappers. AutoMapper or Mapperly profiles register against it. | `framework/src/Volo.Abp.ObjectMapping/Volo/Abp/ObjectMapping/IObjectMapper.cs`, `Volo.Abp.AutoMapper/`, `Volo.Abp.Mapperly/` | `/core/overview` |
+| **Object Extending** | Runtime extra-property bag (`HasExtraProperties.ExtraProperties` + `IObjectExtensionManager`) — extend entities without schema changes. | `framework/src/Volo.Abp.ObjectExtending/` | `/ddd/overview` |
+
+## Eventing & background work
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **Local Event Bus** | In-process `IEventBus` dispatching to `ILocalEventHandler<TEvent>`. Fires synchronously inside the UoW. | `framework/src/Volo.Abp.EventBus/Volo/Abp/EventBus/Local/ILocalEventBus.cs` | `/eventbus/overview` |
+| **Distributed Event Bus** | Process-boundary-crossing `IDistributedEventBus`. Implementations: RabbitMQ, Kafka, Azure Service Bus, Dapr, Rebus. | `framework/src/Volo.Abp.EventBus/Volo/Abp/EventBus/Distributed/IDistributedEventBus.cs` + `Volo.Abp.EventBus.RabbitMQ`, `.Kafka`, `.Azure`, `.Dapr`, `.Rebus` | `/eventbus/overview` |
+| **Outbox / Inbox** | Transactional event delivery: published events first written to an `Outbox` table inside the same transaction; `OutboxSender` ships them later. Consumers dedupe via `Inbox`. | `framework/src/Volo.Abp.EventBus/Volo/Abp/EventBus/Distributed/OutboxSender.cs`, `OutboxSenderManager.cs`, `InboxProcessor.cs`, `InboxProcessManager.cs`, `InboxProcessorFailurePolicy.cs` | `/eventbus/overview` |
+| **Background Job** | Durable, replayable work unit. Submit via `IBackgroundJobManager.EnqueueAsync<TArgs>(args)`. Handler implements `IBackgroundJob<TArgs>`. | `framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/IBackgroundJobManager.cs` | `/backgroundjobs/overview` |
+| **Background Worker** | Long-running hosted service (`IBackgroundWorker`). ABP integrations: Hangfire, Quartz, TickerQ. | `framework/src/Volo.Abp.BackgroundWorkers/Volo/Abp/BackgroundWorkers/IBackgroundWorker.cs` | `/backgroundjobs/overview` |
+| **Distributed Lock** | `IAbpDistributedLock.TryAcquireAsync` for cross-process mutual exclusion. Defaults to local; production uses Redis (`DistributedLock.Redis`). | `framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/IAbpDistributedLock.cs` | `/core/overview` |
+
+## Storage & content
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **BLOB Container** | Named storage bucket. Inject `IBlobContainer<TContainer>` or default `IBlobContainer`. Backed by `IBlobProvider`. | `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/IBlobContainer.cs`, `BlobContainerConfiguration.cs` | `/blobstoring/overview` |
+| **BLOB Provider** | Driver: FileSystem, Memory, Database, Azure, AWS S3, Google Cloud, Minio, Aliyun, Bunny. Choose per container via `Configure<AbpBlobStoringOptions>`. | `framework/src/Volo.Abp.BlobStoring.<X>/` | `/blobstoring/overview` |
+| **Virtual File System** | Composes embedded resources, physical files and in-memory streams into one `IFileProvider`. Registered via `Configure<AbpVirtualFileSystemOptions>(o => o.FileSets.AddEmbedded<TModule>())`. | `framework/src/Volo.Abp.VirtualFileSystem/Volo/Abp/VirtualFileSystem/IVirtualFileProvider.cs`, `VirtualFileSetList.cs`, `AbpVirtualFileSystemModule.cs` | `/core/overview` |
+| **Bundle Contributor** | Object that emits `<script>`/`<link>` references for a named bundle. Registered against `AbpBundlingOptions`. | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/IBundleContributor.cs`, also `framework/src/Volo.Abp.Core/Volo/Abp/Bundling/IBundleContributor.cs` | `/templates/overview` |
+| **Distributed Cache** | `IDistributedCache<TCacheItem>` wrapping `Microsoft.Extensions.Caching.Distributed.IDistributedCache` with typed keys + JSON serialization. Redis backend via `Volo.Abp.Caching.StackExchangeRedis`. | `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/IDistributedCache.cs` | `/core/overview` |
+
+## Tenancy & users
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **Tenant** | Isolated customer of a multi-tenant app. `TenantManagement` module owns persistence; `MultiTenancy` provides the runtime ambient. | `modules/tenant-management/src/`, `Volo.Abp.MultiTenancy` | `/multitenancy/overview` |
+| **Host Side** | "Tenant.Id == null" — the operator who manages tenants. UI/permissions only available when `MultiTenancySides.Host` is set. | `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/MultiTenancySides.cs` | `/multitenancy/overview` |
+| **Tenant Side** | The acting tenant. `MultiTenancySides.Tenant` flag on permission/feature definitions controls visibility. | same as above | `/multitenancy/overview` |
+| **ICurrentUser** | Ambient user accessor: `Id`, `TenantId`, `UserName`, `Roles`, `IsInRole`, `FindClaim`. | `framework/src/Volo.Abp.Security/Volo/Abp/Security/Claims/ICurrentUser.cs` | `/core/overview` |
+
+## Studio / CLI metadata
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **ABP Studio** | Desktop IDE bundling solution scaffolding, module browsing, source-code replacement, low-code designer. Reads `.abpsln`/`.abpmdl`/`.abppkg`. | (closed-source binary; metadata format only) | `/overview/solution-structure` |
+| **ABP Suite** | Code generator on top of ABP — CRUD pages from entity definitions. Invoked via `abp suite`. | (separate product) | `/cli/overview` |
+| **ABP CLI** | Command-line tool installed via `dotnet tool install -g Volo.Abp.Cli`. Commands: `new`, `update`, `install-libs`, `generate-proxy`, `bundle`, etc. | `framework/src/Volo.Abp.Cli/`, `framework/src/Volo.Abp.Cli.Core/` | `/cli/overview` |
+| **`.abpmdl`** | JSON manifest of an ABP Studio **module**: `folders.items` virtual folders + `packages` dictionary mapping name → relative `.abppkg` path. | `framework/Volo.Abp.abpmdl`, `modules/identity/Volo.Abp.Identity.abpmdl` | `/overview/solution-structure` |
+| **`.abppkg`** | JSON descriptor of a **package** (csproj) carrying a single `role` field (`lib.framework`, `lib.domain`, `lib.application`, `lib.httpapi`, `lib.web`, …). Packed into the .nupkg as `content/<name>.abppkg`. | `framework/src/Volo.Abp.Core/Volo.Abp.Core.abppkg`, `modules/identity/src/Volo.Abp.Identity.Domain/Volo.Abp.Identity.Domain.abppkg` | `/overview/solution-structure` |
+| **`.abppkg.analyze.json`** | Pre-computed module-DAG snapshot per package, listing `dependsOnModules`, `implementingInterfaces`. Packed into .nupkg `content/`. | `modules/identity/src/Volo.Abp.Identity.Domain/Volo.Abp.Identity.Domain.abppkg.analyze.json` | `/overview/solution-structure` |
+| **`.abpsln`** | JSON shell pointing to one or more `.abpmdl` modules. ABP Studio entry point. | `framework/Volo.Abp.abpsln` | `/overview/solution-structure` |
+| **`.slnx`** | XML solution format from the .NET 10 SDK replacing `.sln`. `<Solution><Folder Name>…<Project Path/>…</Folder></Solution>`. | `framework/Volo.Abp.slnx`, `modules/identity/Volo.Abp.Identity.slnx` | `/overview/solution-structure` |
+| **`role`** | Single-string layer tag in `.abppkg`. Known values used in repo: `lib.framework`, `lib.domain.shared`, `lib.domain`, `lib.application.contracts`, `lib.application`, `lib.httpapi`, `lib.httpapi.client`, `lib.entityframeworkcore`, `lib.mongodb`, `lib.aspnetcore`, `lib.web`, `lib.blazor`, `lib.blazor.server`, `lib.blazor.webassembly`, `lib.installer`, `test.unit`. | All `*.abppkg` files | `/overview/solution-structure` |
+
+## Versioning & packaging
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **Central Package Management** | NuGet's mode where every `<PackageReference>` omits `Version=` and the version is pinned in a single `Directory.Packages.props`. Enabled by `<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>`. | `Directory.Packages.props` | `/overview/solution-structure` |
+| **LeptonX Version** | Theme version, single-sourced in `common.props` `<LeptonXVersion>`. Templates and module references read it. | `common.props`, `npm/scripts/update-lepton-x-versions.ts`, `latest-versions.json` | `/overview/build-and-tooling` |
+| **SourceLink** | `Microsoft.SourceLink.GitHub` enabled in `common.props` so the published .pdb maps to GitHub source. | `common.props` `<PackageReference Include="Microsoft.SourceLink.GitHub">` | `/overview/build-and-tooling` |
+| **ConfigureAwait.Fody** | Fody weaver that, in Release builds only, injects `.ConfigureAwait(false)` on every awaitable. Toggled in `configureawait.props`. | `configureawait.props` | `/overview/build-and-tooling` |
+| **Installer Package** | Per-module metapackage (e.g. `Volo.Abp.Identity.Installer`) used by ABP Studio to add the module to a customer solution with one click. | `modules/identity/src/Volo.Abp.Identity.Installer/` | `/modules/overview` |
+| **Source-code Redistribution** | Per-module folder under `source-code/Volo.Abp.<X>.SourceCode/` packaged for the "Get source code" feature. Aggregated by `source-code/SourceCodes.slnx`. | `source-code/` and `studio/source-codes/` | `/overview/repository-layout` |
+
+## Lifecycle interfaces
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **IPreConfigureServices** | Module hook running **before** the main `ConfigureServices` pass across all modules. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IPreConfigureServices.cs` | `/flows/application-startup` |
+| **IPostConfigureServices** | Module hook running **after** the main `ConfigureServices` pass. Last chance to mutate the `IServiceCollection`. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IPostConfigureServices.cs` | `/flows/application-startup` |
+| **IOnPreApplicationInitialization / IOnApplicationInitialization / IOnPostApplicationInitialization** | Three sequential init hooks after the service provider is built. `AbpModule` implements all three as virtuals. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IOnPreApplicationInitialization.cs`, etc. | `/flows/application-startup` |
+| **IOnApplicationShutdown** | Module hook called from `AbpApplicationBase.ShutdownAsync()` via `IModuleManager.ShutdownModulesAsync`. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IOnApplicationShutdown.cs` | `/flows/application-startup` |
+| **ITransientDependency / IScopedDependency / ISingletonDependency** | Marker interfaces causing ABP's conventional registrar to register the class with the matching lifetime. | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ITransientDependency.cs`, `IScopedDependency.cs`, `ISingletonDependency.cs` | `/core/overview` |
+| **`[Dependency]`** | Attribute overriding lifetime / `TryAdd` / `ReplaceServices` flags for a specific class. | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DependencyAttribute.cs` | `/core/overview` |
+| **`[ExposeServices]`** | Attribute declaring which service types a class should be registered as. | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposeServicesAttribute.cs` | `/core/overview` |
+
+## Exception & validation
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **BusinessException** | Localized, error-coded exception type that bubbles up to a standardized HTTP error response. | `framework/src/Volo.Abp.ExceptionHandling/Volo/Abp/BusinessException.cs` | `/core/overview` |
+| **AbpException** | Base ABP exception; non-localized infrastructure errors. | `framework/src/Volo.Abp.Core/Volo/Abp/AbpException.cs` | `/core/overview` |
+| **IExceptionToErrorInfoConverter** | Pipeline that turns a `.NET` exception into a `RemoteServiceErrorInfo` JSON payload returned by HTTP APIs. | `framework/src/Volo.Abp.ExceptionHandling/Volo/Abp/ExceptionHandling/IExceptionToErrorInfoConverter.cs` | `/core/overview` |
+| **IObjectValidator** | Composes `DataAnnotations` and FluentValidation validators. Throws `AbpValidationException` on failure. | `framework/src/Volo.Abp.Validation/Volo/Abp/Validation/IObjectValidator.cs`, `Volo.Abp.FluentValidation/` | `/core/overview` |
+
+## Localization
+
+| Term | Definition | Defining file / symbol | Related |
+| --- | --- | --- | --- |
+| **Localization Resource** | `[LocalizationResource]`-annotated class that anchors a tree of JSON files in the VFS. Injected as `IStringLocalizer<TResource>`. | `framework/src/Volo.Abp.Localization/Volo/Abp/Localization/LocalizationResourceAttribute.cs`, `Resources/` folder convention | `/core/overview` |
+| **Language Info** | Item in `AbpLocalizationOptions.Languages` (`LanguageInfo(cultureName, uiCultureName, displayName)`). Drives the language picker. | `framework/src/Volo.Abp.Localization/Volo/Abp/Localization/LanguageInfo.cs` | `/core/overview` |
+
+## Quick navigation
+
+<CardGroup cols={2}>
+  <Card title="Architecture (layers, modules, boot)" href="/overview/architecture" />
+  <Card title="Repository layout (all directories)" href="/overview/repository-layout" />
+  <Card title="Solution structure (.slnx / .abpmdl)" href="/overview/solution-structure" />
+  <Card title="Build & tooling" href="/overview/build-and-tooling" />
+  <Card title="DDD layer rules" href="/ddd/overview" />
+  <Card title="Data & Unit of Work" href="/data/overview" />
+  <Card title="Module catalogue" href="/modules/overview" />
+  <Card title="CLI commands" href="/cli/overview" />
+  <Card title="Application startup flow" href="/flows/application-startup" />
+  <Card title="Core DI / extensions / hooks" href="/core/overview" />
+</CardGroup>
+
+## Naming conventions used everywhere
+
+| Convention | Where it appears | Example |
+| --- | --- | --- |
+| `Volo.Abp.*` | Every framework / first-party module NuGet | `Volo.Abp.Core`, `Volo.Abp.Identity.Domain` |
+| `Abp*Module` | Public framework module class name | `AbpAutofacModule`, `AbpDddDomainModule`, `AbpAspNetCoreMvcModule` |
+| `Abp*Options` | MS Options pattern object for an ABP feature | `AbpMultiTenancyOptions`, `AbpLocalizationOptions`, `AbpVirtualFileSystemOptions`, `AbpBlobStoringOptions` |
+| `Abp*ConventionalRegistrar` | Class scanning assemblies during `ConfigureServices` | `AbpRepositoryConventionalRegistrar`, `BasicConventionalRegistrar` |
+| `Default*` | Default DI implementation of an `I*` abstraction | `DefaultModuleLifecycleContributor`, `DefaultConnectionStringResolver` |
+| `Null*` | No-op fallback registered when no real implementation is configured | `NullTenantResolveResultAccessor`, `NullEmailSender` |
+| `*Contributor` | Pluggable participant in a pipeline (resolve / register / bundle) | `TenantResolveContributorBase`, `IBundleContributor`, `ISettingValueProvider` |
+| `*Provider` | Strategy supplying a value or feature implementation | `IBlobProvider`, `IFeatureValueProvider`, `IVirtualFileProvider` |
+| `*Manager` | Domain-service-style coordinator | `IUnitOfWorkManager`, `IBlobContainerFactory`, `IAuditingManager` |
+| `*Store` | Persistence-only abstraction sitting under a Manager | `IPermissionStore`, `IFeatureStore`, `ISettingStore` |
+| `*Definition` / `*DefinitionContext` | Metadata records emitted by definition providers | `PermissionDefinition`, `FeatureDefinitionContext`, `SettingDefinition` |
+| `Current*` | Ambient request-scoped accessor | `ICurrentUser`, `ICurrentTenant`, `ICurrentPrincipalAccessor` |
+| `ITransient/Scoped/SingletonDependency` | Lifetime markers — convention picks them up | see Lifecycle section |
+| `[Dependency]`, `[ExposeServices]`, `[UnitOfWork]`, `[DependsOn]`, `[Audited]`, `[DisableAuditing]`, `[Authorize(...)]`, `[RequiresFeature(...)]` | Attributes layered on classes/methods | All in `framework/src/Volo.Abp.*` |
+
+## File / folder conventions inside a layer
+
+| File or folder | Layer | Purpose |
+| --- | --- | --- |
+| `<Name>Module.cs` | every layer | The module class. One per csproj. |
+| `<Name>Consts.cs` | Domain.Shared | Const strings (table prefixes, db schema, max lengths). Example `IdentityConsts`. |
+| `<Name>ErrorCodes.cs` | Domain.Shared | Localized error-code constants thrown via `BusinessException`. |
+| `Localization/Resources/<Name>/<lang>.json` | Domain.Shared | Localization JSON consumed via the VFS. |
+| `<Aggregate>.cs` | Domain | Aggregate root POCO. |
+| `<Aggregate>Manager.cs` | Domain | Domain service operating over the aggregate. |
+| `I<Aggregate>Repository.cs` | Domain | Repository interface; implementation lives in EF/Mongo layer. |
+| `<Entity>EventHandler.cs` | Domain | Local event handler for domain events. |
+| `Permissions/<Name>PermissionDefinitionProvider.cs` | Application.Contracts | Permission tree definitions. |
+| `Features/<Name>FeatureDefinitionProvider.cs` | Application.Contracts | Feature tree definitions. |
+| `Settings/<Name>SettingDefinitionProvider.cs` | Domain | Setting tree definitions. |
+| `I<Aggregate>AppService.cs` + `<Aggregate>Dto.cs` + `CreateUpdate<Aggregate>Dto.cs` + `<Aggregate>GetListInput.cs` | Application.Contracts | App service surface. |
+| `<Aggregate>AppService.cs` + `<Name>ApplicationAutoMapperProfile.cs` | Application | Implementation + mapping. |
+| `<Aggregate>Controller.cs` (RemoteService route) | HttpApi | Optional explicit controller; otherwise application services are auto-exposed. |
+| `<Name>DbContext.cs` + `<Aggregate>DbContextModelCreatingExtensions.cs` + `EfCore<Aggregate>Repository.cs` | EntityFrameworkCore | EF persistence. |
+| `<Name>MongoDbContext.cs` + `MongoDb<Aggregate>Repository.cs` | MongoDB | Mongo persistence. |
+| `Pages/<Aggregate>/`, `Menus/<Name>MenuContributor.cs`, `Views/`, `Components/` | Web | Razor UI surface. |
+
+<Tip>
+The conventions above are not enforced by analyzers — they are enforced by ABP Studio's templates and the existing source. Putting a Permission Definition Provider in `Domain` instead of `Application.Contracts` will compile but will not be visible to clients that only reference the contracts. Always copy the layout of an existing module like `modules/identity/src/` when adding a new one.
+</Tip>
+
+<Note>
+When a wiki page introduces a new term, add a row here with its defining file. The glossary's value is that every other page can assume these meanings rather than redefining them.
+</Note>

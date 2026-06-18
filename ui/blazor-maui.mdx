@@ -1,0 +1,286 @@
+---
+title: "MauiBlazor — Blazor inside a .NET MAUI host"
+sidebarTitle: "Blazor MAUI (MauiBlazor)"
+description: "AbpAspNetCoreComponentsMauiBlazorModule wiring: BlazorWebView extension, the IMauiBlazorContentFileProvider that serves bundled assets from the MAUI app's virtual file system, AbpMauiBlazorClientHttpMessageHandler, configuration cache pre-init and the four-module MauiBlazor stack."
+---
+
+The MauiBlazor stack runs ABP's Blazor UI inside a `BlazorWebView` hosted by a .NET MAUI app — giving you the Blazor component story on iOS, Android, Windows and macOS without rewriting screens. It's split into **four** packages so an agent has to keep the layering straight:
+
+| Package | Role |
+| --- | --- |
+| `Volo.Abp.AspNetCore.Components.MauiBlazor` | Runtime: configuration cache, principal/tenant accessors, HTTP message handler, language provider. |
+| `Volo.Abp.AspNetCore.Components.MauiBlazor.Bundling` | File-system bridge: `AbpBlazorWebView`, `IMauiBlazorContentFileProvider`, `BundleManager`, `MauiBlazorBundlerBase` — runs the bundle pipeline against MAUI's `FileSystem.AppDataDirectory` and ABP's virtual file system. |
+| `Volo.Abp.AspNetCore.Components.MauiBlazor.Theming` | Composite: depends on `MauiBlazor` + `Web.Theming` + the theming-bundling module. |
+| `Volo.Abp.AspNetCore.Components.MauiBlazor.Theming.Bundling` | Declares the `MauiBlazor.Global` bundle and the `GlobalAssets.Enabled = true` switch (analogue of the WASM theming-bundling module). |
+
+Before reading this page, see [`/ui/blazor-components-web`](/ui/blazor-components-web) for the shared abstractions and [`/ui/blazor-components-webassembly`](/ui/blazor-components-webassembly) because MauiBlazor borrows most of its lifecycle patterns from WASM.
+
+## Module composition
+
+`framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor/Volo/Abp/AspNetCore/Components/MauiBlazor/AbpAspNetCoreComponentsMauiBlazorModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcClientCommonModule),
+    typeof(AbpUiModule),
+    typeof(AbpAspNetCoreComponentsWebModule))]
+public class AbpAspNetCoreComponentsMauiBlazorModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<AbpHttpClientBuilderOptions>(options =>
+        {
+            options.ProxyClientBuildActions.Add((_, builder) =>
+            {
+                builder.AddHttpMessageHandler<AbpMauiBlazorClientHttpMessageHandler>();
+            });
+        });
+    }
+
+    public async override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        await context.ServiceProvider.GetRequiredService<IClientScopeServiceProviderAccessor>()
+            .ServiceProvider.GetRequiredService<MauiBlazorCachedApplicationConfigurationClient>().InitializeAsync();
+
+        await context.ServiceProvider.GetRequiredService<IClientScopeServiceProviderAccessor>()
+            .ServiceProvider.GetRequiredService<AbpComponentsClaimsCache>().InitializeAsync();
+
+        await SetCurrentLanguageAsync(context.ServiceProvider);
+    }
+}
+```
+
+Comparing to the WASM module:
+
+- Same shape: pre-init the configuration cache + claims cache, apply `CultureInfo.DefaultThreadCurrentCulture`, set `rtl` body class for RTL.
+- HTTP handler injected for every proxy client — but the **MauiBlazor variant** doesn't do antiforgery (no cookie origin); see below.
+- **No `AuthenticationStateProvider` replacement.** MauiBlazor apps usually go through OAuth via `Volo.Abp.Http.Client.IdentityModel.MauiBlazor` (separate package), and `MauiBlazorCurrentPrincipalAccessor` resolves the principal from `AbpComponentsClaimsCache` directly.
+
+`SetCurrentLanguageAsync` is identical to the WASM version: read `Localization.CurrentCulture.CultureName` from the cached `ApplicationConfigurationDto`, set `CultureInfo.DefaultThreadCurrentCulture` / `DefaultThreadCurrentUICulture`, add `rtl` class via `IAbpUtilsService` when needed.
+
+## HTTP handler
+
+`AbpMauiBlazorClientHttpMessageHandler` (`MauiBlazor/AbpMauiBlazorClientHttpMessageHandler.cs`) is leaner than its WASM cousin — there's no browser cookie jar to read antiforgery tokens from:
+
+```csharp
+protected async override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+{
+    try
+    {
+        await _uiPageProgressService.Go(null, o => o.Type = UiPageProgressType.Info);
+        await SetLanguageAsync(request);
+        await SetTimeZoneAsync(request);
+        return await base.SendAsync(request, ct);
+    }
+    finally
+    {
+        await _uiPageProgressService.Go(-1);
+    }
+}
+```
+
+Language is read via `IMauiBlazorSelectedLanguageProvider` (interface in the same package; default impl is `NullMauiBlazorSelectedLanguageProvider`). The host MAUI app replaces it with whatever stores the user's chosen language — `Preferences.Default.Get("language", null)`, a setting from the API, etc.
+
+## Principal & tenant accessors
+
+`MauiBlazor/MauiBlazorCurrentPrincipalAccessor.cs`:
+
+```csharp
+public class MauiBlazorCurrentPrincipalAccessor : CurrentPrincipalAccessorBase, ITransientDependency
+{
+    private AbpComponentsClaimsCache ClaimsCache { get; }
+
+    public MauiBlazorCurrentPrincipalAccessor(IClientScopeServiceProviderAccessor accessor)
+    {
+        ClaimsCache = accessor.ServiceProvider.GetRequiredService<AbpComponentsClaimsCache>();
+    }
+
+    protected override ClaimsPrincipal GetClaimsPrincipal() => ClaimsCache.Principal;
+}
+```
+
+So `ICurrentUser` on MauiBlazor reads from the `AbpComponentsClaimsCache` populated at module init and refreshed by `MauiCurrentApplicationConfigurationCacheResetService`. `MauiBlazorCurrentTenantAccessor`, `MauiBlazorCurrentTimezoneProvider`, `MauiBlazorRemoteTenantStore` and `MauiBlazorServerUrlProvider` follow the same pattern — they're MAUI-storage-backed replacements for their HTTP-context counterparts.
+
+## File serving — `AbpBlazorWebView` and `IMauiBlazorContentFileProvider`
+
+This is the most MauiBlazor-specific bit. A `BlazorWebView` resolves static assets (CSS, JS, images, the precompiled bundle) through an `IFileProvider` — by default the embedded webroot. ABP composes a *virtual* file provider into it so that:
+
+- ABP modules' embedded `wwwroot/...` files become reachable from inside the BlazorWebView.
+- The pre-rendered `Global.css` / `Global.js` from the bundling module appear as if they were on disk.
+
+`Bundling/AbpBlazorWebView.cs`:
+
+```csharp
+public class AbpBlazorWebView : BlazorWebView
+{
+    public override IFileProvider CreateFileProvider(string contentRootDir)
+    {
+        return new CompositeFileProvider(
+            Handler!.GetRequiredService<IMauiBlazorContentFileProvider>(),
+            base.CreateFileProvider(contentRootDir));
+    }
+}
+```
+
+`MauiBlazorContentFileProvider` (`Bundling/MauiBlazorContentFileProvider.cs`) is a singleton `ISingletonDependency` wrapping `IVirtualFileProvider`:
+
+```csharp
+public class MauiBlazorContentFileProvider : IMauiBlazorContentFileProvider, ISingletonDependency
+{
+    private readonly IFileProvider _fileProvider;
+    private string _rootPath = "/wwwroot";
+
+    public MauiBlazorContentFileProvider(IVirtualFileProvider virtualFileProvider) { /* … */ }
+
+    public string ContentRootPath => FileSystem.Current.AppDataDirectory;
+
+    public IFileInfo GetFileInfo(string subpath)
+    {
+        var fi = _fileProvider.GetFileInfo(subpath);
+        return fi.Exists ? fi : _fileProvider.GetFileInfo(_rootPath + subpath.EnsureStartsWith('/'));
+    }
+}
+```
+
+So a request like `<link href="/global.css">` from the BlazorWebView falls through to the virtual file system, which after `InitialGlobalAssetsAsync` has a `/wwwroot/global.css` entry registered via `IDynamicFileProvider.AddOrUpdate(...)`.
+
+The host MAUI app uses `AbpBlazorWebView` in its XAML / code instead of the default `BlazorWebView`.
+
+## Bundling — single global pre-rendered asset
+
+`framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor.Bundling/Volo/Abp/AspNetCore/Components/MauiBlazor/Bundling/AbpAspNetCoreComponentsMauiBlazorBundlingModule.cs` does at app-init what the MVC bundling module does per-request — it merges every contributor for the configured global bundle into one in-memory file:
+
+```csharp
+public async override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    => await InitialGlobalAssetsAsync(context);
+
+protected virtual async Task InitialGlobalAssetsAsync(ApplicationInitializationContext context)
+{
+    var bundlingOptions = context.ServiceProvider.GetRequiredService<IOptions<AbpBundlingOptions>>().Value;
+    if (!bundlingOptions.GlobalAssets.Enabled) return;
+
+    var bundleManager = context.ServiceProvider.GetRequiredService<BundleManager>();
+    var mauiBlazorContentFileProvider = context.ServiceProvider.GetRequiredService<IMauiBlazorContentFileProvider>();
+    var dynamicFileProvider = context.ServiceProvider.GetRequiredService<IDynamicFileProvider>();
+
+    if (!bundlingOptions.GlobalAssets.GlobalStyleBundleName.IsNullOrWhiteSpace())
+    {
+        var styleFiles = await bundleManager.GetStyleBundleFilesAsync(bundlingOptions.GlobalAssets.GlobalStyleBundleName);
+        var styles = string.Empty;
+        foreach (var file in styleFiles)
+        {
+            var fileInfo = mauiBlazorContentFileProvider.GetFileInfo(file.FileName);
+            // … read, CSS-rebase, minify-or-not, concatenate …
+        }
+        dynamicFileProvider.AddOrUpdate(
+            new InMemoryFileInfo("/wwwroot/" + bundlingOptions.GlobalAssets.CssFileName,
+                Encoding.UTF8.GetBytes(styles),
+                bundlingOptions.GlobalAssets.CssFileName));
+    }
+
+    // … same for scripts: concatenate, EnsureEndsWith(';'), AddOrUpdate /wwwroot/<js> …
+}
+```
+
+So at MAUI app startup the framework:
+
+1. Pulls every contributor's files for the `MauiBlazor.Global` bundle.
+2. Reads each file through `IMauiBlazorContentFileProvider` (which can reach into embedded module resources).
+3. Concatenates (and minifies via `Volo.Abp.Minify`, when bundling is enabled).
+4. Pushes the resulting bytes into `IDynamicFileProvider` at `/wwwroot/<css|js>`.
+5. The `AbpBlazorWebView` then serves those bytes directly to the WebView when the layout's `<link>`/`<script>` tags request them.
+
+The standard-bundle constants are in `Theming.Bundling/MauiBlazorStandardBundles.cs`:
+
+```csharp
+public class MauiBlazorStandardBundles
+{
+    public static class Styles  { public static string Global = "MauiBlazor.Global"; }
+    public static class Scripts { public static string Global = "MauiBlazor.Global"; }
+}
+```
+
+And the theming-bundling module wires them with `GlobalAssets.Enabled = true`:
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreMvcUiBundlingAbstractionsModule))]
+public class AbpAspNetCoreComponentsMauiBlazorThemingBundlingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.GlobalAssets.Enabled = true;
+            options.GlobalAssets.GlobalStyleBundleName  = MauiBlazorStandardBundles.Styles.Global;
+            options.GlobalAssets.GlobalScriptBundleName = MauiBlazorStandardBundles.Scripts.Global;
+
+            options.StyleBundles
+                .Add(MauiBlazorStandardBundles.Styles.Global,
+                     b => b.AddContributors(typeof(MauiStyleContributor)));
+
+            options.ScriptBundles
+                .Add(MauiBlazorStandardBundles.Scripts.Global,
+                     b => b.AddContributors(typeof(MauiScriptContributor)));
+        });
+    }
+}
+```
+
+## Bundlers and minification
+
+`MauiBlazorBundlerBase` (`Bundling/MauiBlazorBundlerBase.cs`) is the MAUI counterpart to `MvcUiBundlerBase` — it inherits `BundlerBase` and resolves files through `IMauiBlazorContentFileProvider` instead of `IWebHostEnvironment`. The concrete classes are:
+
+- `MauiBlazor.Bundling/Scripts/ScriptBundler.cs` — `IScriptBundler`, uses `IJavascriptMinifier`.
+- `MauiBlazor.Bundling/Styles/StyleBundler.cs` — `IStyleBundler`, uses `ICssMinifier`, applies `CssRelativePath.Adjust`.
+
+These are the same `IJavascriptMinifier` / `ICssMinifier` interfaces from `Volo.Abp.Minify`. See [`/ui/minify`](/ui/minify).
+
+## Theming composite
+
+`framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor.Theming/AbpAspNetCoreComponentsMauiBlazorThemingModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsMauiBlazorThemingBundlingModule),
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpAspNetCoreComponentsMauiBlazorModule))]
+public class AbpAspNetCoreComponentsMauiBlazorThemingModule : AbpModule { }
+```
+
+No code — just the dependency graph. The host module of the MAUI app depends on `AbpAspNetCoreComponentsMauiBlazorThemingModule` plus a concrete theme module (Basic, LeptonX, etc.).
+
+## Typical MAUI host module shape
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsMauiBlazorThemingModule),
+    typeof(AbpAspNetCoreComponentsMauiBlazorBundlingModule), // optional explicit if not pulled transitively
+    typeof(AbpMauiClientModule),                              // see /ui/maui-client
+    typeof(AbpHttpClientIdentityModelMauiBlazorModule)        // OAuth flows
+    // … your application client modules …
+)]
+public class MyMauiBlazorClientModule : AbpModule
+{
+    // Module initialization (AddApplication<...>) is done in MauiProgram.CreateMauiApp()
+    // with builder.Services.AddAbpApplication<MyMauiBlazorClientModule>(...);
+}
+```
+
+The MAUI program file then wires the `BlazorWebView`:
+
+```xml
+<abp:AbpBlazorWebView HostPage="wwwroot/index.html">
+    <abp:AbpBlazorWebView.RootComponents>
+        <RootComponent Selector="#app" ComponentType="{x:Type local:Routes}" />
+    </abp:AbpBlazorWebView.RootComponents>
+</abp:AbpBlazorWebView>
+```
+
+## Related pages
+
+- [`/ui/blazor-components-web`](/ui/blazor-components-web) — shared Blazor abstractions used here.
+- [`/ui/blazor-components-webassembly`](/ui/blazor-components-webassembly) — sister stack with very similar lifecycle.
+- [`/ui/maui-client`](/ui/maui-client) — pure-MAUI client integration without Blazor.
+- [`/ui/blazorise-ui`](/ui/blazorise-ui) — the component library this stack consumes.
+- [`/ui/minify`](/ui/minify) — minifier feeding the bundler.
+- [`/aspnetcore/mvc-ui-bundling`](/aspnetcore/mvc-ui-bundling) — `AbpBundlingOptions.GlobalAssets` model.

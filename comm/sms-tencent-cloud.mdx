@@ -1,0 +1,192 @@
+---
+title: "Tencent Cloud SMS provider"
+sidebarTitle: "SMS — Tencent Cloud"
+description: "Volo.Abp.Sms.TencentCloud — ISmsSender backed by Tencent Cloud SMS (V20210111)."
+---
+
+`framework/src/Volo.Abp.Sms.TencentCloud/` provides an `ISmsSender` implementation backed by the official Tencent Cloud SDK (`TencentCloud.Sms.V20210111`). It mirrors the [Aliyun provider](./sms-aliyun) in shape: bind options, map `SmsMessage.Properties` to provider-specific fields, build a fresh SDK client per send.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `AbpSmsTencentCloudModule.cs` | ABP module — binds `AbpTencentCloudSmsOptions` from the `AbpTencentCloudSms` config section. |
+| `AbpTencentCloudSmsOptions.cs` | Credentials, endpoint, region, and the SMS SDK App ID. |
+| `TencentCloudSmsProperties.cs` | Two string constants — the `SmsMessage.Properties` keys this provider reads. |
+| `TencentCloudSmsSender.cs` | The transient `ISmsSender` implementation. |
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpSmsModule))]
+public class AbpSmsTencentCloudModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpTencentCloudSmsOptions>(configuration.GetSection("AbpTencentCloudSms"));
+    }
+}
+```
+
+Config section: `AbpTencentCloudSms`. Sample:
+
+```json
+{
+  "AbpTencentCloudSms": {
+    "SecretId": "AKIDxxxxxxxxxxxxxxxx",
+    "SecretKey": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "SmsSdkAppId": "1400xxxxxx",
+    "Endpoint": "sms.tencentcloudapi.com",
+    "Region": "ap-guangzhou"
+  }
+}
+```
+
+## `AbpTencentCloudSmsOptions`
+
+```csharp
+public class AbpTencentCloudSmsOptions
+{
+    public string SmsSdkAppId { get; set; } = default!;
+    public string SecretKey   { get; set; } = default!;
+    public string SecretId    { get; set; } = default!;
+    public string Endpoint    { get; set; } = "sms.tencentcloudapi.com";
+    public string Region      { get; set; } = "ap-guangzhou";
+}
+```
+
+Notice the difference from Aliyun: this options class ships with **defaults** for `Endpoint` and `Region`. The other three (`SmsSdkAppId`, `SecretId`, `SecretKey`) are `default!` and must be configured — the SDK will throw if you call `SendSms` without them.
+
+`Region` is the Tencent Cloud region code (`ap-guangzhou`, `ap-shanghai`, `ap-singapore`, `na-toronto`, etc.). It is _not_ free-form; the SDK validates against a known list.
+
+## `TencentCloudSmsProperties`
+
+```csharp
+public static class TencentCloudSmsProperties
+{
+    public const string SignName   = "SignName";
+    public const string TemplateId = "TemplateId";
+}
+```
+
+These are the property keys the sender reads from `SmsMessage.Properties`. The string values are stable; use the constants in calling code to avoid typos.
+
+## `TencentCloudSmsSender`
+
+```csharp
+public class TencentCloudSmsSender : ISmsSender, ITransientDependency
+{
+    protected AbpTencentCloudSmsOptions Options { get; }
+
+    public TencentCloudSmsSender(IOptionsMonitor<AbpTencentCloudSmsOptions> options)
+    {
+        Options = options.CurrentValue;
+    }
+
+    public virtual async Task SendAsync(SmsMessage smsMessage)
+    {
+        var client = CreateClient();
+
+        await client.SendSms(new SendSmsRequest
+        {
+            SmsSdkAppId      = Options.SmsSdkAppId,
+            SignName         = smsMessage.Properties.GetOrDefault(TencentCloudSmsProperties.SignName) as string,
+            TemplateId       = smsMessage.Properties.GetOrDefault(TencentCloudSmsProperties.TemplateId) as string,
+            TemplateParamSet = smsMessage.Text.Split(','),
+            PhoneNumberSet   = [smsMessage.PhoneNumber]
+        });
+    }
+
+    protected virtual SmsClient CreateClient()
+    {
+        var credential = new Credential
+        {
+            SecretId  = Options.SecretId,
+            SecretKey = Options.SecretKey
+        };
+        var clientProfile = new ClientProfile
+        {
+            HttpProfile = new HttpProfile
+            {
+                Endpoint = Options.Endpoint
+            }
+        };
+        return new SmsClient(credential, Options.Region, clientProfile);
+    }
+}
+```
+
+### Mapping `SmsMessage` → Tencent `SendSmsRequest`
+
+| `SmsMessage` field | Tencent field | Type | Notes |
+| --- | --- | --- | --- |
+| _options_ (`SmsSdkAppId`) | `SmsSdkAppId` | `string` | Per-application id from Tencent Cloud SMS console. Not from `SmsMessage`. |
+| `Properties["SignName"]` | `SignName` | `string` | Pre-approved signature. |
+| `Properties["TemplateId"]` | `TemplateId` | `string` | Tencent template id (numeric string). |
+| `Text` | `TemplateParamSet` | `string[]` | **Comma-split** into the template parameter array. |
+| `PhoneNumber` | `PhoneNumberSet` | `string[]` | Wrapped in a single-element array via collection-expression `[smsMessage.PhoneNumber]`. |
+
+Two mapping quirks vs. Aliyun:
+
+1. **`Text` is comma-split**, not JSON. Aliyun expects `{"code":"123456"}`; Tencent expects `"123456"` (one parameter) or `"123456,300"` (two parameters in template order).
+2. **One number per call.** `PhoneNumberSet` is wrapped as `[smsMessage.PhoneNumber]`. To send to multiple recipients in one request you'd need to override `SendAsync` and construct the array yourself — there's no convention for stashing multiple numbers in `SmsMessage.PhoneNumber`.
+
+### Calling pattern
+
+```csharp
+public class TencentOtpService : ITransientDependency
+{
+    private readonly ISmsSender _smsSender;
+
+    public Task SendCodeAsync(string phone, string code, int expiryMinutes)
+    {
+        // Tencent template parameter order: {1} = code, {2} = expiry minutes
+        var msg = new SmsMessage(phone, $"{code},{expiryMinutes}");
+        msg.Properties[TencentCloudSmsProperties.SignName]   = "MyCompany";
+        msg.Properties[TencentCloudSmsProperties.TemplateId] = "1234567";
+        return _smsSender.SendAsync(msg);
+    }
+}
+```
+
+Phone numbers passed to Tencent must include the country code with `+`, e.g. `+8613800138000` for mainland China. Numbers without `+` are silently rejected by the gateway.
+
+## Implementation notes
+
+- **`SendAsync` is `virtual`** — unlike Aliyun's, this one explicitly opts into subclassing. Override to change the request shape (add `SessionContext`, `ExtendCode`, `SenderId`).
+- **`CreateClient` is also `virtual`** — override to swap credentials or HTTP profile (proxy, custom timeout, regional endpoint override).
+- **One `SmsClient` per call**, same as the Aliyun provider. The Tencent SDK uses a per-request HMAC-SHA256 signing scheme, so there's no warm-up cost beyond TCP/TLS that an `HttpClientHandler` reuse would mitigate.
+- **No retries / no exception translation.** Tencent SDK throws `TencentCloudSDKException` for both transport failures and business errors (e.g. invalid signature). Catch in your application code if you need to differentiate.
+- **`Endpoint` vs `Region` are independent.** The endpoint is the SMS API host (`sms.tencentcloudapi.com` or a regional override); the region is sent as a header for routing. Both must be set consistently.
+
+## Replacing the sender
+
+To pass `SessionContext` (Tencent's callback correlation field) through `SmsMessage.Properties`:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class MyTencentCloudSmsSender : TencentCloudSmsSender
+{
+    public MyTencentCloudSmsSender(IOptionsMonitor<AbpTencentCloudSmsOptions> o) : base(o) { }
+
+    public override async Task SendAsync(SmsMessage smsMessage)
+    {
+        var client = CreateClient();
+        await client.SendSms(new SendSmsRequest
+        {
+            SmsSdkAppId      = Options.SmsSdkAppId,
+            SignName         = smsMessage.Properties.GetOrDefault(TencentCloudSmsProperties.SignName) as string,
+            TemplateId       = smsMessage.Properties.GetOrDefault(TencentCloudSmsProperties.TemplateId) as string,
+            TemplateParamSet = smsMessage.Text.Split(','),
+            PhoneNumberSet   = [smsMessage.PhoneNumber],
+            SessionContext   = smsMessage.Properties.GetOrDefault("SessionContext") as string
+        });
+    }
+}
+```
+
+## See also
+
+- [SMS abstractions](./sms)
+- [Aliyun SMS provider](./sms-aliyun)

@@ -1,0 +1,199 @@
+---
+title: "Sending SMS: Volo.Abp.Sms"
+sidebarTitle: "SMS"
+description: "ISmsSender, SmsMessage, NullSmsSender — the minimal contract that Aliyun, Tencent Cloud and any custom provider plug into."
+---
+
+`framework/src/Volo.Abp.Sms/` is the SMS abstractions package. It is intentionally tiny — five files, no concrete providers — because every SMS gateway has a different signing scheme, template model, and rate-limit policy. ABP just defines the contract and a `NullSmsSender` so application code can depend on `ISmsSender` without conditional compilation.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `AbpSmsModule.cs` | Empty `AbpModule` — exists only so provider packages can `[DependsOn(typeof(AbpSmsModule))]`. |
+| `ISmsSender.cs` | The interface — one method, `SendAsync(SmsMessage)`. |
+| `SmsMessage.cs` | DTO with phone number, text, and a free-form `Properties` dictionary. |
+| `NullSmsSender.cs` | Default `[Dependency(TryRegister = true)]` `ISingletonDependency` that logs and returns. |
+| `SmsSenderExtensions.cs` | Convenience overload `SendAsync(phoneNumber, text)`. |
+
+## Module
+
+```csharp
+public class AbpSmsModule : AbpModule { }
+```
+
+No `ConfigureServices`. No options. No settings. The contract is registered via the `NullSmsSender`'s attributes and provider packages register their own implementations through `[Dependency(ReplaceServices = true)]` (or by being the only non-`TryRegister` registration).
+
+## `ISmsSender`
+
+```csharp
+public interface ISmsSender
+{
+    Task SendAsync(SmsMessage smsMessage);
+}
+```
+
+That is the entire surface area. There is **no `QueueAsync`**, no background-job hop equivalent to `IEmailSender.QueueAsync` — if you want asynchronous, retried SMS delivery you wrap calls in your own `IBackgroundJobManager.EnqueueAsync<MySmsJob>(...)`. See [Background jobs](/background/background-jobs).
+
+The extension method is the ergonomic entry point for one-shot sends:
+
+```csharp
+public static class SmsSenderExtensions
+{
+    public static Task SendAsync(
+        [NotNull] this ISmsSender smsSender,
+        [NotNull] string phoneNumber,
+        [NotNull] string text)
+    {
+        Check.NotNull(smsSender, nameof(smsSender));
+        return smsSender.SendAsync(new SmsMessage(phoneNumber, text));
+    }
+}
+```
+
+## `SmsMessage`
+
+```csharp
+public class SmsMessage
+{
+    public string PhoneNumber { get; }
+    public string Text { get; }
+    public IDictionary<string, object> Properties { get; }
+
+    public SmsMessage([NotNull] string phoneNumber, [NotNull] string text)
+    {
+        PhoneNumber = Check.NotNullOrWhiteSpace(phoneNumber, nameof(phoneNumber));
+        Text        = Check.NotNullOrWhiteSpace(text, nameof(text));
+        Properties  = new Dictionary<string, object>();
+    }
+}
+```
+
+Notes:
+
+- **Phone number format is up to the provider.** Aliyun expects `+86...` numbers, Twilio E.164 with `+`, etc. `SmsMessage` does no normalization or validation beyond non-empty.
+- **`Text` is overloaded.** For "free-text" SMS providers it's the message body. For template-based providers (Aliyun, Tencent Cloud), it is the **template parameters** — usually serialized JSON or a comma-separated list — _not_ the rendered message. Each provider documents its expected format.
+- **`Properties` is the metadata bag** every provider uses for the bits that don't fit `PhoneNumber` and `Text`: template id, sign name, country code, sender id, app id. The provider reads these via `GetOrDefault(...)`.
+
+Common property keys used by shipped providers:
+
+| Provider | Property key | Meaning |
+| --- | --- | --- |
+| Aliyun | `"SignName"` | Pre-approved signature/brand name |
+| Aliyun | `"TemplateCode"` | Aliyun template id, e.g. `SMS_123456789` |
+| Tencent Cloud | `TencentCloudSmsProperties.SignName` (= `"SignName"`) | Pre-approved signature |
+| Tencent Cloud | `TencentCloudSmsProperties.TemplateId` (= `"TemplateId"`) | Tencent template id |
+
+See [Aliyun SMS](./sms-aliyun) and [Tencent Cloud SMS](./sms-tencent-cloud) for the wire formats.
+
+## `NullSmsSender`
+
+```csharp
+[Dependency(TryRegister = true)]
+public class NullSmsSender : ISmsSender, ISingletonDependency
+{
+    public ILogger<NullSmsSender> Logger { get; set; } = NullLogger<NullSmsSender>.Instance;
+
+    public Task SendAsync(SmsMessage smsMessage)
+    {
+        Logger.LogWarning($"SMS Sending was not implemented! Using {nameof(NullSmsSender)}:");
+        Logger.LogWarning("Phone Number : " + smsMessage.PhoneNumber);
+        Logger.LogWarning("SMS Text     : " + smsMessage.Text);
+        return Task.CompletedTask;
+    }
+}
+```
+
+Key flags:
+
+- **`[Dependency(TryRegister = true)]`** — registers itself only if nothing else has registered `ISmsSender`. The moment you add `AbpSmsAliyunModule` (or any provider), `NullSmsSender` drops out.
+- **`ISingletonDependency`** — one instance for the application. SMS senders are stateless wrappers around HTTP clients; lifetime difference between this (singleton) and the provider senders (transient) doesn't matter for correctness.
+- **Logs the body at `LogWarning`.** Useful in dev, but means OTP codes end up in logs — never let `NullSmsSender` be active in production.
+
+## How providers register
+
+The pattern every shipped provider uses:
+
+1. Depend on `AbpSmsModule`:
+
+   ```csharp
+   [DependsOn(typeof(AbpSmsModule))]
+   public class AbpSmsAliyunModule : AbpModule { ... }
+   ```
+
+2. Bind options from configuration:
+
+   ```csharp
+   Configure<AbpAliyunSmsOptions>(configuration.GetSection("AbpAliyunSms"));
+   ```
+
+3. Implement `ISmsSender` as a transient — no `ReplaceServices = true` needed because `NullSmsSender` uses `TryRegister`:
+
+   ```csharp
+   public class AliyunSmsSender : ISmsSender, ITransientDependency
+   {
+       public AliyunSmsSender(IOptionsMonitor<AbpAliyunSmsOptions> options) { ... }
+
+       public async Task SendAsync(SmsMessage smsMessage)
+       {
+           var client = CreateClient();
+           await client.SendSmsAsync(/* mapped from smsMessage */);
+       }
+   }
+   ```
+
+When two provider modules are both referenced, the conventional resolution is "the last one wins" — which is rarely what you want. If you need to host multiple SMS gateways concurrently (e.g. route by country), inject `IEnumerable<ISmsSender>` or build a router service that owns the `IServiceProvider` and resolves a keyed provider per call.
+
+## Writing a custom provider
+
+Minimal skeleton:
+
+```csharp
+[DependsOn(typeof(AbpSmsModule))]
+public class MyCompanySmsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<MyCompanySmsOptions>(configuration.GetSection("MyCompanySms"));
+    }
+}
+
+public class MyCompanySmsOptions
+{
+    public string ApiKey { get; set; } = default!;
+    public string Endpoint { get; set; } = default!;
+}
+
+public class MyCompanySmsSender : ISmsSender, ITransientDependency
+{
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly MyCompanySmsOptions _options;
+
+    public MyCompanySmsSender(IHttpClientFactory httpClientFactory,
+        IOptionsMonitor<MyCompanySmsOptions> options)
+    {
+        _httpClientFactory = httpClientFactory;
+        _options = options.CurrentValue;
+    }
+
+    public async Task SendAsync(SmsMessage smsMessage)
+    {
+        var http = _httpClientFactory.CreateClient();
+        // …call your gateway. Read smsMessage.Properties for vendor-specific fields.
+    }
+}
+```
+
+Things to think about that the abstraction does not give you:
+
+- **Retries / idempotency** — the SMS layer is fire-and-forget. Wrap `SendAsync` in a background job if you need at-least-once.
+- **Per-tenant credentials** — `SmsMessage` has no `TenantId`. If you need tenant-scoped credentials, either inject `ICurrentTenant` into your sender and switch options, or use ABP's settings system (analogous to `EmailSettingProvider`) to overlay per-tenant values.
+- **Phone-number validation** — `SmsMessage` only checks for non-empty. Validate format (libphonenumber, regex) before the call.
+- **Rate limiting** — providers throttle at the account level. The abstractions enforce nothing.
+
+## See also
+
+- [Aliyun SMS provider](./sms-aliyun)
+- [Tencent Cloud SMS provider](./sms-tencent-cloud)
+- [Background jobs](/background/background-jobs) — for queued / retried delivery

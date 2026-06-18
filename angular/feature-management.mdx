@@ -1,0 +1,200 @@
+---
+title: "Feature Management UI for ABP Angular Applications"
+sidebarTitle: "Feature Management"
+description: "The feature modal, FeatureManagementTabComponent, FreeTextInput directive, and proxies inside @abp/ng.feature-management."
+---
+
+`@abp/ng.feature-management` is the Angular counterpart of the Feature Management module. Like `@abp/ng.permission-management`, it is **not a routed page** — it ships a modal component (`FeatureManagementComponent`) that other modules embed, plus a generic `FeatureManagementTabComponent` for tab integration in custom settings pages. The Tenant Management UI uses it to manage per-tenant features, and applications surface it for per-edition feature toggling. Sources: [`npm/ng-packs/packages/feature-management/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/feature-management).
+
+## Package metadata
+
+| Field | Value |
+| --- | --- |
+| NPM name | `@abp/ng.feature-management` |
+| Secondary entry point | `@abp/ng.feature-management/proxy` |
+| Module class | `FeatureManagementModule` (deprecated, prefer `provideFeatureManagementConfig`) |
+| Depends on | `@abp/ng.theme.shared` (+ `@angular/aria` peer for the Tabs primitives) |
+
+```typescript
+// feature-management.module.ts (excerpt)
+export const FEATURE_MANAGEMENT_EXPORTS = [
+  FeatureManagementComponent,
+  FreeTextInputDirective,
+  FeatureManagementTabComponent,
+];
+
+@NgModule({
+  imports: [...FEATURE_MANAGEMENT_EXPORTS],
+  exports: [...FEATURE_MANAGEMENT_EXPORTS],
+})
+export class FeatureManagementModule {
+  static forRoot(): ModuleWithProviders<FeatureManagementModule> {
+    return {
+      ngModule: FeatureManagementModule,
+      providers: [provideFeatureManagementConfig()],
+    };
+  }
+}
+```
+
+Modern bootstrap uses the standalone components directly and calls `provideFeatureManagementConfig()` once at the root.
+
+## Component inventory
+
+| Component / directive | File | Selector | Purpose |
+| --- | --- | --- | --- |
+| `FeatureManagementComponent` | `components/feature-management/feature-management.component.ts` | `abp-feature-management` | The modal grid: tabs per feature group, value editors per `ValueType` |
+| `FeatureManagementTabComponent` | `components/feature-management-tab/feature-management-tab.component.ts` | `abp-feature-management-tab` | Embeddable (non-modal) version used inside contributed tabs |
+| `FreeTextInputDirective` | `directives/free-text-input.directive.ts` | `[abpFreeTextInput]` | Renders the right `<input>` (number / string / boolean) based on the feature's `valueType` validator |
+
+### `FeatureManagementComponent` inputs / outputs
+
+| Input | Type | Meaning |
+| --- | --- | --- |
+| `providerName` | `string` | Provider key — `'T'` (tenant), `'E'` (edition), or `'D'` (default) |
+| `providerKey` | `string` | The entity id (tenant id, edition id, or `'default'`) |
+| `visible` | `boolean` | Two-way binding for modal open state |
+| `entityName` | `string` | Title rendered in the modal header |
+
+| Output | Meaning |
+| --- | --- |
+| `visibleChange` | Emitted when the modal closes |
+| `featuresChange` | Emitted after a successful save |
+
+Internally the component:
+
+1. Calls `FeaturesService.get(providerName, providerKey)` — returns `GetFeatureListResultDto` with one `FeatureGroupDto[]` per group, each containing `FeatureDto[]`.
+2. Renders an Angular ARIA `Tabs` per group; rows are typed by `FeatureDto.valueType.name`:
+   - `ToggleStringValueType` → checkbox
+   - `FreeTextStringValueType` → input with `[abpFreeTextInput]`
+   - `SelectionStringValueType` → `<select>` populated from the validator's `items`
+3. On save, batches the diff into `UpdateFeaturesDto` and calls `FeaturesService.update(providerName, providerKey, input)`.
+4. *Reset to defaults* maps to `FeaturesService.delete(providerName, providerKey)`.
+
+## `ValueTypes` and the `FreeTextInput` directive
+
+```typescript
+enum ValueTypes {
+  ToggleStringValueType    = 'ToggleStringValueType',
+  FreeTextStringValueType  = 'FreeTextStringValueType',
+  SelectionStringValueType = 'SelectionStringValueType',
+}
+
+const DEFAULT_PROVIDER_NAME = 'D';
+```
+
+`FreeTextInputDirective` reads the validator name and projects the correct primitive `<input>` type plus min/max/pattern attributes — so feature definitions like `[NumericValueValidator(min: 1, max: 100)]` on the backend render as `<input type="number" min="1" max="100">` in the modal without any per-feature template work.
+
+## `provideFeatureManagementConfig`
+
+`packages/feature-management/src/lib/providers/feature-management-config.provider.ts` exposes the standalone bootstrap helper. It wires:
+
+- The default settings tab (so `@abp/ng.setting-management` can show *Feature management* under settings if installed).
+- `FeatureManagementSettingsProvider` — contributes the settings tab via `SettingTabsService` from `@abp/ng.setting-management/config`.
+
+```typescript
+// app.config.ts
+import { provideFeatureManagementConfig } from '@abp/ng.feature-management';
+providers: [ provideFeatureManagementConfig() ]
+```
+
+## `eFeatureManagementComponents`
+
+`enums/components.ts` declares:
+
+```typescript
+export enum eFeatureManagementComponents {
+  FeatureManagement = 'FeatureManagement.FeatureManagementComponent',
+}
+```
+
+Use the key with `ReplaceableComponentsService.add({ key, component })` to swap the modal globally.
+
+`enums/feature-management-tab-names.ts` lists the canonical tab identifiers used by `FeatureManagementTabComponent` so contributors can target them.
+
+## Generated proxies
+
+`packages/feature-management/proxy/src/lib/proxy/feature-management/`:
+
+| File | Symbol | Endpoints |
+| --- | --- | --- |
+| `features.service.ts` | `FeaturesService` | `GET/PUT/DELETE /api/feature-management/features` |
+| `models.ts` | `GetFeatureListResultDto`, `FeatureGroupDto`, `FeatureDto`, `UpdateFeatureDto`, `UpdateFeaturesDto`, validator DTOs (`ToggleStringValueType`, `FreeTextStringValueType`, `SelectionStringValueType`, `NumericValueValidator`, etc.) | — |
+
+`apiName = 'AbpFeatureManagement'`. The validation namespace is exposed separately under `proxy/validation/` and re-exported from `index.ts`.
+
+## Consuming the modal
+
+Inside Tenant Management (`packages/tenant-management/src/lib/components/tenants/tenants.component.ts`) the Features row-action is wired up as:
+
+```html
+<abp-feature-management
+  *ngIf="featuresVisible"
+  [(visible)]="featuresVisible"
+  [providerKey]="selectedTenant.id"
+  providerName="T"
+  [entityName]="selectedTenant.name">
+</abp-feature-management>
+```
+
+For an Editions UI:
+
+```html
+<abp-feature-management
+  [(visible)]="visible"
+  [providerKey]="edition.id"
+  providerName="E"
+  [entityName]="edition.displayName">
+</abp-feature-management>
+```
+
+## Validators namespace
+
+`packages/feature-management/proxy/src/lib/proxy/validation/` exposes the validator DTOs returned by the backend:
+
+| DTO | Maps to backend attribute |
+| --- | --- |
+| `ToggleStringValueType` | `[FeatureValueTypeBoolean]` |
+| `FreeTextStringValueType` | Free-text input with numeric/string validators |
+| `SelectionStringValueType` | `[SelectionStringValueType]` with `LocalizableSelectionStringValueItem[]` |
+| `NumericValueValidator` | `min`, `max`, `min`-only, `max`-only constraints |
+| `StringValueValidator` | `regex`, `maxLength`, `allowNull` |
+| `LocalizableSelectionStringValueItemDto` | `value` + `displayText` for select inputs |
+
+The `FreeTextInputDirective` reads the validator name on the `valueType` payload and projects the right `<input>` primitive without per-feature code in templates.
+
+## How a save flows through
+
+```mermaid
+graph LR
+  click[User clicks Save]
+  click --> diff[Compute UpdateFeatureDto[]]
+  diff --> http[FeaturesService.update]
+  http --> backend[/api/feature-management/features]
+  backend --> reload[Component reloads features]
+  reload --> emit[featuresChange emit]
+  emit --> outer[Outer component handles refresh]
+```
+
+After the PUT succeeds the component re-runs `FeaturesService.get(...)` so badges (inherited/overridden) reflect the new state, then emits `featuresChange` to the parent (e.g. `TenantsComponent`) so it can refresh its own row.
+
+## Tab integration via `FeatureManagementTabComponent`
+
+`FeatureManagementTabComponent` is the embeddable variant — same inputs (`providerName`, `providerKey`, `entityName`) but no modal wrapper. It is used when a host page wants to render feature toggles as one tab among many. The setting-management page integration uses it through `FeatureManagementSettingsProvider`, which contributes a *Features* tab to `SettingTabsService` and points the tab's `component` at `FeatureManagementTabComponent`.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Features runtime" href="/crosscut/features">
+    Backend `IFeatureDefinitionProvider` and `IFeatureChecker`.
+  </Card>
+  <Card title="Tenant Management" href="/angular/tenant-management">
+    Where this modal is most commonly opened.
+  </Card>
+  <Card title="Feature Management module" href="/modules/feature-management">
+    Server-side application service consumed by `FeaturesService`.
+  </Card>
+  <Card title="Setting Management" href="/angular/setting-management">
+    `provideFeatureManagementConfig()` registers a settings tab there.
+  </Card>
+</CardGroup>

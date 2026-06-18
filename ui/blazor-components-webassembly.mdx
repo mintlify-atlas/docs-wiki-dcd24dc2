@@ -1,0 +1,283 @@
+---
+title: "Blazor WebAssembly hosting model"
+sidebarTitle: "Blazor WebAssembly"
+description: "AbpAspNetCoreComponentsWebAssemblyModule wiring: WebAssemblyHostBuilder.AddApplicationAsync, WebAssemblyAuthenticationStateProvider, AbpBlazorClientHttpMessageHandler, configuration cache pre-init, and the pre-rendered Global bundle pipeline (Theming.Bundling)."
+---
+
+This page covers the **Blazor WebAssembly** adapter — `Volo.Abp.AspNetCore.Components.WebAssembly`, its theming sister `Volo.Abp.AspNetCore.Components.WebAssembly.Theming`, and the standalone bundle-pre-rendering module `Volo.Abp.AspNetCore.Components.WebAssembly.Theming.Bundling`. Read [`/ui/blazor-components-web`](/ui/blazor-components-web) first for the shared layer this stack composes on.
+
+## Host startup — `AbpWebAssemblyHostBuilderExtensions`
+
+WASM apps don't run through `WebApplicationBuilder`. ABP exposes the equivalent of `AddApplication<T>` for `WebAssemblyHostBuilder` in `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly/Microsoft/AspNetCore/Components/WebAssembly/Hosting/AbpWebAssemblyHostBuilderExtensions.cs`:
+
+```csharp
+public async static Task<IAbpApplicationWithExternalServiceProvider> AddApplicationAsync<TStartupModule>(
+    this WebAssemblyHostBuilder builder,
+    Action<AbpWebAssemblyApplicationCreationOptions> options)
+    where TStartupModule : IAbpModule
+{
+    Castle.DynamicProxy.Generators.AttributesToAvoidReplicating.Add<AsyncStateMachineAttribute>();
+
+    builder.Services.AddSingleton<IConfiguration>(builder.Configuration);
+    builder.Services.AddSingleton(builder);
+
+    var application = await builder.Services.AddApplicationAsync<TStartupModule>(opts =>
+    {
+        options?.Invoke(new AbpWebAssemblyApplicationCreationOptions(builder, opts));
+        if (opts.Environment.IsNullOrWhiteSpace())
+            opts.Environment = builder.HostEnvironment.Environment;
+    });
+    return application;
+}
+```
+
+Two things to keep in mind for any agent generating WASM startup code:
+
+1. **`AsyncStateMachineAttribute` is added to `AttributesToAvoidReplicating`.** A workaround for the removal of `Microsoft.AspNetCore.Blazor.BuildTools` in .NET 5+, this prevents Castle DynamicProxy from trying to replicate the `[AsyncStateMachine]` attribute when generating proxies. Without it, the WASM linker / Castle combination throws.
+2. **The `WebAssemblyHostBuilder` itself is registered as a singleton** so `IServiceCollection` extensions (like `services.GetHostBuilder()`) can pull it from DI during module initialisation. `IWebAssemblyHostEnvironment` is also picked up through `services.GetWebAssemblyHostEnvironment()` — falls back to a stub `EmptyWebAssemblyHostEnvironment` in environment `Development` if nothing is registered.
+
+After `AddApplicationAsync`, the app builds the WASM host and calls:
+
+```csharp
+await application.InitializeApplicationAsync(host.Services);
+```
+
+`InitializeApplicationAsync` (same file) seeds the singleton `IClientScopeServiceProviderAccessor.ServiceProvider` — that's what `AbpComponentBase.LazyGetNonScopedRequiredService` resolves against, and what the configuration cache `InitializeAsync()` call uses below.
+
+## `AbpAspNetCoreComponentsWebAssemblyModule`
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcClientCommonModule),
+    typeof(AbpUiModule),
+    typeof(AbpAspNetCoreComponentsWebModule))]
+public class AbpAspNetCoreComponentsWebAssemblyModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        var abpHostEnvironment = context.Services.GetSingletonInstance<IAbpHostEnvironment>();
+        if (abpHostEnvironment.EnvironmentName.IsNullOrWhiteSpace())
+            abpHostEnvironment.EnvironmentName = context.Services.GetWebAssemblyHostEnvironment().Environment;
+
+        PreConfigure<AbpHttpClientBuilderOptions>(options =>
+        {
+            options.ProxyClientBuildActions.Add((_, builder) =>
+            {
+                builder.AddHttpMessageHandler<AbpBlazorClientHttpMessageHandler>();
+            });
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient();
+        context.Services
+            .GetHostBuilder().Logging
+            .AddProvider(new AbpExceptionHandlingLoggerProvider(context.Services));
+
+        if (!context.Services.ExecutePreConfiguredActions<AbpAspNetCoreComponentsWebOptions>().IsBlazorWebApp)
+        {
+            Configure<AbpAuthenticationOptions>(options =>
+            {
+                options.LoginUrl  = "authentication/login";
+                options.LogoutUrl = "authentication/logout";
+            });
+        }
+    }
+
+    public override void PostConfigureServices(ServiceConfigurationContext context)
+    {
+        var msAuthenticationStateProvider =
+            context.Services.FirstOrDefault(x => x.ServiceType == typeof(AuthenticationStateProvider));
+
+        if (msAuthenticationStateProvider is {ImplementationType: not null} &&
+            msAuthenticationStateProvider.ImplementationType.IsGenericType &&
+            msAuthenticationStateProvider.ImplementationType.GetGenericTypeDefinition()
+                == typeof(RemoteAuthenticationService<,,>))
+        {
+            var providerType = typeof(WebAssemblyAuthenticationStateProvider<,,>).MakeGenericType(
+                msAuthenticationStateProvider.ImplementationType.GenericTypeArguments[0],
+                msAuthenticationStateProvider.ImplementationType.GenericTypeArguments[1],
+                msAuthenticationStateProvider.ImplementationType.GenericTypeArguments[2]);
+
+            context.Services.Replace(
+                ServiceDescriptor.Scoped(typeof(AuthenticationStateProvider), providerType));
+        }
+    }
+
+    public async override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        await context.ServiceProvider.GetRequiredService<IClientScopeServiceProviderAccessor>()
+            .ServiceProvider.GetRequiredService<WebAssemblyCachedApplicationConfigurationClient>().InitializeAsync();
+
+        await context.ServiceProvider.GetRequiredService<IClientScopeServiceProviderAccessor>()
+            .ServiceProvider.GetRequiredService<AbpComponentsClaimsCache>().InitializeAsync();
+
+        await SetCurrentLanguageAsync(context.ServiceProvider);
+    }
+}
+```
+
+This is dense — what the agent needs to remember:
+
+| Hook | Effect |
+| --- | --- |
+| **`AsyncStateMachineAttribute` workaround** in `AddApplicationAsync` | Prevents Castle dynamic proxy from re-replicating async attributes (WASM/.NET 5+ regression). |
+| **`AbpBlazorClientHttpMessageHandler` for every proxy client** | Adds language header (`localStorage["Abp.SelectedLanguage"]`), antiforgery token, timezone, and shows page progress. Wires `ICurrentTimezoneProvider`. Without it the API would receive default culture and no XSRF protection on WASM-issued mutations. |
+| **`AbpExceptionHandlingLoggerProvider`** plugged into the host logger | Routes unhandled exceptions into `IUserExceptionInformer` → toast. |
+| **`AbpAuthenticationOptions` rewrite** | If this is a *classic* WASM (not Blazor Web App), login/logout URLs become `authentication/login`/`authentication/logout` — the routes Microsoft's WASM authentication package handles via `RemoteAuthenticatorView`. |
+| **Replaces `AuthenticationStateProvider`** with `WebAssemblyAuthenticationStateProvider<,,>` (`PostConfigureServices`) | Wraps Microsoft's `RemoteAuthenticationService<,,>` to (1) cache access tokens across renders so they can be revoked, (2) re-initialise the `WebAssemblyCachedApplicationConfigurationClient` when claims drift, (3) re-run `AbpComponentsClaimsCache`. |
+| **`OnApplicationInitializationAsync`** | Pre-warms the cached configuration + claims so the first render already has a populated `ICachedApplicationConfigurationClient`, then applies `CultureInfo.DefaultThreadCurrentCulture` and adds an `rtl` body class for RTL languages. |
+
+## `AbpBlazorClientHttpMessageHandler`
+
+Every typed `HttpClient` proxy generated by `AbpAspNetCoreMvcClientCommonModule` is wrapped in this `DelegatingHandler`:
+
+```csharp
+protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+{
+    try
+    {
+        await _uiPageProgressService.Go(null, o => o.Type = UiPageProgressType.Info);
+
+        if (request.RequestUri?.Scheme == Uri.UriSchemeHttps)
+            request.SetBrowserRequestStreamingEnabled(true);
+
+        await SetLanguageAsync(request, ct);
+        await SetAntiForgeryTokenAsync(request);
+        await SetTimeZoneAsync(request);
+
+        return await base.SendAsync(request, ct);
+    }
+    finally
+    {
+        await _uiPageProgressService.Go(-1);
+    }
+}
+```
+
+- `SetLanguageAsync` reads `localStorage["Abp.SelectedLanguage"]` and sets `Accept-Language`.
+- `SetAntiForgeryTokenAsync` copies the `XSRF-TOKEN` cookie into the `RequestVerificationToken` header.
+- `SetTimeZoneAsync` adds the resolved IANA TZ name from `ICurrentTimezoneProvider`.
+- `SetBrowserRequestStreamingEnabled(true)` is the Blazor WASM fetch option that allows large request bodies to stream.
+- The page-progress bar starts at request-time and tears down on completion (success or fault).
+
+## Authentication and access tokens
+
+`WebAssemblyAuthenticationStateProvider<TRemoteAuthenticationState, TAccount, TProviderOptions>` extends Microsoft's `RemoteAuthenticationService<,,>`. The token-caching machinery in `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly/Volo/Abp/AspNetCore/Components/WebAssembly/WebAssemblyAuthenticationStateProvider.cs`:
+
+```csharp
+protected readonly static ConcurrentDictionary<string, string> AccessTokens = new();
+
+public async override Task<AuthenticationState> GetAuthenticationStateAsync()
+{
+    var accessToken = await FindAccessTokenAsync();
+    if (!accessToken.IsNullOrWhiteSpace())
+        AccessTokens.TryAdd(accessToken, accessToken);
+
+    await TryRevokeOldAccessTokensAsync();
+
+    var state = await base.GetAuthenticationStateAsync();
+    var appCfg = await WebAssemblyCachedApplicationConfigurationClient.GetAsync();
+    if (state.User.Identity is { IsAuthenticated: true } && !appCfg.CurrentUser.IsAuthenticated)
+        await WebAssemblyCachedApplicationConfigurationClient.InitializeAsync();
+
+    return state;
+}
+```
+
+So every time Blazor asks for the auth state, ABP:
+
+1. Pulls the current access token and stores it in a static dictionary.
+2. Calls `TryRevokeOldAccessTokensAsync()` on tokens that are no longer current — preventing leaked tokens after silent refresh.
+3. Detects drift between Microsoft's auth state and ABP's cached configuration and re-initialises the configuration client.
+
+## `WebAssemblyCachedApplicationConfigurationClient`
+
+The WASM cache that backs `ICurrentUser`, `ISettingProvider`, `IFeatureChecker`, etc. on the client. Initialised at module init and refreshed when configuration changes (e.g. after the user logs in, switches tenant, or `BlazorWebAssemblyCurrentApplicationConfigurationCacheResetService` is invoked). Backed by `ApplicationConfigurationCache` (a thread-safe holder) and the `AbpApplicationConfigurationClientProxy` / `AbpApplicationLocalizationClientProxy` static client proxies.
+
+Anywhere a component needs the up-to-date principal/feature/setting state without a re-render, calling `await client.InitializeAsync()` reloads everything. The `Volo.Abp.AspNetCore.Components.WebAssembly/Configuration/BlazorWebAssemblyCurrentApplicationConfigurationCacheResetService.cs` is what other code (e.g. tenant-switcher) calls.
+
+## Theming and bundling — pre-rendered global file
+
+WASM cannot run the MVC `BundleManager` at request time (no server). Instead the **bundling.theming** module pre-declares a single `BlazorWebAssembly.Global` style + script bundle and *the host project's build* (via the ABP CLI install-libs / `abp generate-proxy` / `abp bundle` step) materialises them into `wwwroot/global.css` and `wwwroot/global.js`.
+
+`framework/src/Volo.Abp.AspNetCore.Components.WebAssembly.Theming.Bundling/AbpAspNetCoreComponentsWebAssemblyThemingBundlingModule.cs`:
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreMvcUiBundlingAbstractionsModule))]
+public class AbpAspNetCoreComponentsWebAssemblyThemingBundlingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.GlobalAssets.Enabled = true;
+            options.GlobalAssets.GlobalStyleBundleName  = BlazorWebAssemblyStandardBundles.Styles.Global;
+            options.GlobalAssets.GlobalScriptBundleName = BlazorWebAssemblyStandardBundles.Scripts.Global;
+
+            options.StyleBundles
+                .Add(BlazorWebAssemblyStandardBundles.Styles.Global,
+                     b => b.AddContributors(typeof(BlazorWebAssemblyStyleContributor)));
+
+            options.ScriptBundles
+                .Add(BlazorWebAssemblyStandardBundles.Scripts.Global,
+                     b => b.AddContributors(typeof(BlazorWebAssemblyScriptContributor)));
+
+            options.MinificationIgnoredFiles
+                .Add("_content/Microsoft.AspNetCore.Components.WebAssembly.Authentication/AuthenticationService.js");
+        });
+    }
+}
+```
+
+Key points:
+
+- `BlazorWebAssemblyStandardBundles.Styles.Global` / `Scripts.Global` resolve to the literal string `"BlazorWebAssembly.Global"`.
+- `AbpBundlingOptions.GlobalAssets.Enabled = true` flips the bundler into "single combined file" mode — the `CachedBundleDynamicFileProvider` will emit one `.css` and one `.js`.
+- Microsoft's WASM authentication script is added to `MinificationIgnoredFiles` because NUglify breaks its specific code shape.
+
+The theming module itself, `AbpAspNetCoreComponentsWebAssemblyThemingModule`, is just a composite that depends on the bundling module, the Web theming module and the WASM module — no extra options:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsWebAssemblyThemingBundlingModule),
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpAspNetCoreComponentsWebAssemblyModule))]
+public class AbpAspNetCoreComponentsWebAssemblyThemingModule : AbpModule { }
+```
+
+`WebAssemblyComponentBundleManager` (in `Components.WebAssembly.Theming/`) is the `IComponentBundleManager` impl, and it intentionally returns empty lists — the bundle is *already* on disk as `global.css` and `global.js`, so the layout uses static `<link>`/`<script>` references rather than dynamic resolution.
+
+## Other WASM-specific replacements
+
+- `WebAssemblyCurrentTenantAccessor` — reads tenant from cached `ApplicationConfigurationDto`.
+- `WebAssemblyCurrentTimezoneProvider` — uses JS interop to get the browser timezone.
+- `WebAssemblyRemoteCurrentPrincipalAccessor` — pulls `ClaimsPrincipal` from the WASM auth state provider instead of `HttpContext`.
+- `WebAssemblyServerUrlProvider` — exposes the API base URL set in `wwwroot/appsettings.json`.
+- `WebAssemblyMultiTenantUrlProvider` — handles `{0}` placeholder substitution in domain-tenant URLs (configured via `WebAssemblyMultiTenantUrlOptions`).
+
+## Blazor Web App (interactive WebAssembly mode)
+
+If the host is a .NET 8+ **Blazor Web App** mixing server-prerender + interactive WebAssembly, `IsBlazorWebApp` is set in `PreConfigureServices` of the host module. ABP then **does not** override `AbpAuthenticationOptions` (`authentication/login` only applies to classic WASM) and the host explicitly calls `services.AddBlazorWebAppServices()` from `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly/Microsoft/Extensions/DependencyInjection/AbpBlazorWebAppServiceCollectionExtensions.cs`:
+
+```csharp
+public static IServiceCollection AddBlazorWebAppServices(this IServiceCollection services)
+{
+    services.AddSingleton<AuthenticationStateProvider, RemoteAuthenticationStateProvider>();
+    services.Replace(ServiceDescriptor.Transient<IAbpAccessTokenProvider, CookieBasedWebAssemblyAbpAccessTokenProvider>());
+    return services;
+}
+```
+
+`RemoteAuthenticationStateProvider` (`WebApp/RemoteAuthenticationStateProvider.cs`) reads `ICurrentPrincipalAccessor` instead of the WASM auth service — because in a Web App the server has already established the cookie-based principal and the client just mirrors it. `CookieBasedWebAssemblyAbpAccessTokenProvider` reads the access token from a cookie produced by the server-side login flow.
+
+(There's a now-obsolete `AddBlazorWebAppTieredServices` that uses `PersistentComponentStateAbpAccessTokenProvider` — kept for template compatibility but the new path is `AddBlazorWebAppServices`.)
+
+## Related pages
+
+- [`/ui/blazor-components-web`](/ui/blazor-components-web) — shared abstractions.
+- [`/ui/blazor-components-server`](/ui/blazor-components-server) — contrast with the Server hosting model.
+- [`/ui/blazor-maui`](/ui/blazor-maui) — the MauiBlazor host re-uses much of this stack.
+- [`/aspnetcore/mvc-ui-bundling`](/aspnetcore/mvc-ui-bundling) — `AbpBundlingOptions.GlobalAssets` model.
+- [`/auth/openid-connect`](/auth/openid-connect) — the OIDC handshake `RemoteAuthenticationService<,,>` performs.

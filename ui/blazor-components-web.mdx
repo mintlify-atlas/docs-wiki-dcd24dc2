@@ -1,0 +1,289 @@
+---
+title: "Blazor — shared Components and Components.Web layer"
+sidebarTitle: "Blazor shared layer"
+description: "AbpComponentBase, ServiceProviderComponentActivator, AbpAuthenticationState, ICookieService/ILocalStorageService, IUiMessageService/IUiNotificationService, IComponentBundleManager and the DynamicLayoutComponent — the host-agnostic Blazor primitives every ABP Blazor stack inherits."
+---
+
+Before drilling into Server, WebAssembly or MauiBlazor specifics, this page covers the **hosting-model-agnostic** Blazor layer that lives in three packages:
+
+- `Volo.Abp.AspNetCore.Components` — `AbpComponentBase`, the conventional registrar, dependency-injection plumbing.
+- `Volo.Abp.AspNetCore.Components.Web` — service abstractions used by every Blazor stack: cookies, local storage, UI messages, notifications, exception handling, claims cache, server URL provider.
+- `Volo.Abp.AspNetCore.Components.Web.Theming` — Blazor-side `ITheme` (returning a `Type`), `IComponentBundleManager`, `PageToolbar`, layout-hook component, `DynamicLayoutComponent`.
+
+Every Blazor app — whichever hosting model — depends on these (directly or transitively).
+
+## Module roots
+
+### `AbpAspNetCoreComponentsModule`
+
+`framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/AbpAspNetCoreComponentsModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpObjectMappingModule),
+    typeof(AbpSecurityModule),
+    typeof(AbpTimingModule),
+    typeof(AbpMultiTenancyAbstractionsModule))]
+public class AbpAspNetCoreComponentsModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        DynamicProxyIgnoreTypes.Add<ComponentBase>();
+        context.Services.AddConventionalRegistrar(new AbpWebAssemblyConventionalRegistrar());
+    }
+}
+```
+
+Two key effects:
+
+1. **Castle DynamicProxy ignores `ComponentBase`.** ABP would otherwise wrap interceptors around every Razor component, breaking Blazor's renderer (which inspects the concrete type). This line is mandatory.
+2. **`AbpWebAssemblyConventionalRegistrar`** registers types as Blazor expects — components that derive from `ComponentBase` are *not* registered as DI services (Blazor instantiates them via `IComponentActivator`), but other ABP-decorated services still flow through the normal conventional-registration pipeline.
+
+### `AbpAspNetCoreComponentsWebModule`
+
+```csharp
+[DependsOn(typeof(AbpUiModule), typeof(AbpAspNetCoreComponentsModule))]
+public class AbpAspNetCoreComponentsWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.Replace(ServiceDescriptor.Transient<IComponentActivator, ServiceProviderComponentActivator>());
+
+        var preActions = context.Services.GetPreConfigureActions<AbpAspNetCoreComponentsWebOptions>();
+        Configure<AbpAspNetCoreComponentsWebOptions>(options => preActions.Configure(options));
+    }
+}
+```
+
+The critical line is the `IComponentActivator` replacement: `ServiceProviderComponentActivator` (`framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/DependencyInjection/ServiceProviderComponentActivator.cs`) makes Blazor's component instantiation go through the DI container instead of `Activator.CreateInstance`. That's what enables constructor injection on Blazor components and is also what `Volo.Abp.BlazoriseUI` re-replaces with Blazorise's `ComponentActivator` so Blazorise wrappers continue to work.
+
+`AbpAspNetCoreComponentsWebOptions` carries the single flag `IsBlazorWebApp` (set by the Blazor Web App startup helper) — the Server module checks it to decide whether to call `MapBlazorHub` itself or let the Web App template do it.
+
+### `AbpAspNetCoreComponentsWebThemingModule`
+
+```csharp
+[DependsOn(typeof(AbpBlazoriseUIModule), typeof(AbpUiNavigationModule))]
+public class AbpAspNetCoreComponentsWebThemingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDynamicLayoutComponentOptions>(options =>
+        {
+            options.Components.Add(typeof(AbpAuthenticationState), null);
+        });
+    }
+}
+```
+
+It pulls in BlazoriseUI (the component library wrappers used by ABP-built UI) and Navigation. `AbpDynamicLayoutComponentOptions` is a contributor list rendered inside every layout via `DynamicLayoutComponent` (see below) — themes use it to inject framework-wide chrome (auth-state synchroniser, notification hosts, modal hosts) without modifying app code.
+
+## `AbpComponentBase`
+
+`framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/AbpComponentBase.cs` extends `OwningComponentBase` — meaning every component instance owns its own DI scope, disposed when the component is disposed. That's why `LazyGetRequiredService(ref _x)` is the canonical access pattern:
+
+```csharp
+public abstract class AbpComponentBase : OwningComponentBase
+{
+    protected IStringLocalizerFactory StringLocalizerFactory => LazyGetRequiredService(ref _stringLocalizerFactory)!;
+    protected IStringLocalizer L { get { _localizer ??= CreateLocalizer(); return _localizer; } }
+    protected Type? LocalizationResource { get; set; } = typeof(DefaultResource);
+
+    protected ILogger             Logger             => _lazyLogger.Value;
+    protected ILoggerFactory      LoggerFactory      => LazyGetRequiredService(ref _loggerFactory)!;
+    protected IAuthorizationService AuthorizationService => LazyGetRequiredService(ref _authorizationService)!;
+    protected ICurrentUser        CurrentUser        => LazyGetRequiredService(ref _currentUser)!;
+    protected ICurrentTenant      CurrentTenant      => LazyGetRequiredService(ref _currentTenant)!;
+
+    // Non-scoped (singleton-ish) services that must survive the component scope:
+    protected IUiMessageService     Message               => LazyGetNonScopedRequiredService(ref _message)!;
+    protected IUiNotificationService Notify              => LazyGetNonScopedRequiredService(ref _notify)!;
+    protected IUserExceptionInformer UserExceptionInformer => LazyGetNonScopedRequiredService(ref _userExceptionInformer)!;
+    protected IAlertManager         AlertManager         => LazyGetNonScopedRequiredService(ref _alertManager)!;
+    protected IClock                Clock                => LazyGetNonScopedRequiredService(ref _clock)!;
+
+    [Inject]
+    protected IServiceProvider NonScopedServices { get; set; } = default!;
+
+    protected virtual async Task HandleErrorAsync(Exception exception)
+    {
+        if (IsDisposed) return;
+        await InvokeAsync(async () =>
+        {
+            await UserExceptionInformer.InformAsync(new UserExceptionInformerContext(exception));
+            StateHasChanged();
+        });
+    }
+}
+```
+
+Key idioms an agent must know:
+
+| Helper | Resolves from | When to use |
+| --- | --- | --- |
+| `LazyGetRequiredService<T>(ref _f)` | `ScopedServices` (the component's own scope) | DbContext-style scoped services, application services, repositories. |
+| `LazyGetNonScopedRequiredService<T>(ref _f)` | `NonScopedServices` (injected via `[Inject]`) | Cross-page singletons — UI message hosts, clocks, alert managers. Using `ScopedServices` here would tie the singleton's lifetime to the component scope and recreate it constantly. |
+| `L` | localizer factory using `LocalizationResource` | Markup binding. Override `LocalizationResource` in `OnInitialized` for module-specific strings. |
+| `HandleErrorAsync(ex)` | `IUserExceptionInformer` | Standard try/catch tail for async handlers; the active theme's `IUserExceptionInformer` shows a Blazorise modal. |
+
+### `OwningComponentBase` consequences
+
+Because every component owns its own scope, calling `await SomeAppService.DoAsync()` from an event handler captures *that* component's scope. Don't share the same `IRepository<T>` instance across components — each must resolve its own from `LazyGetRequiredService`.
+
+## Components.Web service surface
+
+Inside `framework/src/Volo.Abp.AspNetCore.Components.Web/`:
+
+| Service | File | Notes |
+| --- | --- | --- |
+| `IUiMessageService` / `SimpleUiMessageService` | `Messages/` | `Info/Success/Warning/Error/Confirm`. Default implementation raises a `MessageReceived` event; Blazorise theme provides `BlazoriseUiMessageService` which renders a modal. |
+| `IUiNotificationService` | `Notifications/` | Toast-style notifications. Same event pattern; Blazorise replaces it. |
+| `IUiPageProgressService` | `Progression/` | Page-top progress bar. |
+| `IBlockUiService` | `BlockUi/` | Modal "blocking" overlay. |
+| `IUserExceptionInformer` | `ExceptionHandling/` | Pretty-prints `AbpException`/`BusinessException`/`UserFriendlyException` through `Message` service. The `AbpExceptionHandlingLogger` plumbs unhandled logger events into this on the WASM side. |
+| `IAlertManager` | `Alerts/` | Same `AlertList` model as MVC, surfaced on `AbpComponentBase.Alerts`. |
+| `ICookieService` / `CookieService` | `CookieService.cs` | JS-interop wrapper around `abp.utils.{set,get,delete}Cookie`. |
+| `ILocalStorageService` / `LocalStorageService` | `LocalStorageService.cs` | `localStorage.getItem`/`setItem` interop. |
+| `IServerUrlProvider` / `DefaultServerUrlProvider` | `DefaultServerUrlProvider.cs` | Resolves the API root URL (overridden per stack). |
+| `IAbpUtilsService` / `AbpUtilsService` | `AbpUtilsService.cs` | Misc JS helpers (e.g. adding `rtl` class to `<body>`). |
+| `AbpComponentsClaimsCache` | `Security/AbpComponentsClaimsCache.cs` | Caches the current principal claims; refreshed when configuration changes. |
+| `ICurrentApplicationConfigurationCacheResetService` | `Configuration/` | Trigger to flush the cached `ApplicationConfigurationDto` — drives auth refresh + menu refresh. |
+| `IApplicationConfigurationChangedService` | `Security/ApplicationConfigurationChangedService.cs` | Fan-out event; components subscribe to re-render when settings/permissions change. |
+
+### `AbpAuthenticationState`
+
+`Security/AbpAuthenticationState.cs` is a `ComponentBase`-derived "marker" component placed in every layout (via `AbpDynamicLayoutComponentOptions`). It keeps a `localStorage` key (`authentication-state-id`) in sync with the current user — so concurrent tabs notice when one tab logs the user out, and on logout-path navigation it proactively clears the cache. Source for the synchronisation:
+
+```csharp
+protected async override Task OnAfterRenderAsync(bool firstRender)
+{
+    if (firstRender)
+    {
+        NavigationManager.RegisterLocationChangingHandler(OnLocationChangingAsync);
+        if (CurrentUser.IsAuthenticated)  await SetAuthenticationStateAsync();
+        else                              await ClearAuthenticationStateAsync();
+    }
+}
+
+protected virtual async ValueTask OnLocationChangingAsync(LocationChangingContext context)
+{
+    if (context.TargetLocation.Contains(AuthenticationOptions.Value.LogoutUrl))
+        await ClearAuthenticationStateAsync();
+}
+```
+
+`AbpAuthenticationOptions` (also in `Components.Web`) controls the URLs:
+
+```csharp
+public class AbpAuthenticationOptions
+{
+    public string LoginUrl  { get; set; } = "Account/Login";
+    public string LogoutUrl { get; set; } = "Account/Logout";
+}
+```
+
+WebAssembly overrides these to `authentication/login` / `authentication/logout` (see [`/ui/blazor-components-webassembly`](/ui/blazor-components-webassembly)).
+
+## `IComponentBundleManager` and theming-side bundles
+
+`Components.Web.Theming/Bundling/IComponentBundleManager.cs`:
+
+```csharp
+public interface IComponentBundleManager
+{
+    Task<IReadOnlyList<string>> GetStyleBundleFilesAsync(string bundleName);
+    Task<IReadOnlyList<string>> GetScriptBundleFilesAsync(string bundleName);
+}
+```
+
+The same MVC `BundleManager` model is reused; this interface is the Blazor-side facade. Each hosting stack provides its own implementation:
+
+- **Server**: `BlazorServerComponentBundleManager` delegates to the real MVC `IBundleManager` (live recomputation per request).
+- **WebAssembly**: `WebAssemblyComponentBundleManager` returns empty lists (WASM uses pre-built static `Global.css` / `Global.js` produced at host-app build time instead).
+
+Layout components inject `IComponentBundleManager` and emit `<link>` / `<script>` tags for the resolved file list.
+
+## `ITheme` (Blazor variant)
+
+The Blazor `ITheme` is **not** the same type as the MVC one — it returns a *Razor component type* instead of a layout path:
+
+```csharp
+// Components.Web.Theming/Theming/ITheme.cs
+public interface ITheme
+{
+    Type GetLayout(string name, bool fallbackToDefault = true);
+}
+```
+
+`DefaultThemeManager` (`Theming/DefaultThemeManager.cs`) is `IScopedDependency` + caches the active `ITheme` for the current circuit:
+
+```csharp
+public class DefaultThemeManager : IThemeManager, IScopedDependency, IServiceProviderAccessor
+{
+    public ITheme CurrentTheme => _currentTheme ??=
+        (ITheme)ServiceProvider.GetRequiredService(ThemeSelector.GetCurrentThemeInfo().ThemeType);
+}
+```
+
+`StandardLayouts` (in `Components.Web.Theming/Layout/StandardLayouts.cs`) re-declares the same names as the MVC stack — `Application`, `Account`, `Public`, `Empty` — so a multi-stack module ships matching artefacts for both.
+
+## `DynamicLayoutComponent`
+
+`Components.Web.Theming/Components/DynamicLayoutComponent.razor.cs` is a tiny component that the active theme places in every layout. It iterates `AbpDynamicLayoutComponentOptions.Components` and renders each registered component type:
+
+```csharp
+public partial class DynamicLayoutComponent : ComponentBase
+{
+    [Inject]
+    protected IOptions<AbpDynamicLayoutComponentOptions> AbpDynamicLayoutComponentOptions { get; set; } = default!;
+}
+```
+
+By default it renders `AbpAuthenticationState`. Modules add their own contributions (e.g. SignalR connection status, push-notification host) without subclassing the theme:
+
+```csharp
+Configure<AbpDynamicLayoutComponentOptions>(options =>
+{
+    options.Components.Add(typeof(MyAuditViewerHost), parameters: null);
+});
+```
+
+## Page toolbars and page headers
+
+`Components.Web.Theming/PageToolbars/` is the Blazor twin of the MVC toolbar system:
+
+| Type | Use |
+| --- | --- |
+| `IPageToolbarManager` / `PageToolbarManager` | Resolves toolbar items for a page name (e.g. `Identity.Users`). |
+| `IPageToolbarContributor` | Contribute items based on the current page + parameters. |
+| `PageToolbarItem` | `Name`, `ComponentType`, `Order`, `Properties` (parameter dictionary). |
+| `SimplePageToolbarContributor` | Adds a single item without writing a class. |
+
+Modules register a contributor via `AbpPageToolbarOptions` (shared with the MVC theme — same name, different namespace). Theme layouts render the items inside the page header.
+
+`Components.Web.Theming/Layout/PageHeader.razor.cs` exposes `Title`, `BreadCrumbs`, `Toolbar` parameters consumed by the theme's chrome.
+
+## Layout hook component
+
+`Components.Web.Theming/Components/LayoutHooks/LayoutHook.razor.cs` is the Blazor equivalent of the MVC `LayoutHookViewComponent` — it reads `AbpLayoutHookOptions.Hooks[name]` and renders every registered component, parameterless. Usage in a layout:
+
+```razor
+<LayoutHook Name="@LayoutHooks.Head.Last" />
+```
+
+## Cross-cutting wiring
+
+| Concern | Mechanism |
+| --- | --- |
+| Component DI | Replace `IComponentActivator` with `ServiceProviderComponentActivator` (and Blazorise re-replaces with its own that still respects ABP DI). |
+| Component disposal | `OwningComponentBase` — your component's services are disposed when the component unmounts. |
+| Localization on markup | `@inject IStringLocalizer<MyResource> L` or `LocalizationResource = typeof(MyResource)` in code-behind. |
+| Auth | `AuthenticationStateProvider` plus `AbpAuthenticationState` for cross-tab sync; cached principal via `AbpComponentsClaimsCache`. |
+| Configuration refresh | `ICurrentApplicationConfigurationCacheResetService` (per-stack impl) → `IApplicationConfigurationChangedService` event → re-render. |
+
+## Where to go next
+
+- Hosting-model specifics: [`/ui/blazor-components-server`](/ui/blazor-components-server), [`/ui/blazor-components-webassembly`](/ui/blazor-components-webassembly), [`/ui/blazor-maui`](/ui/blazor-maui).
+- Component library wrappers: [`/ui/blazorise-ui`](/ui/blazorise-ui).
+- Theme reference: [`/modules/basic-theme`](/modules/basic-theme).
+- Bundling story (which the Blazor stacks all reuse): [`/aspnetcore/mvc-ui-bundling`](/aspnetcore/mvc-ui-bundling).
+- Theme contract on the MVC side: [`/aspnetcore/mvc-ui-themes`](/aspnetcore/mvc-ui-themes).

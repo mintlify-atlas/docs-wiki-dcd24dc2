@@ -1,0 +1,261 @@
+---
+title: "Serilog enrichment for ABP ASP.NET Core web host apps"
+sidebarTitle: "Serilog"
+description: "AbpSerilogMiddleware enriches LogContext with TenantId, UserId, ClientId and CorrelationId; covers AbpAspNetCoreSerilogOptions and Program.cs wiring."
+---
+
+`framework/src/Volo.Abp.AspNetCore.Serilog/` is a thin module that bridges Serilog's structured logging to ABP's request-scoped abstractions. It does not configure Serilog sinks or log levels — that remains the application's responsibility — it only attaches an `AbpSerilogMiddleware` to the pipeline that pushes four ABP-known properties into `Serilog.Context.LogContext` for the duration of each HTTP request: `TenantId`, `UserId`, `ClientId` and `CorrelationId`. Every Serilog event logged from a controller, app service, repository, background worker invoked synchronously, etc. then carries those properties automatically, so log enrichment and downstream filtering (per-tenant log routing, per-correlation tracing) work without any application-side `using` blocks.
+
+## Module
+
+`Volo/Abp/AspNetCore/Serilog/AbpAspNetCoreSerilogModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpMultiTenancyModule),
+    typeof(AbpAspNetCoreModule)
+)]
+public class AbpAspNetCoreSerilogModule : AbpModule { }
+```
+
+The module deliberately contains no `ConfigureServices` — middleware registration is opt-in via `app.UseAbpSerilogEnrichers()`. Depending on `AbpMultiTenancyModule` guarantees `ICurrentTenant` is available; depending on `AbpAspNetCoreModule` guarantees `ICorrelationIdProvider` is wired by `AbpCorrelationIdMiddleware`.
+
+## Middleware
+
+`Volo/Abp/AspNetCore/Serilog/AbpSerilogMiddleware.cs`:
+
+```csharp
+public class AbpSerilogMiddleware : AbpMiddlewareBase, ITransientDependency
+{
+    private readonly ICurrentClient _currentClient;
+    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentUser _currentUser;
+    private readonly ICorrelationIdProvider _correlationIdProvider;
+    private readonly AbpAspNetCoreSerilogOptions _options;
+
+    public AbpSerilogMiddleware(
+        ICurrentTenant currentTenant,
+        ICurrentUser currentUser,
+        ICurrentClient currentClient,
+        ICorrelationIdProvider correlationIdProvider,
+        IOptions<AbpAspNetCoreSerilogOptions> options) { ... }
+
+    public override async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        var enrichers = new List<ILogEventEnricher>();
+
+        if (_currentTenant?.Id != null)
+            enrichers.Add(new PropertyEnricher(_options.EnricherPropertyNames.TenantId, _currentTenant.Id));
+
+        if (_currentUser?.Id != null)
+            enrichers.Add(new PropertyEnricher(_options.EnricherPropertyNames.UserId, _currentUser.Id));
+
+        if (_currentClient?.Id != null)
+            enrichers.Add(new PropertyEnricher(_options.EnricherPropertyNames.ClientId, _currentClient.Id));
+
+        var correlationId = _correlationIdProvider.Get();
+        if (!string.IsNullOrEmpty(correlationId))
+            enrichers.Add(new PropertyEnricher(_options.EnricherPropertyNames.CorrelationId, correlationId));
+
+        using (LogContext.Push(enrichers.ToArray()))
+        {
+            await next(context);
+        }
+    }
+}
+```
+
+`Serilog.Context.LogContext.Push(...)` returns a `IDisposable` that pops the properties on scope exit. Anything logged inside `await next(context)` automatically carries these fields. The `_correlationIdProvider.Get()` call relies on `AbpCorrelationIdMiddleware` having pushed an id earlier in the pipeline — register `UseCorrelationId()` before `UseAbpSerilogEnrichers()`.
+
+## Application builder extension
+
+`Microsoft/AspNetCore/Builder/AbpAspNetCoreSerilogApplicationBuilderExtensions.cs`:
+
+```csharp
+public static class AbpAspNetCoreSerilogApplicationBuilderExtensions
+{
+    public static IApplicationBuilder UseAbpSerilogEnrichers(this IApplicationBuilder app)
+    {
+        return app.UseMiddleware<AbpSerilogMiddleware>();
+    }
+}
+```
+
+## Options — `AbpAspNetCoreSerilogOptions`
+
+`Volo/Abp/AspNetCore/Serilog/AbpAspNetCoreSerilogOptions.cs`:
+
+| Property | Default | Use |
+| --- | --- | --- |
+| `EnricherPropertyNames.TenantId` | `"TenantId"` | Renaming target if your sink expects different field names. |
+| `EnricherPropertyNames.UserId` | `"UserId"` | Same. |
+| `EnricherPropertyNames.ClientId` | `"ClientId"` | Same — `ClientId` is the OAuth/OIDC `client_id`. |
+| `EnricherPropertyNames.CorrelationId` | `"CorrelationId"` | Same. |
+
+Customise via standard ABP options:
+
+```csharp
+Configure<AbpAspNetCoreSerilogOptions>(options =>
+{
+    options.EnricherPropertyNames.TenantId      = "tenant_id";
+    options.EnricherPropertyNames.UserId        = "user_id";
+    options.EnricherPropertyNames.CorrelationId = "trace_id";
+});
+```
+
+## Canonical `Program.cs` Serilog wiring
+
+Solution templates (`templates/app/aspnet-core/host/MyApp.HttpApi.Host/Program.cs`) use a two-phase Serilog setup so the host's earliest bootstrap errors are captured:
+
+```csharp
+using Serilog;
+using Serilog.Events;
+
+Log.Logger = new LoggerConfiguration()
+#if DEBUG
+    .MinimumLevel.Debug()
+#else
+    .MinimumLevel.Information()
+#endif
+    .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+    .MinimumLevel.Override("Microsoft.EntityFrameworkCore", LogEventLevel.Warning)
+    .Enrich.FromLogContext()        // honours LogContext.Push from AbpSerilogMiddleware
+    .WriteTo.Async(c => c.File("Logs/logs.txt"))
+    .WriteTo.Async(c => c.Console())
+    .CreateBootstrapLogger();
+
+try
+{
+    Log.Information("Starting MyApp.HttpApi.Host.");
+    var builder = WebApplication.CreateBuilder(args);
+    builder.Host.UseAutofac();
+    builder.Host.UseSerilog((context, services, config) =>
+    {
+        config
+            .ReadFrom.Configuration(context.Configuration)
+            .ReadFrom.Services(services)
+            .Enrich.FromLogContext();
+    });
+
+    await builder.AddApplicationAsync<MyAppHttpApiHostModule>();
+
+    var app = builder.Build();
+    await app.InitializeApplicationAsync();
+    await app.RunAsync();
+    return 0;
+}
+catch (Exception ex) when (ex is not HostAbortedException)
+{
+    Log.Fatal(ex, "Host terminated unexpectedly!");
+    return 1;
+}
+finally
+{
+    Log.CloseAndFlush();
+}
+```
+
+Key takeaways:
+
+- `Enrich.FromLogContext()` is **mandatory** — without it, `AbpSerilogMiddleware`'s `LogContext.Push` would have no effect on emitted events.
+- The bootstrap logger captures any failure that occurs before the `WebApplication` is built (e.g. configuration binding errors).
+- `UseSerilog((context, services, config) => ...)` re-creates the logger from `appsettings.json` + DI once the host is up; the bootstrap logger is replaced atomically.
+
+## Middleware ordering
+
+`AbpSerilogMiddleware` must run **after** authentication, multi-tenancy and correlation-id middleware so that all four properties are populated:
+
+```csharp
+app.UseCorrelationId();
+app.UseAbpRequestLocalization();
+app.UseAuthentication();
+app.UseMultiTenancy();
+app.UseAbpExceptionHandling();
+app.UseUnitOfWork();
+app.UseAuthorization();
+app.UseAuditing();
+app.UseAbpSerilogEnrichers();   // <-- after MT + Auth so TenantId/UserId/ClientId are set
+app.UseConfiguredEndpoints();
+```
+
+If you place `UseAbpSerilogEnrichers()` too early (e.g. before `UseAuthentication`), `_currentUser?.Id` will be `null` for authenticated requests and the `UserId` property won't be attached.
+
+## Property origins
+
+| Property | Source | When set |
+| --- | --- | --- |
+| `TenantId` | `ICurrentTenant.Id` | After `MultiTenancyMiddleware`. |
+| `UserId` | `ICurrentUser.Id` | After `UseAuthentication()`. |
+| `ClientId` | `ICurrentClient.Id` | After `UseAuthentication()` (OpenIddict/JwtBearer sets it from `client_id` claim). |
+| `CorrelationId` | `ICorrelationIdProvider.Get()` | After `UseCorrelationId()`. |
+
+## Sink configuration via `appsettings.json`
+
+Because `Program.cs` uses `ReadFrom.Configuration(context.Configuration)`, you can keep verbose, environment-specific sink config in JSON:
+
+```json
+"Serilog": {
+  "WriteTo": [
+    { "Name": "Console" },
+    {
+      "Name": "Seq",
+      "Args": {
+        "serverUrl": "http://seq:5341",
+        "apiKey": "abc"
+      }
+    }
+  ],
+  "Enrich": [ "FromLogContext", "WithMachineName", "WithThreadId" ],
+  "MinimumLevel": {
+    "Default": "Information",
+    "Override": {
+      "Microsoft.EntityFrameworkCore.Database.Command": "Warning",
+      "Volo.Abp": "Information"
+    }
+  }
+}
+```
+
+The `FromLogContext` enrichment is the bridge for the ABP-supplied properties.
+
+## Distributed tracing interplay
+
+When `OpenTelemetry` or `Activity` propagation is enabled, the `CorrelationId` produced by `AbpCorrelationIdMiddleware` is *not* automatically aligned with `Activity.TraceId`. To unify them, replace `ICorrelationIdProvider` with one that returns `Activity.Current?.TraceId.ToString()` or extend `AbpSerilogMiddleware` to push `TraceId`/`SpanId` alongside `CorrelationId`:
+
+```csharp
+services.Configure<AbpAspNetCoreSerilogOptions>(o => { /* rename if needed */ });
+services.Replace(ServiceDescriptor.Singleton<ICorrelationIdProvider, ActivityCorrelationIdProvider>());
+```
+
+## Sample log line
+
+After wiring, a Serilog event emitted from inside a controller looks like:
+
+```text
+2025-02-04 12:34:56.789 INF Created book {"BookId":"...","Title":"..."}
+    TenantId=00000000-0000-0000-0000-000000000001
+    UserId=22222222-2222-2222-2222-222222222222
+    ClientId=MyApp_App
+    CorrelationId=8c4f8e1f1c9d4f3a8b6a2c0d1f6e9a4b
+    RequestId=0HMVF8L6F1A8C:00000001
+    RequestPath=/api/app/book
+```
+
+The first four properties come from `AbpSerilogMiddleware`; `RequestId` / `RequestPath` are added by the standard ASP.NET Core Serilog request-logging.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Logging & tracing" href="/core/logging-and-tracing">
+    `ICorrelationIdProvider`, `AbpCorrelationIdOptions`.
+  </Card>
+  <Card title="Base AspNetCore" href="/aspnetcore/volo-abp-aspnetcore">
+    Pipeline ordering for `UseCorrelationId` / `UseAuthentication`.
+  </Card>
+  <Card title="Multi-tenancy" href="/multitenancy/aspnetcore-integration">
+    `MultiTenancyMiddleware` that supplies `TenantId`.
+  </Card>
+  <Card title="Auditing" href="/crosscut/auditing">
+    `IAuditingManager` is the structural cousin — logs are unstructured, audit is structured.
+  </Card>
+</CardGroup>

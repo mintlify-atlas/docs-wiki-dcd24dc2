@@ -1,0 +1,132 @@
+---
+title: "Bunny CDN provider"
+sidebarTitle: "Bunny CDN"
+description: "Volo.Abp.BlobStoring.Bunny — BunnyBlobProvider over BunnyCDN.Net.Storage + Bunny's storage-zone REST API, with storage-zone metadata cached encrypted in IDistributedCache."
+---
+
+The Bunny provider package is `framework/src/Volo.Abp.BlobStoring.Bunny/Volo/Abp/BlobStoring/Bunny/`. It uploads/reads through the **`BunnyCDN.Net.Storage`** package and uses Bunny's own REST API at `https://api.bunny.net/storagezone` to look up (and optionally create) storage zones. Storage-zone metadata — most importantly the per-zone *password*, which is what `BunnyCDNStorage` authenticates with — is cached for 12 hours in `IDistributedCache<BunnyStorageZoneModel>`, encrypted via `IStringEncryptionService`.
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `AbpBunnyBlobStoringModule .cs` (note: trailing space in filename) | `[DependsOn(AbpBlobStoringModule, AbpCachingModule)]` — calls `services.AddHttpClient()` so `IHttpClientFactory` is available. |
+| `BunnyBlobContainerConfigurationExtensions.cs` | `UseBunny(action)` and `GetBunnyConfiguration()`. |
+| `BunnyBlobProviderConfiguration.cs` | Typed view: `Region`, `AccessKey`, `ContainerName`, `CreateContainerIfNotExists`. |
+| `BunnyBlobProviderConfigurationNames.cs` | Bag keys (`Bunny.AccessKey`, `Bunny.Region`, …). |
+| `BunnyBlobProvider.cs` | The `IBlobProvider`. |
+| `BunnyBlobNamingNormalizer.cs` | Storage-zone name rules (lowercase, dashes, 4-64 chars). |
+| `IBunnyBlobNameCalculator.cs` + `DefaultBunnyBlobNameCalculator.cs` | `host/{blob}` or `tenants/{tenantId}/{blob}` object path. |
+| `IBunnyClientFactory.cs` + `DefaultBunnyClientFactory.cs` | Builds a `BunnyCDNStorage` for a storage zone — calls Bunny's REST API to get the per-zone password and caches it. Also ensures the zone exists (creating it on demand). |
+| `BunnyStorageZoneModel.cs` | DTO mirroring Bunny's `/storagezone` JSON — `{ Id, Password, Name, Region, Deleted }`. |
+| `BunnyApiException.cs` | Wraps non-success responses from the Bunny REST API. |
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule),
+           typeof(AbpCachingModule))]
+public class AbpBlobStoringBunnyModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient();
+    }
+}
+```
+
+## `UseBunny(...)`
+
+```csharp
+containerConfiguration.ProviderType = typeof(BunnyBlobProvider);
+containerConfiguration.NamingNormalizers.TryAdd<BunnyBlobNamingNormalizer>();
+bunnyConfigureAction(new BunnyBlobProviderConfiguration(containerConfiguration));
+```
+
+```csharp
+o.Containers.Configure<MyContainer>(c =>
+{
+    c.UseBunny(b =>
+    {
+        b.AccessKey     = config["Bunny:AccessKey"];          // account-level API key
+        b.ContainerName = "myapp-storage-zone";               // storage zone name
+        b.Region        = "ny";                               // optional, default "de"
+        b.CreateContainerIfNotExists = true;                  // create the zone via REST
+    });
+});
+```
+
+## `BunnyBlobProviderConfiguration`
+
+| Property | Bag key | Type | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `AccessKey` | `Bunny.AccessKey` | `string` | required | Bunny account API key — used to call `https://api.bunny.net/storagezone` for listing/creating zones. **Not** the per-zone password. |
+| `ContainerName` | `Bunny.ContainerName` | `string?` | `null` | Bunny storage zone name. Falls back to `args.ContainerName`. Must be lowercase, dashes only, 4-64 chars, globally unique across Bunny. |
+| `Region` | `Bunny.Region` | `string?` | `"de"` | Primary region: `de`, `ny`, `la`, `sg`, `syd`, `uk`, `se`, `br`, `jh`. |
+| `CreateContainerIfNotExists` | `Bunny.CreateContainerIfNotExists` | `bool` | `false` | When true, `BunnyBlobProvider` calls `IBunnyClientFactory.EnsureStorageZoneExistsAsync(... createIfNotExists: true)` on save and tries to create the zone via REST if it doesn't already exist. |
+
+`AccessKey` and (eventually) `ContainerName` are required; `Region` defaults to `de`.
+
+## `IBunnyClientFactory`
+
+`DefaultBunnyClientFactory.CreateAsync(accessKey, containerName, region)`:
+
+1. Cache key: `"BunnyStorageZone:{containerName}"`.
+2. `_cache.GetOrAddAsync(...)`:
+   - Issues `GET https://api.bunny.net/storagezone` with header `AccessKey: {accessKey}`.
+   - Deserialises the JSON array and finds the entry matching `Name == containerName && Deleted == false`.
+   - **Encrypts** `result.Password` with `IStringEncryptionService` before storing in the cache (`AbsoluteExpiration = now + 12h`).
+3. Decrypts the cached password, returns `new BunnyCDNStorage(containerName, decryptedPassword, region)`.
+
+`EnsureStorageZoneExistsAsync(accessKey, containerName, region, createIfNotExists)`:
+
+- Looks the zone up via the same `GET /storagezone` endpoint.
+- If absent and `createIfNotExists == true`, posts to `POST https://api.bunny.net/storagezone` with `{ Name, Region }`, then **clears** the cache entry for `BunnyStorageZone:{containerName}` so the next save can pick up the freshly created zone (and its new password) on the very next call.
+- If absent and `createIfNotExists == false`, throws `AbpException("Storage zone '...' does not exist. …")`.
+
+## `BunnyBlobProvider`
+
+```csharp
+public class BunnyBlobProvider : BlobProviderBase, ITransientDependency
+{
+    public BunnyBlobProvider(
+        IBunnyBlobNameCalculator bunnyBlobNameCalculator,
+        IBlobNormalizeNamingService blobNormalizeNamingService,
+        IBunnyClientFactory bunnyClientFactory)
+    { … }
+}
+```
+
+| Method | Flow |
+| --- | --- |
+| `SaveAsync` | Validate the storage zone exists (`EnsureStorageZoneExistsAsync` with `createIfNotExists: CreateContainerIfNotExists`). Build a `BunnyCDNStorage`. If `!OverrideExisting && BlobExistsAsync` → `BlobAlreadyExistsException`. Copy stream to memory, then `bunnyStorage.UploadAsync(memoryStream, $"{containerName}/{blobName}")`. |
+| `DeleteAsync` | If exists → `bunnyStorage.DeleteObjectAsync($"{containerName}/{blobName}")` → true; else false. |
+| `ExistsAsync` | `bunnyStorage.GetStorageObjectsAsync($"{containerName}/")` and inspect the listing for the blob. Caught `WebException` with `404` returns false. |
+| `GetOrNullAsync` | Returns null if not exists; otherwise `bunnyStorage.DownloadObjectAsStreamAsync(...)` and buffer into a `MemoryStream`. |
+
+The path inside the storage zone is always `containerName/blobName`, but the *containerName* here is the storage zone name and the *blobName* already includes the per-tenant prefix produced by `DefaultBunnyBlobNameCalculator`.
+
+## `DefaultBunnyBlobNameCalculator`
+
+```csharp
+return CurrentTenant.Id == null
+    ? $"host/{args.BlobName}"
+    : $"tenants/{CurrentTenant.Id.Value:D}/{args.BlobName}";
+```
+
+So a tenant blob lands at `<zone>/<zone>/tenants/{id}/<blob>` — the zone is also the on-disk root, hence the double prefix in the upload path.
+
+## `BunnyBlobNamingNormalizer`
+
+Storage-zone names: lowercase letters, digits and single dashes, 4-64 characters, must start and end with an alphanumeric character. The normaliser truncates, lowercases, strips invalid characters and pads. Blob names are not modified.
+
+## Operational notes
+
+- **Two layers of secrets**. The account `AccessKey` controls the REST API (listing/creating zones); each zone has its own `Password` used by `BunnyCDNStorage` for uploads/downloads. The provider hides the latter from app code: it calls the REST API once per cache miss and caches the encrypted password.
+- **Cache invalidation on create**. Newly created zones get a fresh password; the factory clears the cache entry so the next call re-fetches it. If you create zones out-of-band (Bunny dashboard) and your cache hasn't expired, you may need to manually evict the `BunnyStorageZone:{name}` entry.
+- **Encryption**. The cached password is encrypted with `IStringEncryptionService`. Configure `AbpStringEncryptionOptions` consistently across nodes that share the distributed cache.
+
+## Cross-references
+
+- [BLOB storing overview](/blob/blob-storing-overview).
+- [Distributed cache](/caching/distributed-cache) — Bunny relies on a 12-hour cached zone metadata entry.

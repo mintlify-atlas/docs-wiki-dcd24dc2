@@ -1,0 +1,269 @@
+---
+title: "OIDC and Password Flows: @abp/ng.oauth Reference"
+sidebarTitle: "OAuth"
+description: "Inside @abp/ng.oauth: AuthFlowStrategy, AbpOAuthService, OAuthApiInterceptor, token storage factory, and OIDC configuration handler."
+---
+
+`@abp/ng.oauth` is the Angular OIDC client. It overrides every authentication abstraction `@abp/ng.core` declares (`AuthService`, `AuthGuard`, `ApiInterceptor`, the login-redirect and access-token-check function tokens) with implementations powered by [`angular-oauth2-oidc`](https://github.com/manfredsteyer/angular-oauth2-oidc). The package supports two grant flows — authorization-code with PKCE (`responseType: 'code'`) and resource-owner password (`responseType: 'password'`) — and chooses the strategy at runtime from the `EnvironmentService.oAuthConfig`. Sources: [`npm/ng-packs/packages/oauth/`](https://github.com/abpframework/abp/tree/dev/npm/ng-packs/packages/oauth).
+
+## Package metadata
+
+| Field | Value |
+| --- | --- |
+| NPM name | `@abp/ng.oauth` |
+| Source | `packages/oauth/src/lib/` |
+| Module class | `AbpOAuthModule` (deprecated) |
+| Provider function | `provideAbpOAuth()` |
+| Runtime dependencies | `@abp/ng.core`, `@abp/utils`, `angular-oauth2-oidc`, `just-clone`, `just-compare` |
+
+## Bootstrap
+
+```typescript
+// app.config.ts
+import { provideAbpCore, withOptions } from '@abp/ng.core';
+import { provideAbpOAuth } from '@abp/ng.oauth';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideAbpCore(withOptions({ environment })),
+    provideAbpOAuth(),
+  ],
+};
+```
+
+`provideAbpOAuth()` (in `packages/oauth/src/lib/providers/oauth-module-config.provider.ts`) installs:
+
+| Provided token / class | Replacement |
+| --- | --- |
+| `AuthService` | `AbpOAuthService` |
+| `AuthGuard` | `AbpOAuthGuard` |
+| `authGuard` (`CanActivateFn`) | `abpOAuthGuard` |
+| `asyncAuthGuard` | `asyncAbpOAuthGuard` |
+| `ApiInterceptor` | `OAuthApiInterceptor` |
+| `PIPE_TO_LOGIN_FN_KEY` | `pipeToLogin` (function) |
+| `CHECK_AUTHENTICATION_STATE_FN_KEY` | `checkAccessToken` (function) |
+| `HTTP_INTERCEPTORS` | the same `OAuthApiInterceptor` (multi: true) |
+| `OAuthStorage` | `oAuthStorageFactory()` — see [token storage](#token-storage) |
+| `AuthErrorFilterService` | `OAuthErrorFilterService` |
+| `OAuthModule.forRoot().providers` | `angular-oauth2-oidc` defaults |
+| `provideAppInitializer` | Constructs `OAuthConfigurationHandler` on startup |
+| `NavigateToManageProfileProvider` | Wires the "manage profile" link to OIDC end_session/redirect |
+
+## `AbpOAuthService`
+
+`packages/oauth/src/lib/services/oauth.service.ts` implements `IAuthService` from `@abp/ng.core`:
+
+```typescript
+@Injectable({ providedIn: 'root' })
+export class AbpOAuthService implements IAuthService {
+  private strategy!: AuthFlowStrategy;
+  private readonly oAuthService: OAuthService; // from angular-oauth2-oidc
+
+  async init() {
+    const environment = this.injector.get(EnvironmentService);
+    return lastValueFrom(
+      environment.getEnvironment$().pipe(
+        map(env => env?.oAuthConfig),
+        filter(Boolean),
+        tap(cfg => {
+          this.strategy = cfg.responseType === 'code'
+            ? AUTH_FLOW_STRATEGY.Code(this.injector)
+            : AUTH_FLOW_STRATEGY.Password(this.injector);
+        }),
+        switchMap(() => from(this.strategy.init())),
+        take(1),
+      ),
+    );
+  }
+
+  login(params: LoginParams)    { return this.strategy.login(params); }
+  logout(queryParams?: Params)  { return this.strategy.logout(queryParams); }
+  navigateToLogin(queryParams?) { this.strategy.navigateToLogin(queryParams); }
+  get isAuthenticated() { return this.oAuthService.hasValidAccessToken(); }
+}
+```
+
+The service is constructed as soon as the application starts — it is what `@abp/ng.account`'s `LoginComponent.submit()` calls.
+
+## Strategies
+
+`strategies/auth-flow-strategy.ts` declares the abstract base; `auth-code-flow-strategy.ts` and `auth-password-flow-strategy.ts` implement the two flows.
+
+### `AuthCodeFlowStrategy` (authorization-code with PKCE, OIDC)
+
+`isInternalAuth = false` — the login UI is owned by the IdentityServer/OpenIddict authority.
+
+Key behaviours on `init()`:
+1. `checkRememberMeOption()` — restores the *remember me* flag from the token claims and may log the user out if the saved token is expired and not "remember me".
+2. `listenToTokenReceived()` — subscribes to OIDC events and refreshes app state on each new ID token.
+3. `oAuthService.tryLogin().catch(noop)` — finalises the redirect callback if the URL contains `code=…`.
+4. `oAuthService.setupAutomaticSilentRefresh()` — uses iframe-based silent renewal.
+
+```typescript
+// Excerpt from auth-code-flow-strategy.ts
+async init() {
+  this.checkRememberMeOption();
+  this.listenToTokenReceived();
+  if (!this.appStartedWithSSR && isPlatformBrowser(this.platformId)) {
+    return super.init()
+      .then(() => this.oAuthService.tryLogin().catch(noop))
+      .then(() => this.oAuthService.setupAutomaticSilentRefresh());
+  }
+}
+```
+
+### `AuthPasswordFlowStrategy` (resource-owner password)
+
+`isInternalAuth = true` — the login form is rendered by `@abp/ng.account`, the credentials are POSTed to the token endpoint directly.
+
+On `init()`:
+1. `checkRememberMeOption()` — same logic as the code flow.
+2. `listenToTokenExpiration()` — when `OAuthInfoEvent('token_expires', 'access_token')` fires, either refresh via `getRefreshToken()` or log out + `ConfigStateService.refreshAppState()`.
+
+```typescript
+private listenToTokenExpiration() {
+  this.oAuthService.events.pipe(
+    filter(e => e instanceof OAuthInfoEvent
+                && e.type === 'token_expires'
+                && e.info === 'access_token'),
+  ).subscribe(() => {
+    if (this.oAuthService.getRefreshToken()) {
+      this.refreshToken();
+    } else {
+      this.oAuthService.logOut();
+      this.rememberMeService.remove();
+      this.configState.refreshAppState().subscribe();
+    }
+  });
+}
+```
+
+<Note>
+Pick the flow by setting `environment.oAuthConfig.responseType` to either `'code'` (recommended for new apps; pairs with PKCE) or `'password'` (legacy, simpler for internal apps). See [`/auth/openid-connect`](/auth/openid-connect) for the server-side counterparts.
+</Note>
+
+## `OAuthApiInterceptor`
+
+`packages/oauth/src/lib/interceptors/api.interceptor.ts` is the interceptor every API request runs through:
+
+```typescript
+@Injectable({ providedIn: 'root' })
+export class OAuthApiInterceptor implements IApiInterceptor {
+  intercept(request: HttpRequest<any>, next: HttpHandler) {
+    this.httpWaitService.addRequest(request);
+    const isExternalRequest = request.context?.get(IS_EXTERNAL_REQUEST);
+    const newRequest = isExternalRequest
+      ? request
+      : request.clone({ setHeaders: this.getAdditionalHeaders(request.headers) });
+    return next.handle(newRequest)
+      .pipe(finalize(() => this.httpWaitService.deleteRequest(request)));
+  }
+
+  getAdditionalHeaders(existingHeaders?: HttpHeaders) {
+    const headers: Record<string, string> = {};
+    const token = this.oAuthService.getAccessToken();
+    if (!existingHeaders?.has('Authorization') && token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    const lang = this.sessionState.getLanguage();
+    if (!existingHeaders?.has('Accept-Language') && lang) headers['Accept-Language'] = lang;
+    const tenant = this.sessionState.getTenant();
+    if (tenant?.id) headers[this.tenantKey] = tenant.id;        // __tenant by default
+    return headers;
+  }
+}
+```
+
+Headers added on each request:
+
+| Header | Source |
+| --- | --- |
+| `Authorization: Bearer <access_token>` | `OAuthService.getAccessToken()` |
+| `Accept-Language` | `SessionStateService.getLanguage()` |
+| `__tenant` (or value of `TENANT_KEY`) | `SessionStateService.getTenant().id` |
+
+Requests opt out by setting the `IS_EXTERNAL_REQUEST` HTTP context token (used for the OIDC discovery endpoint and CDN assets).
+
+## Token storage
+
+`utils/storage.factory.ts` picks the `OAuthStorage` implementation based on the environment:
+
+```typescript
+export function oAuthStorageFactory(): OAuthStorage {
+  const platformId = inject(PLATFORM_ID);
+  const appStartedWithSSR = inject(APP_STARTED_WITH_SSR);
+  if (appStartedWithSSR) {
+    return isPlatformBrowser(platformId)
+      ? inject(BrowserTokenStorageService)   // cookie-backed
+      : inject(ServerTokenStorageService);   // server-side cookie
+  }
+  return inject(MemoryTokenStorageService);  // pure CSR fallback
+}
+```
+
+| Storage | File | Backing |
+| --- | --- | --- |
+| `BrowserTokenStorageService` | `services/browser-token-storage.service.ts` | `document.cookie` (path `/`, `Secure`, `SameSite=Lax`, 7-day expiry) |
+| `ServerTokenStorageService` | `services/server-token-storage.service.ts` | Reads/writes cookies via the SSR request/response objects |
+| `MemoryTokenStorageService` | `services/memory-token-storage.service.ts` | In-memory `Map` (CSR-only mode) |
+| `MockStorage` | `utils/storage.factory.ts` | Test double — implements the `Storage` interface |
+
+Cookies are the default because OIDC silent-refresh requires the token to survive iframe navigations and SSR.
+
+## `OAuthConfigurationHandler`
+
+`handlers/oauth-configuration.handler.ts` reconfigures the OIDC client whenever `EnvironmentService.oAuthConfig` changes (e.g. after a tenant switch that triggered a config refresh):
+
+```typescript
+@Injectable({ providedIn: 'root' })
+export class OAuthConfigurationHandler {
+  constructor() {
+    this.environmentService
+      .createOnUpdateStream(state => state)
+      .pipe(
+        map(environment => environment.oAuthConfig as AuthConfig),
+        filter(config => !compare(config, this.options.environment.oAuthConfig)),
+      )
+      .subscribe(config => this.oAuthService.configure(config));
+  }
+}
+```
+
+A `provideAppInitializer(() => inject(OAuthConfigurationHandler))` line in the provider function ensures the handler is constructed before the first request fires.
+
+## `RememberMeService`
+
+`services/remember-me.service.ts` tracks the "remember me" checkbox by inspecting the JWT `remember_me` claim. Both strategies call `set(value)` on successful login and `remove()` on logout. The value persists across sessions in cookie storage.
+
+## Guards and helper functions
+
+| Symbol | Behaviour |
+| --- | --- |
+| `AbpOAuthGuard` (class) | `canActivate`: if `hasValidAccessToken()` true; else `navigateToLogin({ returnUrl })`, return false. |
+| `abpOAuthGuard` (fn) | Standalone `CanActivateFn` equivalent — used by every modern route. |
+| `asyncAbpOAuthGuard` | Waits for the silent-refresh event on SSR before allowing activation. |
+| `pipeToLogin(http$)` | RxJS operator: on 401 navigates to login and replays the request. |
+| `checkAccessToken()` | Boolean check used by route activations on hot-reload. |
+| `clearOAuthStorage()` | Wipes every storage key the OIDC library wrote — called on logout failures. |
+| `NavigateToManageProfileProvider` | Overrides `MANAGE_PROFILE_TOKEN` so the top-bar "Manage Profile" link goes to the OIDC `/Account/Manage` page on the authority when `isInternalAuth === false`. |
+
+## Multi-tenant header
+
+The OIDC tenant key defaults to `__tenant` (from `@abp/ng.core`'s `TENANT_KEY` token). The interceptor always appends it from `SessionStateService.getTenant().id`, but the `discovery_document_loaded` flow also passes `acr_values: tenantid:<id>` to the authority so the IdentityServer/OpenIddict server resolves the tenant when issuing the token. See `auth-flow-strategy.ts#configureOAuthService` for the call site.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Core abstractions" href="/angular/core#guards-and-route-protection">
+    `AuthService`, `AuthGuard`, `ApiInterceptor`, `TENANT_KEY` declared in core.
+  </Card>
+  <Card title="Account UI" href="/angular/account">
+    `LoginComponent` calls `AuthService.login(...)` which routes to the strategy.
+  </Card>
+  <Card title="OpenID Connect server" href="/auth/openid-connect">
+    The IdentityServer/OpenIddict authority that issues the tokens.
+  </Card>
+  <Card title="OAuth concepts" href="/auth/oauth">
+    Authorization Code with PKCE vs. Resource Owner Password flows.
+  </Card>
+</CardGroup>

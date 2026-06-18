@@ -1,0 +1,288 @@
+---
+title: "MVC UI for multi-tenancy"
+sidebarTitle: "MVC UI"
+description: "The Switch Tenant modal, the AbpTenantController/AppService lookup endpoints, the Account layout hook and the tenant-switch.js bundle integration."
+---
+
+`Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy` is a small package that ships the user-facing tenant switcher used by the Account / login pages of MVC themes. It contains exactly one Razor Page (the modal), one app service / controller pair (a tenant lookup endpoint for client-side validation), one JS file (the modal opener), and one localization resource.
+
+`framework/src/Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy/`
+
+## Package layout
+
+| File | Role |
+| --- | --- |
+| `Volo/Abp/AspNetCore/Mvc/UI/MultiTenancy/AbpAspNetCoreMvcUiMultiTenancyModule.cs` | Module class — registers localization, virtual files and bundle contribution. |
+| `Pages/Abp/MultiTenancy/TenantSwitchModal.cshtml` | The Bootstrap modal markup. |
+| `Pages/Abp/MultiTenancy/TenantSwitchModal.cshtml.cs` | `OnGetAsync` / `OnPostAsync` — pre-fills the name and writes the `__tenant` cookie. |
+| `Pages/Abp/MultiTenancy/AbpTenantAppService.cs` | `IAbpTenantAppService` implementation backed by `ITenantStore`. |
+| `Pages/Abp/MultiTenancy/AbpTenantController.cs` | `[Area("abp")] [Route("api/abp/multi-tenancy")]` HTTP controller exposing the same. |
+| `Pages/Abp/MultiTenancy/tenant-switch.js` | Tiny jQuery binding that opens the modal when `#AbpTenantSwitchLink` is clicked. |
+| `Volo/Abp/AspNetCore/Mvc/UI/MultiTenancy/Localization/*.json` | `AbpUiMultiTenancyResource` strings (`SwitchTenant`, `Tenant`, `NotSelected`, `Switch`, `GivenTenantIsNotExist`, …). |
+
+## Module wiring
+
+```csharp
+// .../AbpAspNetCoreMvcUiMultiTenancyModule.cs
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpAspNetCoreMultiTenancyModule)
+)]
+public class AbpAspNetCoreMvcUiMultiTenancyModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+        {
+            options.AddAssemblyResource(
+                typeof(AbpUiMultiTenancyResource),
+                typeof(AbpAspNetCoreMvcUiMultiTenancyModule).Assembly);
+        });
+
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(
+                typeof(AbpAspNetCoreMvcUiMultiTenancyModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAspNetCoreMvcUiMultiTenancyModule>();
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Add<AbpUiMultiTenancyResource>("en")
+                .AddVirtualJson("/Volo/Abp/AspNetCore/Mvc/UI/MultiTenancy/Localization");
+        });
+
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.ScriptBundles
+                .Get(StandardBundles.Scripts.Global)
+                .AddFiles("/Pages/Abp/MultiTenancy/tenant-switch.js");
+        });
+    }
+}
+```
+
+The module wires four cross-cutting things:
+
+1. **Localization** — registers `AbpUiMultiTenancyResource` and points at the embedded JSON files (`Localization/en.json` etc.).
+2. **Application part** — adds the assembly so the Razor Page and the controller are discovered by MVC even though they live in a NuGet package.
+3. **Embedded files** — adds the embedded file set so `Pages/Abp/MultiTenancy/TenantSwitchModal.cshtml` resolves through the Virtual File System.
+4. **Bundle contribution** — appends `/Pages/Abp/MultiTenancy/tenant-switch.js` to `StandardBundles.Scripts.Global`, so the click handler is available on every themed page.
+
+## The switch modal — page model
+
+```csharp
+// Pages/Abp/MultiTenancy/TenantSwitchModal.cshtml.cs
+public class TenantSwitchModalModel : AbpPageModel
+{
+    [BindProperty] public TenantInfoModel Input { get; set; } = default!;
+
+    protected ITenantStore TenantStore { get; }
+    protected ITenantNormalizer TenantNormalizer { get; }
+    protected AbpAspNetCoreMultiTenancyOptions Options { get; }
+
+    public TenantSwitchModalModel(
+        ITenantStore tenantStore,
+        ITenantNormalizer tenantNormalizer,
+        IOptions<AbpAspNetCoreMultiTenancyOptions> options)
+    {
+        TenantStore = tenantStore;
+        TenantNormalizer = tenantNormalizer;
+        Options = options.Value;
+        LocalizationResourceType = typeof(AbpUiMultiTenancyResource);
+    }
+
+    public virtual async Task OnGetAsync()
+    {
+        Input = new TenantInfoModel();
+        if (CurrentTenant.IsAvailable)
+        {
+            var tenant = await TenantStore.FindAsync(CurrentTenant.GetId());
+            Input.Name = tenant?.Name;
+        }
+    }
+
+    public virtual async Task OnPostAsync()
+    {
+        Guid? tenantId = null;
+        if (!Input.Name.IsNullOrEmpty())
+        {
+            var tenant = await TenantStore.FindAsync(TenantNormalizer.NormalizeName(Input.Name!)!);
+            if (tenant == null)
+                throw new UserFriendlyException(L["GivenTenantIsNotExist", Input.Name!]);
+            if (!tenant.IsActive)
+                throw new UserFriendlyException(L["GivenTenantIsNotAvailable", Input.Name!]);
+            tenantId = tenant.Id;
+        }
+        AbpMultiTenancyCookieHelper.SetTenantCookie(HttpContext, tenantId, Options.TenantKey);
+    }
+
+    public class TenantInfoModel
+    {
+        [InputInfoText("SwitchTenantHint")]
+        public string? Name { get; set; }
+    }
+}
+```
+
+`OnPostAsync` performs the exact same `ITenantNormalizer.NormalizeName` + `ITenantStore.FindAsync` flow that `TenantConfigurationProvider.FindTenantAsync` uses, then writes the `__tenant` cookie. An empty `Input.Name` clears the cookie (`SetTenantCookie(HttpContext, null, key)`) — that's how the user switches back to host. The hint `"Leave the name field blank to switch to the host side."` is exactly the localization key `SwitchTenantHint`.
+
+The view is intentionally tiny:
+
+```cshtml
+@* Pages/Abp/MultiTenancy/TenantSwitchModal.cshtml *@
+@page
+@model TenantSwitchModalModel
+@inject IHtmlLocalizer<AbpUiMultiTenancyResource> L
+@{ Layout = null; }
+<abp-dynamic-form abp-model="@Model.Input" asp-page="/Abp/MultiTenancy/TenantSwitchModal">
+    <abp-modal>
+        <abp-modal-header title="@L["SwitchTenant"].Value"></abp-modal-header>
+        <abp-modal-body>
+            <abp-form-content />
+        </abp-modal-body>
+        <abp-modal-footer buttons="@(AbpModalButtons.Cancel|AbpModalButtons.Save)"></abp-modal-footer>
+    </abp-modal>
+</abp-dynamic-form>
+```
+
+It uses three ABP Bootstrap tag helpers: `<abp-dynamic-form>` (renders the bound model as a form), `<abp-modal>` (modal scaffolding), and `<abp-form-content />` (the placeholder where the dynamic form drops its inputs).
+
+## The opener script
+
+```js
+// Pages/Abp/MultiTenancy/tenant-switch.js
+(function($) {
+    var tenantSwitchModal = new abp.ModalManager(abp.appPath + 'Abp/MultiTenancy/TenantSwitchModal');
+
+    $(function() {
+        $('#AbpTenantSwitchLink').click(function(e) {
+            e.preventDefault();
+            tenantSwitchModal.open();
+        });
+
+        tenantSwitchModal.onResult(function() {
+            location.assign(location.href);
+        });
+    });
+})(jQuery);
+```
+
+`abp.ModalManager` is the standard `abp-core` helper that opens a server-rendered partial as a Bootstrap modal, AJAX-posts the form, and raises `onResult` on a 2xx. The handler does a hard `location.assign(location.href)` — a reload, not a SPA navigate — because the tenant cookie change has to be observed by the *server* on the next request, which then re-resolves the tenant and re-renders the page (including all the tenant-scoped settings).
+
+The script appends to `StandardBundles.Scripts.Global`, so it ships in `global.min.js` for every theme without per-page wiring.
+
+## The layout hook
+
+The basic theme renders a "Tenant" box at the top of the Account layout (login, forgot-password, register pages), with a **switch** link the script binds to:
+
+```cshtml
+@* modules/basic-theme/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic/Themes/Basic/Layouts/Account.cshtml *@
+@if (MultiTenancyOptions.Value.IsEnabled &&
+     (TenantResolveResultAccessor.Result?.AppliedResolvers
+         ?.Contains(CookieTenantResolveContributor.ContributorName) == true ||
+      TenantResolveResultAccessor.Result?.AppliedResolvers
+         ?.Contains(QueryStringTenantResolveContributor.ContributorName) == true))
+{
+    <div class="card shadow-sm rounded mb-3">
+        <div class="card-body px-5">
+            <div class="row">
+                <div class="col">
+                    <span class="text-uppercase text-muted">@MultiTenancyStringLocalizer["Tenant"]</span><br/>
+                    <h6 class="m-0 d-inline-block">
+                        @if (CurrentTenant.Id == null)
+                        {
+                            <span>@MultiTenancyStringLocalizer["NotSelected"]</span>
+                        }
+                        else
+                        {
+                            <strong>@(CurrentTenant.Name ?? CurrentTenant.Id.Value.ToString())</strong>
+                        }
+                    </h6>
+                </div>
+                <div class="col-auto">
+                    <a id="AbpTenantSwitchLink" href="javascript:;"
+                       class="btn btn-sm mt-3 btn-outline-primary">
+                       @MultiTenancyStringLocalizer["Switch"]
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+```
+
+Notice the condition: the tenant box is shown only when the **current** tenant was resolved by `Cookie` or `QueryString`. That is exactly the case where the end user *can* change it. When `Header` / `Route` / `Domain` resolved the tenant — that is, when the tenant is part of the URL or set by the API client — switching makes no sense from the UI and the box stays hidden.
+
+`ITenantResolveResultAccessor` is the same instance that `MultiTenancyMiddleware` wrote into (`HttpContextTenantResolveResultAccessor`) and is the canonical way to inspect the resolve trail from views.
+
+## The lookup endpoint
+
+The package also ships a small "find tenant by name / by id" endpoint used by Angular and other client UIs to validate a typed-in tenant name before committing to the switch:
+
+```csharp
+// Pages/Abp/MultiTenancy/AbpTenantAppService.cs
+public class AbpTenantAppService : ApplicationService, IAbpTenantAppService
+{
+    public virtual async Task<FindTenantResultDto> FindTenantByNameAsync(string name)
+    {
+        var tenant = await TenantStore.FindAsync(TenantNormalizer.NormalizeName(name)!);
+        if (tenant == null) return new FindTenantResultDto { Success = false };
+        return new FindTenantResultDto
+        {
+            Success = true,
+            TenantId = tenant.Id, Name = tenant.Name,
+            NormalizedName = tenant.NormalizedName, IsActive = tenant.IsActive
+        };
+    }
+
+    public virtual async Task<FindTenantResultDto> FindTenantByIdAsync(Guid id) { /* same shape */ }
+}
+
+// Pages/Abp/MultiTenancy/AbpTenantController.cs
+[Area("abp")]
+[RemoteService(Name = "abp")]
+[Route("api/abp/multi-tenancy")]
+public class AbpTenantController : AbpControllerBase, IAbpTenantAppService
+{
+    [HttpGet, Route("tenants/by-name/{name}")]
+    public virtual Task<FindTenantResultDto> FindTenantByNameAsync(string name) { /* delegate */ }
+
+    [HttpGet, Route("tenants/by-id/{id}")]
+    public virtual Task<FindTenantResultDto> FindTenantByIdAsync(Guid id) { /* delegate */ }
+}
+```
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/abp/multi-tenancy/tenants/by-name/{name}` | `FindTenantResultDto { Success, TenantId, Name, NormalizedName, IsActive }` |
+| `GET /api/abp/multi-tenancy/tenants/by-id/{id}` | same |
+
+Both endpoints are open (no `[Authorize]`) — they are intentionally accessible to anonymous users so they can be used from the login page. They reveal only id / name / active status, not connection strings or any tenant settings. The Angular tenant box (`@abp/ng.theme.shared`) consumes them, as does the static MVC `tenant-switch.js` indirectly through `AbpTenantStore` on the JS side.
+
+The `IAbpTenantAppService` contract itself lives in `framework/src/Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy/Volo/Abp/AspNetCore/Mvc/MultiTenancy/` (in the abstractions assembly), so client proxy generators can produce typed clients.
+
+## Tag helper / view component hooks
+
+The package does **not** ship a dedicated tag helper. The "switch" link is just an anchor with a known id (`#AbpTenantSwitchLink`) that the global JS bundle binds to. Themes that want a different placement add the same id; themes that want different markup (or no link at all) simply omit it — nothing breaks.
+
+If you need to render the tenant box on a non-Account layout, copy the conditional `@if` block above into your own layout. The three pieces it needs:
+
+- `IOptions<AbpMultiTenancyOptions>` (or `MultiTenancyOptions` via injection) — to check `IsEnabled`.
+- `ITenantResolveResultAccessor` — to decide whether switching makes sense.
+- `ICurrentTenant` and `IStringLocalizer<AbpUiMultiTenancyResource>` — to display the current state.
+
+## Cross-references
+
+- The cookie this UI writes is read by [Cookie / QueryString resolvers](/multitenancy/tenant-resolution).
+- The cookie write/delete helper, headers and error page: [ASP.NET Core integration](/multitenancy/aspnetcore-integration).
+- The Tenant Management module that backs the lookup with a real database, plus full CRUD pages for the host: [Tenant Management module](/modules/tenant-management).
+- The Angular counterpart of this UI (`@abp/ng.theme.shared` tenant box + `SessionService`): [Angular tenant management](/angular/tenant-management).

@@ -1,0 +1,121 @@
+---
+title: "Unit of work (Volo.Abp.Uow)"
+description: "Lifecycle of UnitOfWork, the [UnitOfWork] interceptor, ambient-flow semantics, reservation, child UoWs, event publishing order and isolation."
+---
+
+`Volo.Abp.Uow` is the orchestrator for transactional database access and deferred event publishing. Every `[UnitOfWork]`-attributed method, every application service, every `IDataSeedContributor` and every controller action that calls a repository runs inside an `IUnitOfWork`.
+
+Source: `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/`.
+
+## Module
+
+`AbpUnitOfWorkModule` (file `AbpUnitOfWorkModule.cs`) hooks `UnitOfWorkInterceptorRegistrar.RegisterIfNeeded` into `IServiceCollection.OnRegistered`. Any registered type whose declaring class implements `IUnitOfWorkEnabled` or carries `[UnitOfWork]` gets wrapped with `UnitOfWorkInterceptor`.
+
+## File-by-file enumeration
+
+| File | Type | Role |
+| --- | --- | --- |
+| `IUnitOfWork.cs` | `IUnitOfWork : IDatabaseApiContainer, ITransactionApiContainer, IDisposable` | The contract every UoW exposes. |
+| `UnitOfWork.cs` | `UnitOfWork : IUnitOfWork, ITransientDependency` | Concrete implementation that owns `_databaseApis`, `_transactionApis`, distributed/local event buffers. Constant `UnitOfWorkReservationName = "_AbpActionUnitOfWork"`. |
+| `IUnitOfWorkManager.cs` | `IUnitOfWorkManager` | `Begin(options, requiresNew)`, `Reserve(name, requiresNew)`, `BeginReserved(name, options)`, `TryBeginReserved`, `Current` property. |
+| `UnitOfWorkManager.cs` | `UnitOfWorkManager : IUnitOfWorkManager, ISingletonDependency` | Creates a new `IServiceScope` per UoW (so each UoW gets fresh transient services), pushes the new UoW onto `IAmbientUnitOfWork`, returns a `ChildUnitOfWork` if one already exists and `requiresNew == false`. |
+| `IAmbientUnitOfWork.cs` | `IAmbientUnitOfWork : IUnitOfWorkAccessor` | Adds `GetCurrentByChecking()` which walks the outer chain skipping reserved/disposed/completed UoWs. |
+| `AmbientUnitOfWork.cs` | `AmbientUnitOfWork : IAmbientUnitOfWork, ISingletonDependency` | Wraps an `AsyncLocal<IUnitOfWork?>`. Exposes `SetUnitOfWork(uow)`. |
+| `IUnitOfWorkAccessor.cs` | `IUnitOfWorkAccessor` | Minimal `UnitOfWork` getter. |
+| `IUnitOfWorkManagerAccessor.cs` | accessor | Used to break circular DI in interceptors. |
+| `UnitOfWorkAttribute.cs` | `UnitOfWorkAttribute` | `IsTransactional?`, `IsolationLevel?`, `Timeout?`, `IsDisabled` flag. `SetOptions(AbpUnitOfWorkOptions)` mutates the options before `Begin`. |
+| `UnitOfWorkHelper.cs` | static | `IsUnitOfWorkType(TypeInfo)` / `IsUnitOfWorkMethod(MethodInfo, out attr)` — the discovery rules: explicit `[UnitOfWork]` on method or class, or implementing `IUnitOfWorkEnabled`. |
+| `IUnitOfWorkEnabled.cs` | marker interface | Conventional opt-in for application services. |
+| `UnitOfWorkInterceptor.cs` | `UnitOfWorkInterceptor : AbpInterceptor` | DynamicProxy interceptor that opens / completes the UoW for `[UnitOfWork]` methods. Honours the pre-reserved UoW name `_AbpActionUnitOfWork`. |
+| `UnitOfWorkInterceptorRegistrar.cs` | static | Decides which DI registrations need the interceptor. |
+| `UnitOfWorkTransactionBehavior.cs` | enum | `Auto`, `Enabled`, `Disabled`. |
+| `IUnitOfWorkTransactionBehaviourProvider.cs` / `NullUnitOfWorkTransactionBehaviourProvider.cs` | provider | Pluggable per-runtime override (e.g. ASP.NET Core sets it based on HTTP method/route). |
+| `AlwaysDisableTransactionsUnitOfWorkManager.cs` | `AlwaysDisableTransactionsUnitOfWorkManager : UnitOfWorkManager` | Test helper that forces `IsTransactional = false`. |
+| `AbpUnitOfWorkOptions.cs` | `AbpUnitOfWorkOptions : IAbpUnitOfWorkOptions` | `IsTransactional`, `IsolationLevel?`, `Timeout?` (ms). `Clone()`. |
+| `IAbpUnitOfWorkOptions.cs` | read-only view of options | Exposed via `IUnitOfWork.Options`. |
+| `AbpUnitOfWorkDefaultOptions.cs` | global defaults | `TransactionBehavior = Auto`, plus default `IsolationLevel`/`Timeout`. `Normalize(options)` fills in unset values. `CalculateIsTransactional(autoValue)` resolves `Auto` → true/false. |
+| `ChildUnitOfWork.cs` | `internal ChildUnitOfWork : IUnitOfWork` | Wraps a parent UoW: forwards everything except `CompleteAsync()` (which is a no-op for the child). |
+| `IDatabaseApi.cs` / `IDatabaseApiContainer.cs` | per-provider DB handle bag | EF Core stores `EfCoreDatabaseApi`, MongoDB `MongoDbDatabaseApi`. Container has `FindDatabaseApi(key)` + `AddDatabaseApi(key, api)`. |
+| `ITransactionApi.cs` / `ITransactionApiContainer.cs` | per-transaction handle bag | `CommitAsync(CancellationToken)`. EF Core's wraps `IDbContextTransaction`, MongoDB's wraps `IClientSessionHandle`. |
+| `ISupportsRollback.cs` | optional interface on transaction APIs | Allows `RollbackAsync`. |
+| `ISupportsSavingChanges.cs` | optional interface on database APIs | Allows the UoW to flush changes (`SaveChangesAsync` propagates). |
+| `IUnitOfWorkEventPublisher.cs` / `NullUnitOfWorkEventPublisher.cs` | event sink | Receives `LocalEvents` and `DistributedEvents` collected during the UoW. |
+| `UnitOfWorkEventRecord.cs` | `UnitOfWorkEventRecord` | `EventType`, `EventData`, `EventOrder`, `UseOutbox`, `Properties` dictionary. |
+| `EventOrderGenerator.cs` | static | `Interlocked.Increment(ref _lastOrder)` — gives every event a global monotonic order. |
+| `UnitOfWorkEventArgs.cs` / `UnitOfWorkFailedEventArgs.cs` | event args | Used by `IUnitOfWork.Failed` / `Disposed`. |
+| `UnitOfWorkExtensions.cs` | extension helpers | `IsReservedFor(name)`, etc. |
+| `UnitOfWorkManagerExtensions.cs` | extensions | Convenience overloads of `Begin()`. |
+| `UnitOfWorkCollectionExtensions.cs` | extensions | `AbpApplicationCreationOptions` helpers. |
+| `UnitOfWorkTransactionBehavior.cs` | enum (above) | — |
+
+## Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Caller as Caller (controller / app service)
+    participant Int as UnitOfWorkInterceptor
+    participant Mgr as UnitOfWorkManager
+    participant Amb as AmbientUnitOfWork (AsyncLocal)
+    participant Uow as UnitOfWork
+    participant DB as DatabaseApi(s)
+    participant Tx as TransactionApi(s)
+    participant Pub as IUnitOfWorkEventPublisher
+
+    Caller->>Int: invoke virtual method
+    Int->>Mgr: TryBeginReserved(_AbpActionUnitOfWork) or Begin(options)
+    Mgr->>Uow: new UnitOfWork() via scope.ServiceProvider
+    Mgr->>Amb: SetUnitOfWork(uow)
+    Mgr-->>Int: IUnitOfWork
+    Int->>Caller: ProceedAsync()
+    Caller->>Uow: implicit via IDbContextProvider / repository
+    Uow->>DB: AddDatabaseApi("EntityFrameworkCore:<TDbContext>", api)
+    alt IsTransactional
+        Uow->>Tx: AddTransactionApi(...)
+    end
+    Caller-->>Int: returns
+    Int->>Uow: CompleteAsync()
+    Uow->>Uow: SaveChangesAsync() → DB.SaveChangesAsync()
+    Uow->>Pub: PublishLocalEventsAsync(LocalEvents) ordered by EventOrder
+    Uow->>Pub: PublishDistributedEventsAsync(DistributedEvents)
+    Uow->>Tx: CommitAsync() on every transaction api
+    Uow-->>Int: completed
+    Int->>Uow: Dispose() (Disposed event fires; Amb pops)
+```
+
+### Outer / inner / reserved
+
+- **Outer UoW exists & `requiresNew == false`** → `Begin` returns a `ChildUnitOfWork`. The child's `CompleteAsync` is a no-op; only the outer commits.
+- **Outer UoW exists & `requiresNew == true`** → a fresh root UoW is created, `SetOuter(outerUow)` is called so it can still chain `Failed` events. The new UoW becomes the ambient one until disposed.
+- **Reservation** — `Reserve("_AbpActionUnitOfWork")` creates a UoW with `IsReserved = true` early in the pipeline (e.g. `AbpUnitOfWorkMiddleware` for ASP.NET Core). `[UnitOfWork]`-wrapped methods then call `TryBeginReserved(name, options)` which initialises the reserved UoW with the method's options, so middleware-level state (current tenant, current user) is captured before the action runs.
+
+### Event ordering
+
+`UnitOfWork.AddOrReplaceLocalEvent` / `AddOrReplaceDistributedEvent` accept an optional `Predicate<UnitOfWorkEventRecord>? replacementSelector`. If supplied and a previous record matches, the new event replaces it — this is how "entity updated" events deduplicate across multiple modifications. Otherwise the event is appended with `EventOrderGenerator.GetNext()`. On commit, events are sorted by `EventOrder` ascending, then dispatched via `IUnitOfWorkEventPublisher`.
+
+### Transaction decision
+
+`UnitOfWorkInterceptor.CreateOptions` resolves `IsTransactional` like this when the attribute does not set it:
+
+```csharp
+options.IsTransactional = defaultOptions.CalculateIsTransactional(
+    autoValue: serviceProvider.GetRequiredService<IUnitOfWorkTransactionBehaviourProvider>().IsTransactional
+               ?? !invocation.Method.Name.StartsWith("Get", StringComparison.InvariantCultureIgnoreCase)
+);
+```
+
+So by default a method whose name starts with `Get` is read-only (no transaction), everything else opens one — unless `AbpUnitOfWorkDefaultOptions.TransactionBehavior` is `Enabled`/`Disabled` to force it.
+
+## Failure handling
+
+`UnitOfWork.SaveChangesAsync` / `CompleteAsync` catch exceptions, stash them in `_exception`, raise `Failed`, then rethrow. `Dispose` rolls back any active transaction (`ISupportsRollback`), fires `Disposed`, and pops itself off `AmbientUnitOfWork`.
+
+`AbpDbConcurrencyException` (in `Volo.Abp.Data`) is the canonical concurrency error — EF Core wraps `DbUpdateConcurrencyException` into it via `AbpDbContext.SaveChangesOnDbContextAsync`.
+
+## Cross-references
+
+- `/flows/unit-of-work-flow` — the end-to-end sequence including middleware.
+- `/data/entity-framework-core` — how `UnitOfWorkDbContextProvider<TDbContext>` plugs into the UoW.
+- `/data/data-seeding-and-migrations` — `DataSeeder.SeedAsync` is `[UnitOfWork]`.
+- `/core/dynamic-proxy-and-aspects` — `AbpInterceptor`/Castle DynamicProxy basis for `UnitOfWorkInterceptor`.
+- `/aspnetcore/overview` — `AbpUnitOfWorkMiddleware` is where the action-level reservation is created.

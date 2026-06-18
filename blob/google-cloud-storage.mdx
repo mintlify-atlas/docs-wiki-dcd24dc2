@@ -1,0 +1,135 @@
+---
+title: "Google Cloud Storage provider"
+sidebarTitle: "Google Cloud Storage"
+description: "Volo.Abp.BlobStoring.Google — GoogleBlobProvider, GoogleBlobProviderConfiguration (service account JSON or ADC), GoogleBlobNamingNormalizer (GCS bucket and object rules)."
+---
+
+The Google provider package is `framework/src/Volo.Abp.BlobStoring.Google/Volo/Abp/BlobStoring/Google/`. It wraps the **`Google.Cloud.Storage.V1`** SDK and supports both explicit service-account credentials (`ClientEmail` + `PrivateKey`) and Application Default Credentials (`UseApplicationDefaultCredentials`).
+
+## Files in this package
+
+| File | Role |
+| --- | --- |
+| `AbpBlobStoringGoogleModule.cs` | `[DependsOn(AbpBlobStoringModule)]`, empty body. |
+| `GoogleBlobContainerConfigurationExtensions.cs` | `UseGoogle(action)` and `GetGoogleConfiguration()`. |
+| `GoogleBlobProviderConfiguration.cs` | Typed view over the properties bag. |
+| `GoogleBlobProviderConfigurationNames.cs` | The bag keys (`Google.ProjectId`, `Google.ClientEmail`, …). |
+| `GoogleBlobProvider.cs` | The `IBlobProvider`. |
+| `GoogleBlobNamingNormalizer.cs` | GCS bucket + object naming rules — lowercases, strips invalid chars, removes `goog` prefix and `google` substring, validates length per dot-separated component. |
+| `IGoogleBlobNameCalculator.cs` + `DefaultGoogleBlobNameCalculator.cs` | `host/{blob}` or `tenants/{tenantId:D}/{blob}` blob key. |
+
+## Module
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule))]
+public class AbpBlobStoringGoogleModule : AbpModule { }
+```
+
+No `AbpCachingModule` dependency — GCS service-account JWTs are managed inside the Google SDK and the provider does not interpose its own cache.
+
+## `UseGoogle(...)`
+
+```csharp
+containerConfiguration.ProviderType = typeof(GoogleBlobProvider);
+containerConfiguration.NamingNormalizers.TryAdd<GoogleBlobNamingNormalizer>();
+googleConfigureAction(new GoogleBlobProviderConfiguration(containerConfiguration));
+```
+
+Example:
+
+```csharp
+o.Containers.Configure<MyContainer>(c =>
+{
+    c.UseGoogle(g =>
+    {
+        g.ProjectId   = "my-project";
+        g.ClientEmail = "blob-svc@my-project.iam.gserviceaccount.com";
+        g.PrivateKey  = config["Gcp:PrivateKey"];           // PEM, multi-line
+        g.ContainerName = "my-bucket";
+        g.CreateContainerIfNotExists = true;
+    });
+});
+
+// or ADC (Application Default Credentials)
+o.Containers.ConfigureDefault(c =>
+{
+    c.UseGoogle(g =>
+    {
+        g.ProjectId = "my-project";
+        g.UseApplicationDefaultCredentials = true;
+        g.ContainerName = "my-bucket";
+    });
+});
+```
+
+## `GoogleBlobProviderConfiguration`
+
+| Property | Bag key | Type | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `ProjectId` | `Google.ProjectId` | `string?` | `null` | GCP project unique id. Required when creating buckets (`CreateContainerIfNotExists = true`). |
+| `ClientEmail` | `Google.ClientEmail` | `string?` | `null` | Service account email. |
+| `PrivateKey` | `Google.PrivateKey` | `string?` | `null` | Service account private key (PEM `-----BEGIN PRIVATE KEY-----` … `-----END PRIVATE KEY-----`). |
+| `Scopes` | `Google.Scopes` | `List<string>?` | empty list | OAuth 2.0 scopes for the service account credential. |
+| `UseApplicationDefaultCredentials` | `Google.ApplicationDefaultCredentials` | `bool` | `false` | Use ADC (env var `GOOGLE_APPLICATION_CREDENTIALS`, metadata server on GCE/GKE, etc.). When `true`, ignores `ClientEmail` / `PrivateKey`. |
+| `ContainerName` | `Google.ContainerName` | `string?` | `null` | Override the bucket name. Falls back to `args.ContainerName`. Run through `BlobNormalizeNamingService.NormalizeContainerName`. |
+| `CreateContainerIfNotExists` | `Google.CreateContainerIfNotExists` | `bool` | `false` | Create the bucket on first save if it does not exist (`StorageClient.CreateBucketAsync(projectId, bucketName)`). |
+
+Reading `ProjectId`, `ClientEmail`, `PrivateKey`, `Scopes`, `ContainerName` returns the stored value or default — they do **not** throw on null, so the provider's own `Check`/SDK validates required fields when constructing the credential.
+
+## `DefaultGoogleBlobNameCalculator`
+
+Same shape as Azure/AWS:
+
+```csharp
+return CurrentTenant.Id == null
+    ? $"host/{args.BlobName}"
+    : $"tenants/{CurrentTenant.Id.Value:D}/{args.BlobName}";
+```
+
+## `GoogleBlobProvider`
+
+For each call the provider builds a `Google.Apis.Auth.OAuth2.GoogleCredential` either from ADC (`GoogleCredential.GetApplicationDefaultAsync()`) or from a `ServiceAccountCredential` constructed with `(ClientEmail, PrivateKey, Scopes)`, and creates a `Google.Cloud.Storage.V1.StorageClient` over it.
+
+| Method | Flow |
+| --- | --- |
+| `SaveAsync` | If `!OverrideExisting && exists` → `BlobAlreadyExistsException`. If `CreateContainerIfNotExists` and the bucket doesn't exist → `StorageClient.CreateBucketAsync(ProjectId, bucketName)`. Then `client.UploadObjectAsync(bucketName, blobName, contentType: null, args.BlobStream)`. |
+| `DeleteAsync` | If exists → `client.DeleteObjectAsync(bucketName, blobName)` → return true; else false. |
+| `ExistsAsync` | Attempts `client.GetObjectAsync(bucketName, blobName)` — returns false on `GoogleApiException` with `HttpStatusCode.NotFound`. |
+| `GetOrNullAsync` | If not exists → null. Otherwise `DownloadObjectAsync(bucketName, blobName, MemoryStream)`; the memory stream is rewound and returned. |
+
+## `GoogleBlobNamingNormalizer`
+
+The most elaborate of the cloud normalisers because GCS has the most complex bucket rules.
+
+`NormalizeContainerName`:
+
+- Lowercases.
+- If the name contains `.`, splits on `.`, truncates each segment to 63 chars, rejoins; otherwise truncates the whole name to 63 chars (overall cap: 222 with dots).
+- `Regex.Replace(name, "[^a-z0-9-_.]", "")` — keeps lowercase letters, digits, `- _ .`.
+- Collapses runs of dots, removes dotted-decimal IPv4 patterns.
+- Strips a leading `goog` prefix, removes all occurrences of `google`.
+- Trims any leading/trailing non-alphanumeric character (recursively).
+- Pads with `0`s up to 3 chars if too short.
+
+`NormalizeBlobName`:
+
+```csharp
+if (blobName.Length > 1024) blobName = blobName.Substring(0, 1024);
+blobName = Regex.Replace(blobName, "[\r\n]", "");
+blobName = Regex.Replace(blobName, "^\\.well-known/acme-challenge/", "");
+blobName = Regex.Replace(blobName, "^\\.\\.?$", "");
+return blobName;
+```
+
+GCS objects can contain any Unicode but disallow CR/LF and the `.well-known/acme-challenge/` prefix; objects can't be named `.` or `..`.
+
+## Credentials lifecycle
+
+`GoogleCredential.FromServiceAccountKey(new ServiceAccountCredential(...))` produces a credential that signs short-lived JWTs and exchanges them for OAuth access tokens internally; the SDK handles refresh. There is no application-side STS cache — the provider can be relatively chatty on cold starts but does not need a distributed cache.
+
+If you set `UseApplicationDefaultCredentials = true`, the SDK reads `GOOGLE_APPLICATION_CREDENTIALS` (a path to a JSON file), then falls back to GCP metadata server detection for workloads running on GCE/GKE/Cloud Run with attached service accounts.
+
+## Cross-references
+
+- [BLOB storing overview](/blob/blob-storing-overview).
+- [Azure Blob](/blob/azure-blob) / [AWS S3](/blob/aws-s3) — peer providers with similar `Use…` ergonomics.

@@ -1,0 +1,169 @@
+---
+title: "OAuth Claim Mapping Helpers"
+sidebarTitle: "OAuth"
+description: "What Volo.Abp.AspNetCore.Authentication.OAuth provides: the AbpAspNetCoreAuthenticationOAuthModule, MapAbpClaimTypes, MultipleClaimAction, RemoveDuplicateClaimAction."
+---
+
+`Volo.Abp.AspNetCore.Authentication.OAuth` (`framework/src/Volo.Abp.AspNetCore.Authentication.OAuth/`) is a tiny shared package. It does **not** add a new OAuth handler — it only contributes claim actions that bridge OAuth2/OIDC userinfo payloads to `AbpClaimTypes`. The OpenID Connect package and any third-party OAuth handler (Google, GitHub, Microsoft) re-use it through `options.ClaimActions.MapAbpClaimTypes()`.
+
+## Module
+
+`AbpAspNetCoreAuthenticationOAuthModule` (`Volo/Abp/AspNetCore/Authentication/OAuth/AbpAspNetCoreAuthenticationOAuthModule.cs`):
+
+```csharp
+[DependsOn(typeof(AbpSecurityModule))]
+public class AbpAspNetCoreAuthenticationOAuthModule : AbpModule { }
+```
+
+There are no services registered here. The module exists so `AbpAspNetCoreAuthenticationOpenIdConnectModule` and any module that consumes the claim-action extensions can take a single `[DependsOn]`.
+
+## `MapAbpClaimTypes`
+
+`AbpClaimActionCollectionExtensions.MapAbpClaimTypes` (`Microsoft/AspNetCore/Authentication/OAuth/Claims/AbpClaimActionCollectionExtensions.cs`) is the centerpiece. It rewires the default ASP.NET Core claim-action collection so that OIDC userinfo fields (`name`, `given_name`, `family_name`, `email`, `email_verified`, `phone_number`, `phone_number_verified`, `role`) end up on the `ClaimsIdentity` under the names declared by `AbpClaimTypes` (`framework/src/Volo.Abp.Security/Volo/Abp/Security/Claims/AbpClaimTypes.cs`).
+
+```csharp
+public static void MapAbpClaimTypes(this ClaimActionCollection claimActions)
+{
+    if (AbpClaimTypes.UserName != "name")
+    {
+        claimActions.MapJsonKey(AbpClaimTypes.UserName, "name");
+        claimActions.DeleteClaim("name");
+        claimActions.RemoveDuplicate(AbpClaimTypes.UserName);
+    }
+
+    if (AbpClaimTypes.Name != "given_name")
+    {
+        claimActions.MapJsonKey(AbpClaimTypes.Name, "given_name");
+        claimActions.DeleteClaim("given_name");
+        claimActions.RemoveDuplicate(AbpClaimTypes.Name);
+    }
+
+    if (AbpClaimTypes.SurName != "family_name")
+    {
+        claimActions.MapJsonKey(AbpClaimTypes.SurName, "family_name");
+        claimActions.DeleteClaim("family_name");
+        claimActions.RemoveDuplicate(AbpClaimTypes.SurName);
+    }
+
+    if (AbpClaimTypes.Email != "email")
+    {
+        claimActions.MapJsonKey(AbpClaimTypes.Email, "email");
+        claimActions.DeleteClaim("email");
+        claimActions.RemoveDuplicate(AbpClaimTypes.Email);
+    }
+
+    if (AbpClaimTypes.EmailVerified != "email_verified")
+        claimActions.MapJsonKey(AbpClaimTypes.EmailVerified, "email_verified");
+
+    if (AbpClaimTypes.PhoneNumber != "phone_number")
+        claimActions.MapJsonKey(AbpClaimTypes.PhoneNumber, "phone_number");
+
+    if (AbpClaimTypes.PhoneNumberVerified != "phone_number_verified")
+        claimActions.MapJsonKey(AbpClaimTypes.PhoneNumberVerified, "phone_number_verified");
+
+    if (AbpClaimTypes.Role != "role")
+        claimActions.MapJsonKeyMultiple(AbpClaimTypes.Role, "role");
+
+    claimActions.RemoveDuplicate(AbpClaimTypes.Name);
+}
+```
+
+The pattern repeats: map the well-known OIDC field to the ABP-canonical claim type, then **delete the original-typed claim** so downstream code does not have to handle both. `Role` uses `MapJsonKeyMultiple` (see below) because the OIDC spec allows `role` to be a single string or a JSON array.
+
+The recommended call site is inside `AddOpenIdConnect` (or `AddGoogle`, `AddMicrosoftAccount`, etc.) configuration — `AbpOpenIdConnectExtensions.AddAbpOpenIdConnect` already does this for you. For a custom OAuth handler:
+
+```csharp
+.AddOAuth("github", options =>
+{
+    options.ClientId = "…";
+    options.ClientSecret = "…";
+    options.UserInformationEndpoint = "https://api.github.com/user";
+    options.ClaimActions.MapAbpClaimTypes(); // <- here
+    options.ClaimActions.MapJsonKey(AbpClaimTypes.Picture, "avatar_url");
+});
+```
+
+## `MultipleClaimAction`
+
+`MultipleClaimAction` (`Volo/Abp/AspNetCore/Authentication/OAuth/Claims/MultipleClaimAction.cs`) is the claim action behind `MapJsonKeyMultiple`. The stock `MapJsonKey` adds at most one claim and only handles JSON strings. `MultipleClaimAction.Run` supports both shapes and de-duplicates while adding:
+
+```csharp
+public override void Run(JsonElement userData, ClaimsIdentity identity, string issuer)
+{
+    if (!userData.TryGetProperty(ValueType, out var prop)) return;
+    if (prop.ValueKind == JsonValueKind.Null) return;
+
+    switch (prop.ValueKind)
+    {
+        case JsonValueKind.String:
+            var claim = new Claim(ClaimType, prop.GetString()!, ValueType, issuer);
+            if (!identity.Claims.Any(c => c.Type == claim.Type && c.Value == claim.Value))
+                identity.AddClaim(claim);
+            break;
+        case JsonValueKind.Array:
+            foreach (var arramItem in prop.EnumerateArray())
+            {
+                claim = new Claim(ClaimType, arramItem.GetString()!, ValueType, issuer);
+                if (!identity.Claims.Any(c => c.Type == claim.Type && c.Value == claim.Value))
+                    identity.AddClaim(claim);
+            }
+            break;
+        default:
+            throw new AbpException("Unhandled JsonValueKind: " + prop.ValueKind);
+    }
+}
+```
+
+Important quirks:
+
+- The base class's `ValueType` field is **reused** to carry the JSON key name (the extension passes the `jsonKey` as `valueType`). Read `MapJsonKeyMultiple` to confirm.
+- Only string/array of strings is accepted — booleans and numbers in `role` will throw `AbpException`.
+- Adds the claim only when no `(type, value)` pair already exists, so re-running the action is idempotent.
+
+Use it whenever a userinfo field can be a single string or an array — most commonly `role`, `groups`, `scope`.
+
+## `RemoveDuplicateClaimAction`
+
+`RemoveDuplicateClaimAction` (`Volo/Abp/AspNetCore/Authentication/OAuth/Claims/RemoveDuplicateClaimAction.cs`) is what `MapAbpClaimTypes` schedules after every `MapJsonKey` rename. The action examines all claims of a given `ClaimType` and removes any whose value duplicates a previously seen one, in order:
+
+```csharp
+public override void Run(JsonElement userData, ClaimsIdentity identity, string issuer)
+{
+    var claims = identity.Claims.Where(c => c.Type == ClaimType).ToArray();
+    if (claims.Length < 2) return;
+
+    var previousValues = new List<string>();
+    foreach (var claim in claims)
+    {
+        if (claim.Value.IsIn(previousValues))
+            identity.RemoveClaim(claim);
+        else
+            previousValues.Add(claim.Value);
+    }
+}
+```
+
+Why this exists: some providers emit the same data under multiple keys (e.g. `name` and `preferred_username` both returning the username). After remapping both to `AbpClaimTypes.UserName` you get duplicate claims; `RemoveDuplicateClaimAction` cleans up post-mapping. The `MapAbpClaimTypes` method finishes by calling `claimActions.RemoveDuplicate(AbpClaimTypes.Name)` once more as a defensive trailing pass.
+
+`AbpClaimActionCollectionExtensions` adds two convenience methods:
+
+```csharp
+public static void MapJsonKeyMultiple(this ClaimActionCollection claimActions, string claimType, string jsonKey)
+    => claimActions.Add(new MultipleClaimAction(claimType, jsonKey));
+
+public static void RemoveDuplicate(this ClaimActionCollection claimActions, string claimType)
+    => claimActions.Add(new RemoveDuplicateClaimAction(claimType));
+```
+
+## How it composes
+
+`AbpOpenIdConnectExtensions.AddAbpOpenIdConnect` (in the OpenID Connect package — see [`auth/openid-connect`](/auth/openid-connect)) calls `options.ClaimActions.MapAbpClaimTypes()` for you. The Account module's external-login flow does the same on each external authentication handler so that `ICurrentUser.UserName`, `ICurrentUser.Email` and `ICurrentUser.Roles` work the same way regardless of the upstream IdP.
+
+If you change `AbpClaimTypes.UserName = "preferred_username"` (or any other static), the `if` guards in `MapAbpClaimTypes` will short-circuit the rename so you don't fight yourself.
+
+## See also
+
+- ABP-canonical claim types and the principal pipeline — [`auth/security-and-claims`](/auth/security-and-claims).
+- OIDC handler that automatically invokes `MapAbpClaimTypes` — [`auth/openid-connect`](/auth/openid-connect).
+- JWT API hosts that consume the resulting tokens — [`auth/jwt-bearer`](/auth/jwt-bearer).
+- External-login plumbing in Account module — [`/modules/account`](/modules/account).

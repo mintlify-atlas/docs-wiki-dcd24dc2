@@ -1,0 +1,280 @@
+---
+title: "Castle.Core integration: Dynamic Proxy adapter"
+sidebarTitle: "Castle.Core"
+description: "AbpCastleCoreModule, AbpAsyncDeterminationInterceptor<T>, and the CastleAsyncAbpInterceptorAdapter / CastleAbpMethodInvocationAdapter pair that bridges IAbpInterceptor to Castle.DynamicProxy."
+---
+
+`Volo.Abp.Castle.Core` is the bridge between ABP's container-agnostic interceptor contracts (`IAbpInterceptor`, `IAbpMethodInvocation` in `Volo.Abp.Core`) and Castle.DynamicProxy. It depends on **`Castle.Core.AsyncInterceptor`** to handle sync-vs-async invocations correctly without forcing every ABP interceptor to know which it is dealing with.
+
+This package contains no application logic of its own — it is pure adapter code. The cross-cutting interceptors that actually do work (auditing, authorization, validation, etc.) live in their respective feature packages; see [`core/dynamic-proxy-and-aspects`](/core/dynamic-proxy-and-aspects).
+
+## Why ABP wraps interceptors this way
+
+ABP's interceptor contract is single-method:
+
+```csharp
+public interface IAbpInterceptor
+{
+    Task InterceptAsync(IAbpMethodInvocation invocation);
+}
+```
+
+That's deliberately **always-async**, so interceptor authors don't have to branch on return type. But Castle.DynamicProxy's native `IInterceptor` is **always-sync**:
+
+```csharp
+public interface IInterceptor
+{
+    void Intercept(IInvocation invocation);
+}
+```
+
+If you intercept an `async` method with a plain Castle `IInterceptor`, you intercept the synchronous wrapper that returns the `Task`, not the asynchronous body. Awaiting inside the interceptor wouldn't compose with the caller's `await`. The standard fix is `Castle.Core.AsyncInterceptor`'s `AsyncInterceptorBase` and `AsyncDeterminationInterceptor`:
+
+- `AsyncInterceptorBase` exposes two overrideable methods — `InterceptAsync` for void-returning async, and `InterceptAsync<TResult>` for `Task<T>`-returning async — both genuinely awaitable.
+- `AsyncDeterminationInterceptor` inspects the invocation's return type and dispatches to either the sync `IInterceptor.Intercept` or the async `AsyncInterceptorBase.InterceptAsync` overload.
+
+ABP composes these into a single generic interceptor type that any `IAbpInterceptor` plugs into.
+
+## Files
+
+```
+framework/src/Volo.Abp.Castle.Core/Volo/Abp/Castle/
+├── AbpCastleCoreModule.cs                          — module
+└── DynamicProxy/
+    ├── AbpAsyncDeterminationInterceptor.cs         — the public adapter type
+    ├── CastleAsyncAbpInterceptorAdapter.cs         — IAbpInterceptor → AsyncInterceptorBase
+    ├── CastleAbpMethodInvocationAdapterBase.cs     — IInvocation → IAbpMethodInvocation (base)
+    ├── CastleAbpMethodInvocationAdapter.cs         — void/Task overload
+    └── CastleAbpMethodInvocationAdapterWithReturnValue.cs  — Task<TResult> overload
+```
+
+## `AbpCastleCoreModule`
+
+```csharp
+public class AbpCastleCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddTransient(typeof(AbpAsyncDeterminationInterceptor<>));
+    }
+}
+```
+
+One job: register the open-generic `AbpAsyncDeterminationInterceptor<>` so Autofac's `InterceptedBy(typeof(AbpAsyncDeterminationInterceptor<MyInterceptor>))` call can resolve closed instances at proxy-construction time.
+
+`AbpAutofacModule` declares `[DependsOn(typeof(AbpCastleCoreModule))]`, so whenever you `UseAutofac()`, this registration is in place automatically.
+
+## `AbpAsyncDeterminationInterceptor<TInterceptor>`
+
+```csharp
+public class AbpAsyncDeterminationInterceptor<TInterceptor> : AsyncDeterminationInterceptor
+    where TInterceptor : IAbpInterceptor
+{
+    public AbpAsyncDeterminationInterceptor(TInterceptor abpInterceptor)
+        : base(new CastleAsyncAbpInterceptorAdapter<TInterceptor>(abpInterceptor))
+    {
+    }
+}
+```
+
+The whole adapter surface in three lines. `AsyncDeterminationInterceptor` is from `Castle.Core.AsyncInterceptor`; it takes an `IAsyncInterceptor` (here, our `CastleAsyncAbpInterceptorAdapter`) and dispatches each call to the right method based on the target method's return type.
+
+The closed generic `AbpAsyncDeterminationInterceptor<TInterceptor>` is what Autofac actually registers via:
+
+```csharp
+registrationBuilder.InterceptedBy(
+    typeof(AbpAsyncDeterminationInterceptor<>).MakeGenericType(interceptor));
+```
+
+…inside `AbpRegistrationBuilderExtensions.AddInterceptors` (see [`integrations/autofac`](/integrations/autofac)). The generic parameter ensures that constructor-injected `TInterceptor` resolves the user's concrete interceptor type from DI — which in turn picks up all of `TInterceptor`'s own dependencies.
+
+## `CastleAsyncAbpInterceptorAdapter<TInterceptor>`
+
+```csharp
+public class CastleAsyncAbpInterceptorAdapter<TInterceptor> : AsyncInterceptorBase
+    where TInterceptor : IAbpInterceptor
+{
+    private readonly TInterceptor _abpInterceptor;
+
+    public CastleAsyncAbpInterceptorAdapter(TInterceptor abpInterceptor)
+    {
+        _abpInterceptor = abpInterceptor;
+    }
+
+    protected override async Task InterceptAsync(IInvocation invocation, IInvocationProceedInfo proceedInfo,
+        Func<IInvocation, IInvocationProceedInfo, Task> proceed)
+    {
+        await _abpInterceptor.InterceptAsync(
+            new CastleAbpMethodInvocationAdapter(invocation, proceedInfo, proceed));
+    }
+
+    protected override async Task<TResult> InterceptAsync<TResult>(IInvocation invocation,
+        IInvocationProceedInfo proceedInfo,
+        Func<IInvocation, IInvocationProceedInfo, Task<TResult>> proceed)
+    {
+        var adapter = new CastleAbpMethodInvocationAdapterWithReturnValue<TResult>(
+            invocation, proceedInfo, proceed);
+
+        await _abpInterceptor.InterceptAsync(adapter);
+
+        return (TResult)adapter.ReturnValue;
+    }
+}
+```
+
+Two overrides:
+
+- **`InterceptAsync` (no result)** — covers `void` (synchronous) and `Task`-returning methods. The adapter wraps the invocation in `CastleAbpMethodInvocationAdapter`, hands it to the user's `IAbpInterceptor`, and the interceptor decides whether to `await invocation.ProceedAsync()`.
+- **`InterceptAsync<TResult>` (with result)** — covers `Task<T>` and synchronous `T`-returning methods. The wrapper is `CastleAbpMethodInvocationAdapterWithReturnValue<TResult>`, which stores the result in `ReturnValue` after `Proceed`. We cast it back to `TResult` for the caller.
+
+The Castle library calls one of these based on the original method's return type — interceptor code itself never has to branch.
+
+## `CastleAbpMethodInvocationAdapterBase`
+
+```csharp
+public abstract class CastleAbpMethodInvocationAdapterBase : IAbpMethodInvocation
+{
+    public object?[] Arguments => Invocation.Arguments;
+
+    public IReadOnlyDictionary<string, object?> ArgumentsDictionary => _lazyArgumentsDictionary.Value;
+    private readonly Lazy<IReadOnlyDictionary<string, object?>> _lazyArgumentsDictionary;
+
+    public Type[]? GenericArguments => Invocation.GenericArguments;
+
+    public object? TargetObject => Invocation.InvocationTarget ?? Invocation.MethodInvocationTarget;
+
+    public MethodInfo Method => Invocation.MethodInvocationTarget ?? Invocation.Method;
+
+    public object ReturnValue { get; set; } = null!;
+
+    protected IInvocation Invocation { get; }
+
+    protected CastleAbpMethodInvocationAdapterBase(IInvocation invocation)
+    {
+        Invocation = invocation;
+        _lazyArgumentsDictionary = new Lazy<IReadOnlyDictionary<string, object?>>(GetArgumentsDictionary);
+    }
+
+    public abstract Task ProceedAsync();
+
+    private IReadOnlyDictionary<string, object?> GetArgumentsDictionary()
+    {
+        var dict = new Dictionary<string, object?>();
+        var methodParameters = Method.GetParameters();
+        for (var i = 0; i < methodParameters.Length; i++)
+            dict[methodParameters[i].Name!] = Invocation.Arguments[i];
+        return dict;
+    }
+}
+```
+
+Implements every member of `IAbpMethodInvocation` by delegating to Castle's `IInvocation`:
+
+- `Arguments` — passthrough.
+- `ArgumentsDictionary` — lazily zipped from `Method.GetParameters()` and `Invocation.Arguments`. Built once per intercepted call.
+- `GenericArguments` — passthrough.
+- `TargetObject` — `Invocation.InvocationTarget` (the resolved target instance) with a fallback to `MethodInvocationTarget` for some Castle edge cases.
+- `Method` — `Invocation.MethodInvocationTarget` (the target's method, after interface routing) with a fallback to `Invocation.Method` (the interface method).
+- `ReturnValue` — a public, settable slot that the `WithReturnValue` subclass populates from `Proceed`.
+
+`ProceedAsync` is abstract because the two concrete subclasses call different `Proceed` overloads.
+
+## Concrete adapters
+
+### Void / `Task`
+
+```csharp
+public class CastleAbpMethodInvocationAdapter : CastleAbpMethodInvocationAdapterBase, IAbpMethodInvocation
+{
+    protected IInvocationProceedInfo ProceedInfo { get; }
+    protected Func<IInvocation, IInvocationProceedInfo, Task> Proceed { get; }
+
+    public CastleAbpMethodInvocationAdapter(IInvocation invocation,
+        IInvocationProceedInfo proceedInfo,
+        Func<IInvocation, IInvocationProceedInfo, Task> proceed)
+        : base(invocation)
+    {
+        ProceedInfo = proceedInfo;
+        Proceed = proceed;
+    }
+
+    public override async Task ProceedAsync()
+    {
+        await Proceed(Invocation, ProceedInfo);
+    }
+}
+```
+
+`ProceedAsync` simply calls the captured `proceed` delegate. The interceptor decides when (or whether) to await it.
+
+### `Task<TResult>`
+
+```csharp
+public class CastleAbpMethodInvocationAdapterWithReturnValue<TResult>
+    : CastleAbpMethodInvocationAdapterBase, IAbpMethodInvocation
+{
+    protected IInvocationProceedInfo ProceedInfo { get; }
+    protected Func<IInvocation, IInvocationProceedInfo, Task<TResult>> Proceed { get; }
+
+    public CastleAbpMethodInvocationAdapterWithReturnValue(IInvocation invocation,
+        IInvocationProceedInfo proceedInfo,
+        Func<IInvocation, IInvocationProceedInfo, Task<TResult>> proceed)
+        : base(invocation)
+    {
+        ProceedInfo = proceedInfo;
+        Proceed = proceed;
+    }
+
+    public override async Task ProceedAsync()
+    {
+        ReturnValue = (await Proceed(Invocation, ProceedInfo))!;
+    }
+}
+```
+
+The extra step: after awaiting `Proceed`, the result is boxed into `IAbpMethodInvocation.ReturnValue`. The outer `CastleAsyncAbpInterceptorAdapter.InterceptAsync<TResult>` then casts that back to `TResult` for Castle.
+
+This split means **interceptor code can mutate `ReturnValue` after `ProceedAsync()` and the caller will see the changed value** — used by, for example, the audit interceptor when it wants to log return values.
+
+## End-to-end call shape
+
+For an async method `Task<Book> CreateAsync(CreateBookDto dto)` on an application service, decorated with `[Authorize]` (which contributes `AuthorizationInterceptor : IAbpInterceptor`):
+
+```
+caller.CreateAsync(dto)
+   │
+   ▼ Castle proxy intercepts
+AsyncDeterminationInterceptor.Intercept
+   │  return type is Task<Book> → routes to async-with-result path
+   ▼
+CastleAsyncAbpInterceptorAdapter.InterceptAsync<Book>(invocation, proceedInfo, proceed)
+   │  builds CastleAbpMethodInvocationAdapterWithReturnValue<Book>
+   ▼
+AuthorizationInterceptor.InterceptAsync(invocation)
+   │  1. CheckAuthorization(invocation.Method)  ← can throw, skipping ProceedAsync
+   │  2. await invocation.ProceedAsync()
+   │     → Proceed(invocation, proceedInfo)
+   │     → real CreateAsync runs, result captured into ReturnValue
+   ▼
+returns (Book)adapter.ReturnValue
+```
+
+The `IAbpInterceptor` author writes:
+
+```csharp
+public class AuthorizationInterceptor : AbpInterceptor, ITransientDependency
+{
+    public override async Task InterceptAsync(IAbpMethodInvocation invocation)
+    {
+        await AuthorizeAsync(invocation.Method);
+        await invocation.ProceedAsync();
+    }
+}
+```
+
+…and never deals with `IInvocation`, `IInvocationProceedInfo`, sync vs async dispatch, or `Task<T>` vs `Task` overloads. That separation is what this package exists to provide.
+
+## Related
+
+- [`core/dynamic-proxy-and-aspects`](/core/dynamic-proxy-and-aspects) — `IAbpInterceptor`, `IAbpMethodInvocation`, and the shipped interceptors (audit, auth, validation, UoW, features, global features) that this adapter plugs into Castle.
+- [`integrations/autofac`](/integrations/autofac) — where `AbpAsyncDeterminationInterceptor<T>` actually gets attached to service registrations via `InterceptedBy`.

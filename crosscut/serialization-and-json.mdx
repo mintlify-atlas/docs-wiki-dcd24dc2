@@ -1,0 +1,219 @@
+---
+title: "Serialization & JSON (Volo.Abp.Json, Volo.Abp.Serialization)"
+description: "IJsonSerializer with System.Text.Json and Newtonsoft.Json backends, the AbpDateTimeConverter timezone-aware pipeline, JsonTypeInfo modifiers, and the byte-level IObjectSerializer."
+---
+
+ABP exposes two complementary serialization seams:
+
+- `IJsonSerializer` (in `Volo.Abp.Json.Abstractions`) — text-level JSON. Implemented by `AbpSystemTextJsonSerializer` (the default) or `AbpNewtonsoftJsonSerializer`. Used by the distributed-event bus, HTTP API client proxies, ABP's audit-log argument serializer, etc.
+- `IObjectSerializer` (in `Volo.Abp.Serialization`) — byte-level binary serializer with a per-type override hook (`IObjectSerializer<T>`). Used by the distributed cache and any consumer that needs to round-trip `byte[]`.
+
+Both layers honour `IClock` and `ICurrentTimezoneProvider` so `DateTime` values are normalized to the configured `DateTimeKind` (UTC or Local) on read and written using `AbpJsonOptions.OutputDateTimeFormat`.
+
+Source: `framework/src/Volo.Abp.Json/`, `Volo.Abp.Json.Abstractions/`, `Volo.Abp.Json.SystemTextJson/`, `Volo.Abp.Json.Newtonsoft/`, `Volo.Abp.Serialization/`.
+
+## Modules
+
+| Module | Depends on | What it does |
+| --- | --- | --- |
+| `AbpJsonAbstractionsModule` | — | Ships `IJsonSerializer` + `AbpJsonOptions`. |
+| `AbpJsonSystemTextJsonModule` | `AbpJsonAbstractionsModule`, `AbpTimingModule`, `AbpDataModule` | Registers `AbpSystemTextJsonSerializer`. Configures `AbpSystemTextJsonSerializerOptions.JsonSerializerOptions` with the ABP converters, the `AbpDefaultJsonTypeInfoResolver`, and the date-time converter modifier. |
+| `AbpJsonModule` | `AbpJsonSystemTextJsonModule` | The default — pulls in System.Text.Json. |
+| `AbpJsonNewtonsoftModule` | `AbpJsonAbstractionsModule`, `AbpTimingModule` | Configures `AbpNewtonsoftJsonSerializerOptions.JsonSerializerSettings.ContractResolver = AbpCamelCasePropertyNamesContractResolver(AbpDateTimeConverter)`. Registers `AbpNewtonsoftJsonSerializer` with `[Dependency(ReplaceServices = true)]` — referencing this module **replaces** the System.Text.Json `IJsonSerializer` with the Newtonsoft one. |
+| `AbpSerializationModule` | — | Hooks `OnExposing` so any class implementing `IObjectSerializer<T>` is also exposed as that interface. |
+
+## `IJsonSerializer`
+
+```csharp
+public interface IJsonSerializer
+{
+    string Serialize(object obj, bool camelCase = true, bool indented = false);
+    T Deserialize<T>(string jsonString, bool camelCase = true);
+    object Deserialize(Type type, string jsonString, bool camelCase = true);
+}
+```
+
+Both backends cache the underlying options/settings object in a `ConcurrentDictionary` keyed by `(camelCase, indented, baseOptions)` so repeated calls don't reallocate.
+
+### `AbpJsonOptions`
+
+```csharp
+public class AbpJsonOptions
+{
+    public List<string> InputDateTimeFormats { get; set; }   // tried in order on read
+    public string? OutputDateTimeFormat { get; set; }        // null = default
+}
+```
+
+Lives in `Volo.Abp.Json.Abstractions`. Consumed by both backends' `AbpDateTimeConverter`.
+
+## System.Text.Json backend
+
+### `AbpSystemTextJsonSerializerOptions`
+
+Holds a `JsonSerializerOptions(JsonSerializerDefaults.Web)` instance with `ReadCommentHandling = Skip` and `AllowTrailingCommas = true`.
+
+`AbpJsonSystemTextJsonModule.ConfigureServices` configures it lazily (via `IServiceProvider`) to:
+
+1. Set `Encoder ??= JavaScriptEncoder.UnsafeRelaxedJsonEscaping` if the user hasn't picked one — keeps non-ASCII characters un-escaped, which produces cleaner output for European/Asian text.
+2. Add converters:
+   - `AbpStringToEnumFactory` — allows enums to be deserialized from their string name.
+   - `AbpStringToBooleanConverter` — accepts `"true"`/`"false"` as well as JSON booleans.
+   - `AbpStringToGuidConverter` — accepts all five `Guid.ToString()` formats (`N`, `D`, `B`, `P`, `X`).
+   - `AbpNullableStringToGuidConverter` — same but for `Guid?`.
+   - `ObjectToInferredTypesConverter` — `JsonElement -> object` inference for `dynamic` shapes.
+3. Set `TypeInfoResolver = AbpDefaultJsonTypeInfoResolver` and append the `AbpDateTimeConverterModifier`.
+
+### `AbpDefaultJsonTypeInfoResolver`
+
+Subclass of `DefaultJsonTypeInfoResolver`. On construction it copies every `Action<JsonTypeInfo>` from `AbpSystemTextJsonSerializerModifiersOptions.Modifiers` into its own `Modifiers` list. The default options ships with:
+
+- `AbpIncludeExtraPropertiesModifiers.Modify` — for every type that implements `IHasExtraProperties`, if the `ExtraProperties` property is read-only (no public setter), generate a `Set` action via `ObjectHelper.TrySetProperty` so deserialization can populate it.
+
+You can add your own modifiers in `Configure<AbpSystemTextJsonSerializerModifiersOptions>(...)` or use the helpers:
+
+- `AbpIgnorePropertiesModifiers<TClass, TProperty>` — `.CreateModifyAction(x => x.SecretField)` removes a property from serialization entirely.
+- `AbpIncludeNonPublicPropertiesModifiers` — opt-in serialization of non-public properties on a specific type.
+
+### `AbpDateTimeConverter` and the modifier
+
+`AbpDateTimeConverter : AbpDateTimeConverterBase<DateTime>, ITransientDependency` is **not** registered globally on `JsonSerializerOptions.Converters`. Instead, `AbpDateTimeConverterModifier` walks every `JsonTypeInfo` and, unless the property carries `[DisableDateTimeNormalization]` (or its declaring type does), assigns `property.CustomConverter = abpDateTimeConverter` (or `abpNullableDateTimeConverter` for nullables). The converter then:
+
+1. On read — tries `Options.InputDateTimeFormats` (if non-empty) using `DateTime.TryParseExact` with `CultureInfo.InvariantCulture` and `DateTimeStyles.RoundtripKind`. Falls back to `DateTime.Parse`. The value is then `Normalize`d — if the `DateTime.Kind` is `Unspecified` and the clock supports timezones and a current timezone is set, the value is interpreted in that timezone and converted to UTC; finally `_clock.Normalize(dateTime)` aligns the `Kind` with `AbpClockOptions.Kind`.
+2. On write — `Normalize`, then if `AdjustToUniversal`/`AssumeUniversal` is set, convert to UTC, then format with `Options.OutputDateTimeFormat` (or the default `yyyy'-'MM'-'dd'T'HH':'mm':'ss.FFFFFFFK`) using `CultureInfo.InvariantCulture`.
+
+The converter resolved by the JSON module sets `IsSkipDateTimeNormalization = true` via `.SkipDateTimeNormalization()` because the modifier itself does the per-property selection — that prevents double normalization in nested calls.
+
+### `AbpSystemTextJsonSerializer`
+
+```csharp
+public class AbpSystemTextJsonSerializer : IJsonSerializer, ITransientDependency
+{
+    protected AbpSystemTextJsonSerializerOptions Options { get; }
+    public string Serialize(object obj, bool camelCase = true, bool indented = false) =>
+        JsonSerializer.Serialize(obj, CreateJsonSerializerOptions(camelCase, indented));
+    public T Deserialize<T>(string jsonString, bool camelCase = true) =>
+        JsonSerializer.Deserialize<T>(jsonString, CreateJsonSerializerOptions(camelCase))!;
+    public object Deserialize(Type type, string jsonString, bool camelCase = true) =>
+        JsonSerializer.Deserialize(jsonString, type, CreateJsonSerializerOptions(camelCase))!;
+}
+```
+
+`CreateJsonSerializerOptions` clones the base options, sets `PropertyNamingPolicy = camelCase ? CamelCase : null` and `WriteIndented = indented`, and caches by `(camelCase, indented, baseOptions)`.
+
+## Newtonsoft.Json backend
+
+Reference `Volo.Abp.Json.Newtonsoft` and depend on `AbpJsonNewtonsoftModule` from your module. `[Dependency(ReplaceServices = true)]` swaps the System.Text.Json serializer out for `AbpNewtonsoftJsonSerializer`.
+
+`AbpNewtonsoftJsonSerializerOptions.JsonSerializerSettings` is a `Newtonsoft.Json.JsonSerializerSettings`. The module sets `ContractResolver = AbpCamelCasePropertyNamesContractResolver(AbpDateTimeConverter.SkipDateTimeNormalization())` so every property of type `DateTime` / `DateTime?` gets a per-property converter (`AbpDefaultContractResolver.CreateProperty` calls `AbpDateTimeConverter.ShouldNormalize(member, property)` to gate it — same `[DisableDateTimeNormalization]` semantics).
+
+`AbpNewtonsoftJsonSerializer.CreateJsonSerializerOptions` deep-clones every relevant `JsonSerializerSettings` property because Newtonsoft's `JsonSerializerSettings` has no public clone. When `camelCase == false`, the cloned settings get `AbpDefaultContractResolver` (PascalCase + per-property `AbpDateTimeConverter`). When `indented`, sets `Formatting = Indented`.
+
+ASP.NET Core MVC integration is **separate** — see `Volo.Abp.AspNetCore.Mvc.NewtonsoftJson` / `/aspnetcore/mvc-newtonsoft`. Referencing `Volo.Abp.Json.Newtonsoft` only swaps the *programmatic* `IJsonSerializer`; the MVC formatters keep using whichever JSON stack you registered on `IMvcBuilder`.
+
+## `IObjectSerializer`
+
+```csharp
+public interface IObjectSerializer
+{
+    byte[]? Serialize<T>(T? obj);
+    T?     Deserialize<T>(byte[] bytes);
+}
+
+public interface IObjectSerializer<T>
+{
+    byte[]? Serialize(T? obj);
+    T?     Deserialize(byte[]? bytes);
+}
+```
+
+`DefaultObjectSerializer : IObjectSerializer, ITransientDependency` looks up `IObjectSerializer<T>` from a fresh scope and delegates to it if registered; otherwise falls back to `JsonSerializer.SerializeToUtf8Bytes(obj)` / `Deserialize<T>(bytes)` (raw System.Text.Json — no converters). Override for a specific type:
+
+```csharp
+public class WidgetObjectSerializer : IObjectSerializer<Widget>, ITransientDependency
+{
+    public byte[]? Serialize(Widget? obj) => obj == null ? null : Encoding.UTF8.GetBytes(obj.ToProtoString());
+    public Widget? Deserialize(byte[]? bytes) => bytes == null ? null : Widget.FromProto(bytes);
+}
+```
+
+`AbpSerializationModule.PreConfigureServices` hooks `IServiceCollection.OnExposing` so every closed `IObjectSerializer<X>` your class implements is auto-exposed:
+
+```csharp
+onServiceExposingContext.ExposedTypes.AddRange(
+    ReflectionHelper.GetImplementedGenericTypes(implementationType, typeof(IObjectSerializer<>))
+        .ConvertAll(t => new ServiceIdentifier(t)));
+```
+
+## File-by-file enumeration
+
+### `Volo.Abp.Json.Abstractions`
+
+| File | Role |
+| --- | --- |
+| `AbpJsonAbstractionsModule.cs` | empty module. |
+| `AbpJsonOptions.cs` | `InputDateTimeFormats`, `OutputDateTimeFormat`. |
+| `IJsonSerializer.cs` | contract. |
+
+### `Volo.Abp.Json`
+
+| File | Role |
+| --- | --- |
+| `AbpJsonModule.cs` | `[DependsOn(typeof(AbpJsonSystemTextJsonModule))]` — picks System.Text.Json. |
+
+### `Volo.Abp.Json.SystemTextJson`
+
+| File | Role |
+| --- | --- |
+| `AbpJsonSystemTextJsonModule.cs` | Configures `AbpSystemTextJsonSerializerOptions`. |
+| `AbpSystemTextJsonSerializer.cs` | `IJsonSerializer, ITransientDependency` — caches per-flag `JsonSerializerOptions`. |
+| `AbpSystemTextJsonSerializerOptions.cs` | Wraps `JsonSerializerOptions(JsonSerializerDefaults.Web)`. |
+| `AbpSystemTextJsonSerializerModifiersOptions.cs` | `List<Action<JsonTypeInfo>> Modifiers` — pre-seeded with `AbpIncludeExtraPropertiesModifiers.Modify`. |
+| `AbpDefaultJsonTypeInfoResolver.cs` | `DefaultJsonTypeInfoResolver` subclass that consumes the modifier list. |
+| `JsonConverters/AbpDateTimeConverterBase.cs` | Shared read/write helpers for `DateTime` and `DateTime?` converters. |
+| `JsonConverters/AbpDateTimeConverter.cs` / `AbpNullableDateTimeConverter.cs` | `ITransientDependency` per-property converters; not added to global `Converters`. |
+| `JsonConverters/AbpStringToBooleanConverter.cs` | `string -> bool`. Also accepts JSON `true`/`false`. |
+| `JsonConverters/AbpStringToGuidConverter.cs` / `AbpNullableStringToGuidConverter.cs` | Accepts all `Guid` formats. |
+| `JsonConverters/AbpStringToEnumConverter.cs` / `AbpStringToEnumFactory.cs` | Enums by name. |
+| `JsonConverters/ObjectToInferredTypesConverter.cs` | `JsonElement -> int/long/double/bool/string/...`. |
+| `Modifiers/AbpDateTimeConverterModifier.cs` | Applies the date-time converters property-by-property unless `[DisableDateTimeNormalization]`. |
+| `Modifiers/AbpIncludeExtraPropertiesModifiers.cs` | Restores write access to `IHasExtraProperties.ExtraProperties`. |
+| `Modifiers/AbpIgnorePropertiesModifiers.cs` | Generic `(TClass, TProperty)` helper that removes a property. |
+| `Modifiers/AbpIncludeNonPublicPropertiesModifiers.cs` | Opt-in non-public property serialization for a specific type. |
+
+### `Volo.Abp.Json.Newtonsoft`
+
+| File | Role |
+| --- | --- |
+| `AbpJsonNewtonsoftModule.cs` | Sets the contract resolver via the date-time converter. |
+| `AbpNewtonsoftJsonSerializer.cs` | `[Dependency(ReplaceServices = true)]` — replaces the STJ serializer. |
+| `AbpNewtonsoftJsonSerializerOptions.cs` | Wraps `JsonSerializerSettings`. |
+| `AbpCamelCasePropertyNamesContractResolver.cs` | `CamelCasePropertyNamesContractResolver` + per-property `AbpDateTimeConverter` via `ShouldNormalize`. |
+| `AbpDefaultContractResolver.cs` | PascalCase variant with the same per-property converter hookup. |
+| `AbpDateTimeConverter.cs` | Same timezone-normalization logic as the STJ converter, only for Newtonsoft. Reads `Options.InputDateTimeFormats`; writes with `Options.OutputDateTimeFormat ?? "yyyy'-'MM'-'dd'T'HH':'mm':'ss.FFFFFFFK"`. |
+
+### `Volo.Abp.Serialization`
+
+| File | Role |
+| --- | --- |
+| `AbpSerializationModule.cs` | Hooks `OnExposing` to expose `IObjectSerializer<T>` automatically. |
+| `IObjectSerializer.cs` | Generic and non-generic contracts. |
+| `DefaultObjectSerializer.cs` | `IObjectSerializer, ITransientDependency`. Specific-type override or `JsonSerializer.SerializeToUtf8Bytes` fallback. |
+
+## When to use which
+
+| Need | Use |
+| --- | --- |
+| Serialize a DTO to JSON for an HTTP body or a distributed event. | `IJsonSerializer`. |
+| Hash, cache, or compress an arbitrary object as bytes. | `IObjectSerializer`. |
+| Custom binary wire format for one type. | Implement `IObjectSerializer<T>`. |
+| Skip `DateTime` normalization for one property. | `[DisableDateTimeNormalization]` on the property. |
+| Hide a property only from JSON output. | `AbpIgnorePropertiesModifiers<TClass, TProperty>` registered via `AbpSystemTextJsonSerializerModifiersOptions.Modifiers`. |
+| Switch the JSON stack globally. | Depend on `AbpJsonNewtonsoftModule`. |
+
+## Related
+
+- `/crosscut/timing` — `IClock`, `AbpClockOptions`, `ICurrentTimezoneProvider` drive the date-time converters.
+- `/aspnetcore/mvc-newtonsoft` — separate package for the MVC formatters.
+- `/eventbus/distributed-event-bus` — uses `IJsonSerializer` to encode event payloads.
+- `/caching/distributed-cache` — uses `IObjectSerializer` to encode cache entries.

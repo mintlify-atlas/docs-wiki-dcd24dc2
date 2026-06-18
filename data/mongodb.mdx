@@ -1,0 +1,218 @@
+---
+title: "MongoDB integration"
+description: "AbpMongoDbContext, IMongoDbContextProvider, AbpMongoDbContextOptions, MongoDbRepository, conventional registration and transaction support."
+---
+
+`Volo.Abp.MongoDB` integrates MongoDB into the same `IRepository<TEntity>` abstraction used by EF Core, while exposing the underlying `IMongoCollection<T>` / `IMongoDatabase` / `IClientSessionHandle` for power users.
+
+Source: `framework/src/Volo.Abp.MongoDB/`. Driver: `MongoDB.Driver` (Mongo C# Driver). Constant `AbpMongoDbConsts.ProviderName = "Volo.Abp.MongoDB"` identifies this provider to the rest of the framework.
+
+## Module — `AbpMongoDbModule`
+
+File: `Volo/Abp/MongoDB/AbpMongoDbModule.cs`.
+
+```csharp
+[DependsOn(typeof(AbpDddDomainModule))]
+public class AbpMongoDbModule : AbpModule
+{
+    static AbpMongoDbModule()
+    {
+        AbpBsonSerializer.RemoveSerializer<Guid>();
+        BsonSerializer.RegisterSerializer(new GuidSerializer(GuidRepresentation.Standard));
+        BsonTypeMapper.RegisterCustomTypeMapper(typeof(Guid), new AbpGuidCustomBsonTypeMapper());
+    }
+
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddConventionalRegistrar(new AbpMongoDbConventionalRegistrar());
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.TryAddTransient(typeof(IMongoDbContextProvider<>),
+            typeof(UnitOfWorkMongoDbContextProvider<>));
+        context.Services.TryAddEnumerable(ServiceDescriptor.Transient(
+            typeof(IMongoDbRepositoryFilterer<>), typeof(MongoDbRepositoryFilterer<>)));
+        context.Services.TryAddEnumerable(ServiceDescriptor.Transient(
+            typeof(IMongoDbRepositoryFilterer<,>), typeof(MongoDbRepositoryFilterer<,>)));
+        context.Services.AddTransient(typeof(IMongoDbContextEventOutbox<>), typeof(MongoDbContextEventOutbox<>));
+        context.Services.AddTransient(typeof(IMongoDbContextEventInbox<>), typeof(MongoDbContextEventInbox<>));
+        Configure<AbpDistributedEntityEventOptions>(options =>
+        {
+            options.IgnoredEventSelectors.Add<OutgoingEventRecord>();
+            options.IgnoredEventSelectors.Add<IncomingEventRecord>();
+        });
+    }
+}
+```
+
+The static constructor switches the default GUID representation to `Standard` (16-byte binary subtype 4) so GUIDs round-trip cleanly with .NET. `AbpMongoDbConventionalRegistrar` (`DependencyInjection/AbpMongoDbConventionalRegistrar.cs`) is what makes every `AbpMongoDbContext`-derived class register itself automatically.
+
+## `AbpMongoDbContext`
+
+File: `Volo/Abp/MongoDB/AbpMongoDbContext.cs`.
+
+```csharp
+public abstract class AbpMongoDbContext : IAbpMongoDbContext, ITransientDependency
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+    public IMongoModelSource ModelSource { get; set; } = default!;
+    public IMongoClient Client { get; private set; } = default!;
+    public IMongoDatabase Database { get; private set; } = default!;
+    public IClientSessionHandle? SessionHandle { get; private set; }
+
+    protected internal virtual void CreateModel(IMongoModelBuilder modelBuilder) { }
+
+    public virtual void InitializeDatabase(IMongoDatabase database, IMongoClient client, IClientSessionHandle? sessionHandle)
+    {
+        Database = database; Client = client; SessionHandle = sessionHandle;
+    }
+
+    public virtual IMongoCollection<T> Collection<T>()
+        => Database.GetCollection<T>(GetCollectionName<T>());
+    // GetCollectionName<T>() → IMongoEntityModel.CollectionName
+}
+```
+
+You subclass it for each logical database, then define collections by overriding `CreateModel`:
+
+```csharp
+[ConnectionStringName("Default")]
+public class MyMongoDbContext : AbpMongoDbContext
+{
+    public IMongoCollection<Book> Books => Collection<Book>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.Entity<Book>(b => b.CollectionName = "MyBooks");
+    }
+}
+```
+
+`IAbpMongoDbContext` (file `IAbpMongoDbContext.cs`) is the slim public face: `IMongoClient Client`, `IMongoDatabase Database`, `IMongoCollection<T> Collection<T>()`, `IClientSessionHandle? SessionHandle`.
+
+## Modeling helpers
+
+| File | Purpose |
+| --- | --- |
+| `IMongoEntityModel.cs` | `Type EntityType`, `string CollectionName`, optional `CreateCollectionOptions`, optional `BsonClassMap`, index-builder action. |
+| `IMongoEntityModelBuilder.cs` / `MongoEntityModelBuilder.cs` | Fluent builder for the above. |
+| `IMongoModelBuilder.cs` / `MongoModelBuilder.cs` | Top-level model builder iterating registered entities. |
+| `IMongoModelSource.cs` / `MongoModelSource.cs` | Caches the materialised `MongoDbContextModel` per context type. |
+| `MongoDbContextModel.cs` | Holds `Entities : Dictionary<Type, IMongoEntityModel>`. |
+| `IMongoDbContextTypeProvider.cs` / `MongoDbContextTypeProvider.cs` | Resolves a logical context type to a replaced implementation type (multi-tenancy hook). |
+| `IHasBsonClassMap.cs` / `IHasCreateCollectionOptions.cs` / `IHasMongoIndexManagerAction.cs` | Per-entity opt-in interfaces consumed during model creation. |
+| `MongoCollectionAttribute.cs` | `[MongoCollection(string? collectionName)]` — applied to entity types to set the collection name declaratively. |
+| `AbpBsonClassMapExtensions.cs` | Conventions for `IEntity`, `IHasConcurrencyStamp`, `IHasExtraProperties`. |
+| `AbpBsonSerializer.cs` | Helper that removes pre-registered serializers (used in the static ctor). |
+| `AbpGuidCustomBsonTypeMapper.cs` | Maps `Guid` → `BsonBinaryData` with `GuidRepresentation.Standard`. |
+| `AbpMongoDbDateTimeSerializer.cs` | `IClock.Normalize` integration so `DateTime` columns honour UTC/Local mode. |
+| `AbpMongoModelBuilderConfigurationOptions.cs` | Carries the collection-name prefix and other model-wide options. |
+| `MongoDbContextHelper.cs` | Internal resolver utilities. |
+| `MongoDbAsyncQueryableProvider.cs` | Bridges `IMongoQueryable<T>` to ABP's `IAsyncQueryableExecuter`. |
+
+## `IMongoDbContextProvider<TMongoDbContext>`
+
+File: `Volo/Abp/MongoDB/IMongoDbContextProvider.cs`.
+
+```csharp
+public interface IMongoDbContextProvider<TMongoDbContext>
+    where TMongoDbContext : IAbpMongoDbContext
+{
+    Task<TMongoDbContext> GetDbContextAsync(CancellationToken cancellationToken = default);
+}
+```
+
+Default implementation: `Volo/Abp/Uow/MongoDB/UnitOfWorkMongoDbContextProvider.cs`. It:
+
+1. Asks `IConnectionStringResolver` for the connection string of the named DbContext.
+2. Looks up the cached `IMongoClient` via `IAbpMongoClientFactory` (`Volo/Abp/MongoDB/Clients/AbpMongoClientFactory.cs`) keyed on the connection string. `AbpMongoDbContextOptions.MongoClientSettingsConfigurer` can mutate `MongoClientSettings` before the client is built.
+3. Adds an `MongoDbDatabaseApi` (file `Volo/Abp/Uow/MongoDB/MongoDbDatabaseApi.cs`) to the active UoW so subsequent repository calls reuse it.
+4. If `IUnitOfWork.Options.IsTransactional` is true and the cluster supports transactions, starts an `IClientSessionHandle` and registers a `MongoDbTransactionApi` (file `Volo/Abp/Uow/MongoDB/MongoDbTransactionApi.cs`) so commit/rollback flows through the UoW.
+
+## `AbpMongoDbContextOptions`
+
+File: `Volo/Abp/MongoDB/AbpMongoDbContextOptions.cs`.
+
+```csharp
+public class AbpMongoDbContextOptions
+{
+    internal Dictionary<MultiTenantDbContextType, Type> DbContextReplacements { get; }
+    public Action<MongoClientSettings>? MongoClientSettingsConfigurer { get; set; }
+    internal Type GetReplacedTypeOrSelf(Type dbContextType, MultiTenancySides multiTenancySides = Both) { ... }
+}
+```
+
+- `DbContextReplacements` lets a module register a tenant-specific subclass that overrides the host's `DbContext`. Looked up by `MongoDbContextTypeProvider`.
+- `MongoClientSettingsConfigurer` is the recommended place to add SSL options, the linq provider switch, or driver-level instrumentation — runs once per `MongoClient` creation.
+
+## Conventional registration
+
+`AbpMongoDbContextRegistrationOptions` (`DependencyInjection/AbpMongoDbContextRegistrationOptions.cs`) and its builder interface `IAbpMongoDbContextRegistrationOptionsBuilder` mirror EF Core's options. Usage:
+
+```csharp
+[DependsOn(typeof(AbpMongoDbModule))]
+public class MyAppMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<MyMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+            options.AddRepository<Book, MyMongoBookRepository>();
+        });
+    }
+}
+```
+
+`AddMongoDbContext<T>` lives in `Microsoft/Extensions/DependencyInjection/AbpMongoDbServiceCollectionExtensions.cs`. It:
+
+- Registers `T` itself as transient.
+- Registers `IMongoDbContextProvider<T>` (handled by the module already).
+- Runs `MongoDbRepositoryRegistrar` (`DependencyInjection/MongoDbRepositoryRegistrar.cs`) to wire `IRepository<TEntity>` → `MongoDbRepository<T, TEntity>` for every entity exposed by the model.
+
+## `MongoDbRepository<TMongoDbContext, TEntity[, TKey]>`
+
+File: `Volo/Abp/Domain/Repositories/MongoDB/MongoDbRepository.cs`. Implements `IMongoDbRepository<TEntity>` (`IMongoDbRepository.cs`) and `IRepository<TEntity, TKey>`.
+
+Notable behaviour:
+
+- `GetCollectionAsync()` → `(await GetDbContextAsync()).Collection<TEntity>()`.
+- `GetDatabaseAsync()` → `IMongoDatabase`.
+- `GetSessionHandleAsync()` → `IClientSessionHandle?` (null when no transactional UoW).
+- Multi-tenancy: if the entity is not `IMultiTenant`, the repository forces `CurrentTenant.Change(null)` so the host connection string is used.
+- Soft delete & multi-tenant filtering is applied via `IMongoDbRepositoryFilterer<TEntity>` / `MongoDbRepositoryFilterer<TEntity>` (`Volo/Abp/Domain/Repositories/MongoDB/MongoDbRepositoryFilterer.cs`), which evaluates `IDataFilter<ISoftDelete>` / `IDataFilter<IMultiTenant>` and builds a `FilterDefinition<TEntity>`.
+- Bulk operations check for `IMongoDbBulkOperationProvider` (file `IMongoDbBulkOperationProvider.cs`) so you can plug in `MongoBulkWrite` providers.
+
+`MongoDbCoreRepositoryExtensions.cs` exposes `ToMongoQueryable<TEntity>(this IReadOnlyRepository<TEntity>)` shortcut.
+
+## Transactions
+
+The C# driver only supports transactions on replica sets / sharded clusters with the WiredTiger engine. `UnitOfWorkMongoDbContextProvider` starts a session via `MongoClient.StartSessionAsync()` and calls `StartTransaction()` only when:
+
+1. The current UoW is transactional (`Options.IsTransactional == true`), and
+2. `MongoDatabase.Client.Cluster.Description.Type` indicates a topology that supports transactions.
+
+If transactions are unsupported, the UoW falls back to a non-transactional session (writes still go through `SessionHandle`, just without `Commit/Abort`). The `IClientSessionHandle` is then committed by `MongoDbTransactionApi.CommitAsync` on UoW completion or aborted on `Dispose`.
+
+## Distributed events (`DistributedEvents/`)
+
+- `IMongoDbContextEventOutbox<TDbContext>` / `MongoDbContextEventOutbox.cs` — writes `OutgoingEventRecord` documents.
+- `IMongoDbContextEventInbox<TDbContext>` / `MongoDbContextEventInbox.cs` — consumes inbox documents.
+- `IHasEventOutbox`, `IHasEventInbox` — markers your `DbContext` implements to opt in.
+- `EventInboxMongoModelBuilderExtensions.cs` / `EventOutboxMongoModelBuilderExtensions.cs` — set up the collection mapping.
+- `MongoDbInboxConfigExtensions.cs` / `MongoDbOutboxConfigExtensions.cs` — `Configure<AbpDistributedEventBusOptions>` wiring.
+- `IncomingEventRecord.cs` / `OutgoingEventRecord.cs` — document shapes (mirror the EF Core versions).
+
+## Migrations
+
+`Migrations/MongoDatabaseMigrationEventHandlerBase.cs` is the base handler for `ApplyDatabaseMigrationsEto` — for MongoDB "migration" effectively means ensuring indexes and seed data (no schema migration in the SQL sense).
+
+## Cross-references
+
+- `/data/unit-of-work` — `MongoDbDatabaseApi` and `MongoDbTransactionApi` are stored in the UoW's containers.
+- `/data/connection-strings` — `[ConnectionStringName]` on the context drives `IConnectionStringResolver`.
+- `/data/data-filtering` — `MongoDbRepositoryFilterer` reads the same `IDataFilter` state EF Core does.
+- `/ddd/repositories` — `IRepository<TEntity>` contract.
+- `/flows/distributed-event-publish` — inbox/outbox flow.

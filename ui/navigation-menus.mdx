@@ -1,0 +1,246 @@
+---
+title: "UI navigation menus — IMenuManager and menu contributors"
+sidebarTitle: "Navigation menus"
+description: "The Volo.Abp.UI.Navigation menu model: IMenuManager, ApplicationMenu, IMenuContributor, MenuConfigurationContext, permission/feature gating via ISimpleStateCheckerManager, and how Razor and Blazor themes consume the resulting tree."
+---
+
+`Volo.Abp.UI.Navigation` defines an **abstract, stack-agnostic menu model**. The MVC theme, the Blazor theming module, the MAUI shell — all of them call into the same `IMenuManager` and render the same `ApplicationMenu` tree. This page covers the contracts in `framework/src/Volo.Abp.UI.Navigation/`.
+
+## Module setup
+
+`Volo/Abp/Ui/Navigation/AbpUiNavigationModule.cs` wires the defaults:
+
+```csharp
+[DependsOn(typeof(AbpUiModule), typeof(AbpAuthorizationModule), typeof(AbpMultiTenancyModule))]
+public class AbpUiNavigationModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(o => o.FileSets.AddEmbedded<AbpUiNavigationModule>());
+
+        Configure<AbpLocalizationOptions>(o =>
+        {
+            o.Resources.Add<AbpUiNavigationResource>("en")
+                .AddVirtualJson("/Volo/Abp/Ui/Navigation/Localization/Resource");
+        });
+
+        Configure<AbpNavigationOptions>(o =>
+        {
+            o.MenuContributors.Add(new DefaultMenuContributor());
+        });
+    }
+}
+```
+
+The defaults give every app one `Main` menu seeded with an `Administration` group (icon `fa fa-wrench`). Every other module — Identity, Tenant Management, CMS Kit, your own — adds its own `IMenuContributor`.
+
+## The menu tree
+
+The model is three classes in `Volo/Abp/Ui/Navigation/`:
+
+| Class | Purpose |
+| --- | --- |
+| `ApplicationMenu` | Top-level container. Has `Name`, `DisplayName`, `Items` (`ApplicationMenuItemList`), `Groups` (`ApplicationMenuGroupList`), `CustomData` dictionary. |
+| `ApplicationMenuItem` | A node. `Name`, `DisplayName`, `Url`, `Icon`, `Order` (default `1000`), `Target`, `IsDisabled`, `IsLeaf`, `ElementId` (auto `MenuItem_{Name}`, dots replaced with `_`), `CssClass`, `GroupName`, nested `Items`, `StateCheckers`, `CustomData`. Implements `IHasSimpleStateCheckers<ApplicationMenuItem>` and `IHasMenuItems`. |
+| `ApplicationMenuGroup` | Optional grouping headers for items that share `GroupName`. |
+
+`ApplicationMenuItemList.Normalize()` is what sanitises the tree before returning it:
+
+```csharp
+public void Normalize()
+{
+    RemoveEmptyItems();   // RemoveAll(item => item.IsLeaf && item.Url.IsNullOrEmpty())
+    Order();              // OrderBy(item => item.Order)
+}
+```
+
+So a parent node with **no surviving children and no URL** is pruned. That's how a module hides its whole sub-menu when all its leaves are filtered out by permissions.
+
+### Standard menu names
+
+`StandardMenus` declares the three well-known menus:
+
+```csharp
+public static class StandardMenus
+{
+    public const string Main     = "Main";
+    public const string User     = "User";
+    public const string Shortcut = "Shortcut";
+}
+```
+
+`DefaultMenuNames.Application.Main.Administration` (`"Abp.Application.Main.Administration"`) is the well-known node every module hangs its admin pages under.
+
+## `IMenuManager`
+
+```csharp
+public interface IMenuManager
+{
+    Task<ApplicationMenu> GetAsync(string name);
+    Task<ApplicationMenu> GetMainMenuAsync();
+}
+```
+
+The implementation is `MenuManager : IMenuManager, ITransientDependency` (`Volo/Abp/Ui/Navigation/MenuManager.cs`). `GetMainMenuAsync()` merges every menu listed in `AbpNavigationOptions.MainMenuNames` (default: just `"Main"`):
+
+```csharp
+public Task<ApplicationMenu> GetMainMenuAsync()
+    => GetAsync(Options.MainMenuNames.ToArray());
+
+protected virtual async Task<ApplicationMenu> GetAsync(params string[] menuNames)
+{
+    if (menuNames.IsNullOrEmpty())
+        return new ApplicationMenu(StandardMenus.Main);
+
+    var menus = new List<ApplicationMenu>();
+    foreach (var menuName in Options.MainMenuNames)
+        menus.Add(await GetInternalAsync(menuName));
+
+    return MergeMenus(menus);
+}
+```
+
+`GetInternalAsync(name)` is where the contributors run, all inside a single `IServiceScope` so contributors see a *fresh, scoped* `IServiceProvider`:
+
+```csharp
+protected virtual async Task<ApplicationMenu> GetInternalAsync(string name)
+{
+    var menu = new ApplicationMenu(name);
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    using (RequirePermissionsSimpleBatchStateChecker<ApplicationMenuItem>
+                .Use(new RequirePermissionsSimpleBatchStateChecker<ApplicationMenuItem>()))
+    {
+        var context = new MenuConfigurationContext(menu, scope.ServiceProvider);
+
+        foreach (var contributor in Options.MenuContributors)
+            await contributor.ConfigureMenuAsync(context);
+
+        await CheckPermissionsAsync(scope.ServiceProvider, menu);
+    }
+
+    NormalizeMenu(menu);
+    NormalizeMenuGroup(menu);
+    return menu;
+}
+```
+
+`CheckPermissionsAsync` walks the tree, materialises `RequiredPermissionName` (legacy property) into a `RequirePermissions` state checker, then **batch-evaluates** every item that has any `StateCheckers` through `ISimpleStateCheckerManager<ApplicationMenuItem>`. Items that fail are removed. The batching matters: rendering a 200-item sidebar issues **one** permission lookup, not 200.
+
+## `IMenuContributor` and the configuration context
+
+```csharp
+public interface IMenuContributor
+{
+    Task ConfigureMenuAsync(MenuConfigurationContext context);
+}
+```
+
+`MenuConfigurationContext` (`Volo/Abp/Ui/Navigation/MenuConfigurationContext.cs`) implements `IMenuConfigurationContext` and exposes everything a contributor typically needs:
+
+```csharp
+public class MenuConfigurationContext : IMenuConfigurationContext
+{
+    public IServiceProvider ServiceProvider { get; }
+    public ApplicationMenu Menu { get; }
+
+    public IAuthorizationService AuthorizationService
+        => _lazyServiceProvider.LazyGetRequiredService<IAuthorizationService>();
+    public IStringLocalizerFactory StringLocalizerFactory
+        => _lazyServiceProvider.LazyGetRequiredService<IStringLocalizerFactory>();
+
+    public Task<bool> IsGrantedAsync(string policyName)
+        => AuthorizationService.IsGrantedAsync(policyName);
+
+    public IStringLocalizer? GetDefaultLocalizer()
+        => StringLocalizerFactory.CreateDefaultOrNull();
+
+    public IStringLocalizer GetLocalizer<T>()  => StringLocalizerFactory.Create<T>();
+    public IStringLocalizer GetLocalizer(Type resourceType) => StringLocalizerFactory.Create(resourceType);
+}
+```
+
+> The orchestrator brief mentions a `MenuContributorContext`/`MenuConfigurationProvider`; the actual type in source is `MenuConfigurationContext`. There is **no** `MenuConfigurationProvider` — `MenuManager` itself drives configuration.
+
+### Pattern — a contributor with permission gating
+
+The framework's own `DefaultMenuContributor` (`Volo/Abp/Ui/Navigation/DefaultMenuContributor.cs`) shows the minimal shape:
+
+```csharp
+public class DefaultMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        Configure(context);
+        return Task.CompletedTask;
+    }
+
+    protected virtual void Configure(MenuConfigurationContext context)
+    {
+        var l = context.GetLocalizer<AbpUiNavigationResource>();
+
+        if (context.Menu.Name == StandardMenus.Main)
+        {
+            context.Menu.AddItem(
+                new ApplicationMenuItem(
+                    DefaultMenuNames.Application.Main.Administration,
+                    l["Menu:Administration"],
+                    icon: "fa fa-wrench"));
+        }
+    }
+}
+```
+
+Module-supplied contributors typically follow this template, then call `item.RequirePermissions("X.View")` extension on each leaf so the batch checker removes them when permission is missing:
+
+```csharp
+public async Task ConfigureMenuAsync(MenuConfigurationContext context)
+{
+    if (context.Menu.Name != StandardMenus.Main) return;
+
+    var l = context.GetLocalizer<MyResource>();
+
+    var admin = context.Menu.GetAdministration(); // extension that finds the Administration node
+    admin.AddItem(
+        new ApplicationMenuItem("MyModule.Settings", l["Menu:Settings"], "/my/settings")
+            .RequirePermissions("MyModule.Settings"));
+}
+```
+
+Contributors are registered through `AbpNavigationOptions.MenuContributors`, normally from a module's `ConfigureServices`:
+
+```csharp
+Configure<AbpNavigationOptions>(o => o.MenuContributors.Add(new MyMenuContributor()));
+```
+
+## Rendering and "dynamic" reloads
+
+`MenuManager` is **transient**, so every render call rebuilds the tree against the current user and feature set. There is no cached `ApplicationMenu` and no `IMenuChanged` event in `Volo.Abp.UI.Navigation` itself. The "dynamic reload" pattern is therefore:
+
+- **Razor**: a view component (`AbpNavigationView`-style, provided by the active theme — for example `modules/basic-theme/`) calls `await menuManager.GetMainMenuAsync()` during view-component execution. It runs once per request.
+- **Blazor**: the theming module's sidebar/topbar component holds a `Task<ApplicationMenu>` field, refreshes it inside `OnInitializedAsync` and again on each `AuthenticationStateProvider.AuthenticationStateChanged` (so login / tenant switch triggers `StateHasChanged` and a fresh `GetMainMenuAsync()` call).
+- **State-change triggers**: the framework provides `ICurrentApplicationConfigurationCacheResetService` (in `Volo.Abp.AspNetCore.Components.Web`) to flush the cached `ApplicationConfigurationDto` on the Blazor side. After it resets, the next `GetMainMenuAsync()` re-evaluates permissions against the new principal — that's the effective "menu reloaded" signal.
+
+## Standalone (`User`, `Shortcut`) menus
+
+`AbpNavigationOptions.MainMenuNames` only governs which menu the *sidebar* shows. To populate the user dropdown or shortcut toolbar, contributors gate on the menu name and add items to the **same** `context.Menu`:
+
+```csharp
+if (context.Menu.Name == StandardMenus.User)
+{
+    context.Menu.AddItem(new ApplicationMenuItem("MyAccount", l["Menu:MyAccount"], "/Account/Manage"));
+}
+```
+
+The active theme decides which `IMenuManager.GetAsync("User")` / `GetAsync("Shortcut")` calls to issue.
+
+## Application URLs vs menu URLs
+
+`ApplicationMenuItem.Url` is what the rendered `<a href>` uses. For URLs that have to round-trip through the central host (multi-app deployments), use `Volo/Abp/Ui/Navigation/Urls/AppUrlProvider.cs` — register apps in `AppUrlOptions.Applications` (`ApplicationUrlInfo` → `RootUrl`, `Urls`) and resolve via `IAppUrlProvider.GetUrlAsync(appName, urlName)` *before* assigning to `Url`. `AbpPageModel` exposes `AppUrlProvider`; `AbpComponentBase`-derived Blazor components can inject `IAppUrlProvider` directly.
+
+## Related pages
+
+- [`/ui/mvc-razor-pages`](/ui/mvc-razor-pages) — how Razor view components consume the menu tree.
+- [`/ui/blazor-components-web`](/ui/blazor-components-web) — how Blazor's theming module renders it.
+- [`/modules/basic-theme`](/modules/basic-theme) — the reference theme that hosts both renderers.
+- [`/auth/permissions`](/auth/permissions) — what `RequirePermissions` checks against.
