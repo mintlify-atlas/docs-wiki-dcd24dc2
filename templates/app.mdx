@@ -122,8 +122,8 @@ The table below lists every directory under
 | HttpApi.Host | `HttpApi.Host/` | Tiered API host. Validates JWTs issued by a separate `AuthServer`. |
 | HttpApi.HostWithIds | `HttpApi.HostWithIds/` | Non-tiered API host that **also hosts OpenIddict** (no separate AuthServer). |
 | AuthServer | `AuthServer/` | Stand-alone OpenIddict identity provider used by the tiered topology. |
-| Blazor | `Blazor/` | Blazor WebAssembly standalone host (legacy single-WASM option). |
-| Blazor.Client | `Blazor.Client/` | WASM client module used by the standalone Blazor host. |
+| Blazor | `Blazor/` | Blazor WebAssembly host — `WebApplication.CreateBuilder` server that runs `AddRazorComponents().AddInteractiveWebAssemblyComponents()` and serves the WASM client. |
+| Blazor.Client | `Blazor.Client/` | The actual `WebAssemblyHostBuilder` client csproj shipped to the browser by the `Blazor` host. |
 | Blazor.Server | `Blazor.Server/` | Blazor Server (interactive server rendering), non-tiered. |
 | Blazor.Server.Tiered | `Blazor.Server.Tiered/` | Blazor Server pointed at a remote API + AuthServer. |
 | Blazor.WebApp | `Blazor.WebApp/` | Blazor Web App (Server + WASM auto-render), non-tiered. |
@@ -260,8 +260,10 @@ contributed via `OnApplicationInitialization`. Only then is Kestrel started.
 </Steps>
 
 `Web/Program.cs`, `AuthServer/Program.cs`, `Blazor.Server/Program.cs`,
-`Blazor.WebApp/Program.cs` and `Web.Host/Program.cs` are **identical** except
-for the root module type name and the namespace.
+`Blazor.WebApp/Program.cs`, `Blazor/Program.cs`, and `Web.Host/Program.cs` are
+**identical in shape** — only the root module type passed to
+`builder.AddApplicationAsync<...>()`, the namespace, and the
+`Log.Information("Starting ...")` string differ.
 
 ### WASM `Program.cs`
 
@@ -289,34 +291,40 @@ public class Program
 
 ### `DbMigrator/Program.cs`
 
-`DbMigrator` is not a web host — it is a console `IHostedService`:
+`DbMigrator` is not a web host — it is a console that registers `DbMigratorHostedService` and runs it under `Host.CreateDefaultBuilder(...).RunConsoleAsync()`:
 
 ```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.DbMigrator/Program.cs
 static async Task Main(string[] args)
 {
-    Log.Logger = /* Serilog setup */ ;
+    Log.Logger = new LoggerConfiguration()
+        .MinimumLevel.Information()
+        .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+        .MinimumLevel.Override("Volo.Abp", LogEventLevel.Warning)
+        .Enrich.FromLogContext()
+        .WriteTo.Async(c => c.File("Logs/logs.txt"))
+        .WriteTo.Async(c => c.Console())
+        .CreateLogger();
 
     await CreateHostBuilder(args).RunConsoleAsync();
 }
 
-static IHostBuilder CreateHostBuilder(string[] args) =>
+public static IHostBuilder CreateHostBuilder(string[] args) =>
     Host.CreateDefaultBuilder(args)
         .AddAppSettingsSecretsJson()
+        .ConfigureLogging((context, logging) => logging.ClearProviders())
         .ConfigureServices((hostContext, services) =>
         {
-            services.AddHostedService<MyProjectNameDbMigratorHostedService>();
-        })
-        .UseAutofac()
-        .UseSerilog();
+            services.AddHostedService<DbMigratorHostedService>();
+        });
 ```
 
-The hosted service boots
-`MyProjectNameDbMigratorModule` (which depends on
-`MyProjectNameEntityFrameworkCoreModule` + `MyProjectNameApplicationContractsModule`),
-runs `DbContext.Database.MigrateAsync()` via
-`EntityFrameworkCoreMyProjectNameDbSchemaMigrator`, then executes every
-registered `IDataSeedContributor` (Identity admin user, OpenIddict clients,
-permissions, etc.).
+The class name is `DbMigratorHostedService` (it lives in `MyCompanyName.MyProjectName.DbMigrator`). Note that `UseAutofac()` / `UseSerilog()` are not on `CreateHostBuilder` itself — they are passed via `AbpApplicationFactory.CreateAsync<MyProjectNameDbMigratorModule>(options => { options.UseAutofac(); options.Services.AddLogging(c => c.AddSerilog()); options.AddDataMigrationEnvironment(); })` inside `DbMigratorHostedService.StartAsync`, which then:
+
+1. Calls `application.InitializeAsync()`.
+2. Resolves `MyProjectNameDbMigrationService` and calls `MigrateAsync()` — this drives `EntityFrameworkCoreMyProjectNameDbSchemaMigrator.MigrateAsync()` (which calls `DbContext.Database.MigrateAsync()`) and then loops every registered `IDataSeedContributor` (Identity admin user, OpenIddict applications/scopes, permission grants, default tenant connection strings).
+3. Calls `application.ShutdownAsync()` and then `IHostApplicationLifetime.StopApplication()` so the process exits when seeding finishes.
+
+`MyProjectNameDbMigratorModule` itself depends on `MyProjectNameEntityFrameworkCoreModule` and `MyProjectNameApplicationContractsModule` plus the framework's `AbpAutofacModule`.
 
 ## Module dependency snapshots
 
@@ -326,7 +334,7 @@ extend) these `[DependsOn]` graphs. Use these snippets to know what is
 
 ### `MyProjectNameDomainSharedModule`
 
-```csharp
+```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.Domain.Shared/MyProjectNameDomainSharedModule.cs
 [DependsOn(
     typeof(AbpAuditLoggingDomainSharedModule),
     typeof(AbpBackgroundJobsDomainSharedModule),
@@ -335,14 +343,16 @@ extend) these `[DependsOn]` graphs. Use these snippets to know what is
     typeof(AbpOpenIddictDomainSharedModule),
     typeof(AbpPermissionManagementDomainSharedModule),
     typeof(AbpSettingManagementDomainSharedModule),
-    /* + TenantManagement, Validation, VirtualFileSystem */
+    typeof(AbpTenantManagementDomainSharedModule)
 )]
 public class MyProjectNameDomainSharedModule : AbpModule { }
 ```
 
+The class also runs `MyProjectNameGlobalFeatureConfigurator.Configure()` and `MyProjectNameModuleExtensionConfigurator.Configure()` from `PreConfigureServices`, registers the embedded `Localization/MyProjectName/*.json` resource, and maps the `MyProjectName` exception-code namespace to `MyProjectNameResource`.
+
 ### `MyProjectNameDomainModule`
 
-```csharp
+```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.Domain/MyProjectNameDomainModule.cs
 [DependsOn(
     typeof(MyProjectNameDomainSharedModule),
     typeof(AbpAuditLoggingDomainModule),
@@ -353,14 +363,17 @@ public class MyProjectNameDomainSharedModule : AbpModule { }
     typeof(AbpPermissionManagementDomainOpenIddictModule),
     typeof(AbpPermissionManagementDomainIdentityModule),
     typeof(AbpSettingManagementDomainModule),
-    typeof(AbpTenantManagementDomainModule)
+    typeof(AbpTenantManagementDomainModule),
+    typeof(AbpEmailingModule)
 )]
 public class MyProjectNameDomainModule : AbpModule { }
 ```
 
+`ConfigureServices` here registers the seeded languages (`ar`, `cs`, `en`, `en-GB`, `hu`, `hr`, `fi`, `fr`, `hi`, `it`, `pt-BR`, `ru`, `sk`, `tr`, `zh-Hans`, `zh-Hant`, `de-DE`, `es`), flips `AbpMultiTenancyOptions.IsEnabled` from `MultiTenancyConsts.IsEnabled`, and replaces `IEmailSender` with `NullEmailSender` under `#if DEBUG`.
+
 ### `MyProjectNameApplicationModule`
 
-```csharp
+```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.Application/MyProjectNameApplicationModule.cs
 [DependsOn(
     typeof(MyProjectNameDomainModule),
     typeof(AbpAccountApplicationModule),
@@ -382,7 +395,9 @@ public class MyProjectNameApplicationModule : AbpModule
 
 ### `MyProjectNameEntityFrameworkCoreModule`
 
-```csharp
+The class itself lives at `templates/app/aspnet-core/src/MyCompanyName.MyProjectName.EntityFrameworkCore/EntityFrameworkCore/MyProjectNameEntityFrameworkCoreModule.cs` — note the nested `EntityFrameworkCore/` folder inside the project. The sibling `MyProjectNameDbContext`, `MyProjectNameDbContextFactory`, `EntityFrameworkCoreMyProjectNameDbSchemaMigrator`, and `MyProjectNameEfCoreEntityExtensionMappings` live next to it.
+
+```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.EntityFrameworkCore/EntityFrameworkCore/MyProjectNameEntityFrameworkCoreModule.cs
 [DependsOn(
     typeof(MyProjectNameDomainModule),
     typeof(AbpIdentityEntityFrameworkCoreModule),
@@ -405,7 +420,7 @@ projects assume a single provider.
 
 ### `MyProjectNameHttpApiModule`
 
-```csharp
+```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.HttpApi/MyProjectNameHttpApiModule.cs
 [DependsOn(
     typeof(MyProjectNameApplicationContractsModule),
     typeof(AbpAccountHttpApiModule),
@@ -420,7 +435,7 @@ public class MyProjectNameHttpApiModule : AbpModule { }
 
 ### `MyProjectNameHttpApiClientModule`
 
-```csharp
+```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.HttpApi.Client/MyProjectNameHttpApiClientModule.cs
 [DependsOn(
     typeof(MyProjectNameApplicationContractsModule),
     typeof(AbpAccountHttpApiClientModule),
@@ -496,8 +511,7 @@ Blazor render mode. Pick **one pair** and delete the rest at generation time.
 
 | Render mode | Server project | WASM client | Tiered? |
 | --- | --- | --- | --- |
-| Blazor WebAssembly standalone | (none — WASM only) | `Blazor/` | No. WASM hosts itself, calls `HttpApi.Host`/`HostWithIds`. |
-| Blazor WebAssembly (separate client csproj) | served by `HttpApi.Host` | `Blazor.Client/` | Optional. |
+| Blazor WebAssembly (server-host + client csproj pair) | `Blazor/` | `Blazor.Client/` | Optional — depends on which API host the client targets. |
 | Blazor Server (non-tiered) | `Blazor.Server/` | — | No. Direct EF Core. |
 | Blazor Server (tiered) | `Blazor.Server.Tiered/` | — | Yes. Uses `HttpApi.Client`. |
 | Blazor Web App (non-tiered) | `Blazor.WebApp/` | `Blazor.WebApp.Client/` | No. |

@@ -157,7 +157,7 @@ public AbpRedisCache(IOptions<RedisCacheOptions> optionsAccessor)
 
 `InstancePrefix.Append(key)` is used on every multi-key entry point. The base type already does the same for single-key methods, so the byte-level Redis keyspace looks like:
 
-```
+```text
 myapp:t:3fa…,c:user,k:42
 └──┘└────────────────────┘
  instance      normalized key from DistributedCacheKeyNormalizer

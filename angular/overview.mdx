@@ -10,7 +10,7 @@ The ABP Angular UI lives in a single Nx workspace under [`npm/ng-packs/`](https:
 
 The workspace is a standard [Nx](https://nx.dev) monorepo with [Lerna](https://lerna.js.org) used only for publishing. The `libsDir` is `packages/` (declared in `nx.json`), there is no `apps/` directory — the only application is `dev-app` declared inline. Schematics are built separately via a bespoke script.
 
-```
+```text
 npm/ng-packs/
 ├── package.json          # workspace root, Angular 21 + Nx 21
 ├── nx.json               # workspaceLayout.libsDir = "packages"

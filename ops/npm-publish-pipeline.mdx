@@ -17,7 +17,7 @@ For the deploy-step wrappers (where steps 4 and 5 fit into `_run_all.ps1`) see [
 
 ## Layout
 
-```
+```text
 npm/
 ├── lerna.json                 ← MVC packs (Lerna config)
 ├── package.json               ← MVC scripts (lerna, ncu, update-gulp, replace-with-tilde, update)
@@ -297,7 +297,7 @@ $commands = (
 | 2 | `yarn install` | Restore Nx + Angular toolchain |
 | 3 | `yarn update-version $V` | Rewrite `lerna.version.json` to the new version (and propagate to every `packages/*/package.json`) |
 | 4 | `cd scripts && yarn install` | Install Nx-publish helpers |
-| 5 | `npm run publish-packages -- --nextVersion $V --skipGit --registry $R --skipVersionValidation` | Run `ng-packs/scripts/publish.ts`: builds `dist/packages/*` with Nx, swaps `lerna.publish.json` over `lerna.json`, then `lerna publish` from `dist/packages/*` |
+| 5 | `npm run publish-packages -- --nextVersion $V --skipGit --registry $R --skipVersionValidation` | Run `ng-packs/scripts/publish.ts`: builds `dist/packages/*` with Nx, renames `lerna.publish.json` over `lerna.json`, then `lerna exec -- "npm publish --registry $R"` from `dist/packages/*` |
 | 6 | `cd ../../` and `cd scripts` | Back at `npm/scripts/` |
 | 7 | `yarn remove-lock-files` | Drop stale `yarn.lock` / `package-lock.json` from the three templates so they regenerate next time |
 | 8 | `cd ..` and `yarn update-gulp --registry $R` | See below — refreshes `wwwroot/libs` in every MVC template |
@@ -310,7 +310,7 @@ $commands = (
 | `ng-packs/lerna.version.json` | At version-bump time — operates on **source** packages | `["packages/*"]` |
 | `ng-packs/lerna.publish.json` | At publish time — operates on **built artifacts** | `["dist/packages/*"]` |
 
-The publish script swaps `lerna.publish.json` *into* `lerna.json` right before `lerna publish` so Lerna sees the `dist/packages/*` glob without needing a separate config flag. (See `npm/ng-packs/scripts/publish.ts` `fse.rename('../lerna.publish.json', '../lerna.json')`.)
+The publish script renames `lerna.publish.json` into `lerna.json` right before `lerna exec -- "npm publish …"` so Lerna sees the `dist/packages/*` glob without needing a separate config flag. After publish completes (or on error) it renames it back. See `npm/ng-packs/scripts/publish.ts` — `fse.rename('../lerna.publish.json', '../lerna.json')`.
 
 ```json
 // lerna.version.json
@@ -353,11 +353,20 @@ await execa('yarn',
 
 await execa('yarn', ['build:schematics'], { stdout: 'inherit' });
 
-// then rename lerna.publish.json → lerna.json and lerna publish
+// then rename lerna.publish.json → lerna.json and lerna exec npm publish
+await fse.rename('../lerna.publish.json', '../lerna.json');
+
 let tag: string;
 if (program.preview) tag = 'preview';
 else if (semverParse(program.nextVersion).prerelease?.length) tag = 'next';
-// …lerna publish from-package --registry … (with optional --dist-tag $tag)
+
+await execa(
+  'yarn',
+  ['lerna', 'exec', '--', `"npm publish --registry ${registry}${tag ? ` --tag ${tag}` : ''}"`],
+  { stdout: 'inherit', cwd: '../' },
+);
+
+await fse.rename('../lerna.json', '../lerna.publish.json');
 ```
 
 Key points:
@@ -497,7 +506,7 @@ sequenceDiagram
     PM->>PM: lerna version --no-git-tag-version --force-publish
     PM->>PM: yarn replace-with-tilde
     PM->>PM: yarn validate-versions
-    PM->>NPM: lerna exec 'npm publish --registry … [--tag next]'
+    PM->>NPM: lerna exec npm publish --registry ... (optional --tag next)
 
     D5->>D5: read npm-auth-token.txt
     D5->>D5: npm set //registry.npmjs.org/:_authToken
@@ -506,7 +515,7 @@ sequenceDiagram
     PN->>Pub: scripts: yarn publish-packages
     Pub->>Pub: validate-versions, nx run-many --target=build --prod
     Pub->>Pub: build:schematics, rename lerna.publish.json → lerna.json
-    Pub->>NPM: lerna publish from-package --registry … [--dist-tag next|preview]
+    Pub->>NPM: lerna exec -- npm publish --registry ... (optional --tag next or preview)
     PN->>PN: scripts: yarn remove-lock-files (template lockfiles)
     PN->>PN: yarn update-gulp (refresh wwwroot/libs in MVC templates)
     PN->>PN: scripts: yarn update-lepton-x-versions

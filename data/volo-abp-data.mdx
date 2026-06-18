@@ -3,7 +3,7 @@ title: "Volo.Abp.Data"
 description: "Every type in framework/src/Volo.Abp.Data/Volo/Abp/Data — the provider-agnostic data abstractions consumed by every persistence package."
 ---
 
-`Volo.Abp.Data` defines abstractions the rest of the data stack depends on. It has **no** dependency on EF Core, MongoDB, Dapper or any driver. It is depended on by `AbpUnitOfWorkModule` (transitively) and `AbpObjectExtendingModule`, and feeds the multi-tenancy and migration subsystems.
+`Volo.Abp.Data` defines abstractions the rest of the data stack depends on. It has **no** dependency on EF Core, MongoDB, Dapper or any driver. `AbpDataModule` itself depends on `AbpObjectExtendingModule`, `AbpUnitOfWorkModule` and `AbpEventBusAbstractionsModule`; every persistence-provider package (`Volo.Abp.EntityFrameworkCore`, `Volo.Abp.MongoDB`, `Volo.Abp.Dapper`, `Volo.Abp.MemoryDb`) sits on top of it through `AbpDddDomainModule`. It feeds the multi-tenancy and migration subsystems.
 
 Source: `framework/src/Volo.Abp.Data/Volo/Abp/Data/`.
 
@@ -20,7 +20,7 @@ File: `AbpDataModule.cs`.
 public class AbpDataModule : AbpModule { ... }
 ```
 
-`PreConfigureServices` scans the DI container via `IServiceCollection.OnRegistered` and collects every type assignable to `IDataSeedContributor` into `AbpDataSeedOptions.Contributors`. `ConfigureServices` binds `AbpDbConnectionOptions` from `IConfiguration` (so `appsettings.json`'s `ConnectionStrings` section is auto-wired) and registers the open generic singleton `IDataFilter<>` → `DataFilter<>`. `PostConfigureServices` calls `AbpDatabaseInfoDictionary.RefreshIndexes()` so connection-name lookups are O(1).
+`AbpDataModule.PreConfigureServices` calls private `AutoAddDataSeedContributors(context.Services)`, which registers a `services.OnRegistered` callback that inspects every subsequent service registration and, for those whose `ImplementationType` is assignable to `IDataSeedContributor`, appends the type to `AbpDataSeedOptions.Contributors` via `services.Configure<AbpDataSeedOptions>(...)`. `ConfigureServices` binds `AbpDbConnectionOptions` from `IConfiguration` (so `appsettings.json`'s `ConnectionStrings` section is auto-wired) and registers the open generic singleton `IDataFilter<>` → `DataFilter<>`. `PostConfigureServices` calls `Configure<AbpDbConnectionOptions>(o => o.Databases.RefreshIndexes())` so `AbpDatabaseInfoDictionary.GetMappedDatabaseOrNull` is O(1) after module setup.
 
 ## Connection strings
 
@@ -44,11 +44,11 @@ See `/data/connection-strings` for the full resolver chain (including `MultiTena
 
 | File | Type | Notes |
 | --- | --- | --- |
-| `IDataFilter.cs` | `IDataFilter` (non-generic) and `IDataFilter<TFilter>` | Generic per-filter accessor. Methods: `Enable()`, `Disable()`, `bool IsEnabled`. |
-| `DataFilter.cs` | `DataFilter` (singleton) + `DataFilter<TFilter>` | `DataFilter` is a façade that caches `IDataFilter<TFilter>` in a `ConcurrentDictionary`. `DataFilter<TFilter>` keeps state in an `AsyncLocal<DataFilterState>` so the toggle does not leak across requests. |
-| `DataFilterState.cs` | `DataFilterState` | `IsEnabled` flag with `Clone()` for snapshotting. |
-| `AbpDataFilterOptions.cs` | `AbpDataFilterOptions` | `DefaultStates : Dictionary<Type, DataFilterState>` — set per-filter default during module configuration. |
-| `DataFilterExtensions.cs` | extensions | Variadic `Disable<T1,T2>()`, `Disable<T1,T2,T3>()`, ... that return a `CompositeDisposable`. |
+| `IDataFilter.cs` | `IDataFilter` (non-generic) and `IDataFilter<TFilter>` | `IDataFilter<TFilter>` exposes `IDisposable Enable()`, `IDisposable Disable()`, `bool IsEnabled`. `IDataFilter` is the type-routed façade with `Enable<TFilter>()`, `Disable<TFilter>()`, `IsEnabled<TFilter>()`. |
+| `DataFilter.cs` | `DataFilter : IDataFilter, ISingletonDependency` + `DataFilter<TFilter> : IDataFilter<TFilter>` | `DataFilter` resolves `IDataFilter<TFilter>` from DI and caches it in a `ConcurrentDictionary<Type, object>`. `DataFilter<TFilter>` holds its state in an `AsyncLocal<DataFilterState>`, lazy-initialized from `AbpDataFilterOptions.DefaultStates[typeof(TFilter)]?.Clone()` (defaulting to `new DataFilterState(true)`), so the toggle is per async-flow and does not leak across requests. |
+| `DataFilterState.cs` | `DataFilterState` | Mutable `bool IsEnabled` with a `Clone()` that returns `new DataFilterState(IsEnabled)`. |
+| `AbpDataFilterOptions.cs` | `AbpDataFilterOptions` | `DefaultStates : Dictionary<Type, DataFilterState>` — set per-filter default during module configuration. Filters not present in the dictionary default to enabled. |
+| `DataFilterExtensions.cs` | extensions | Variadic `Disable<T1,T2>()` … `Disable<T1,T2,T3,T4,T5,T6,T7,T8>()` and the matching `Enable<T1,T2>()` … `Enable<T1,…,T8>()` that each return a private `CompositeDisposable` re-enabling/disabling every filter on dispose. |
 
 The default registration is in `AbpDataModule.ConfigureServices`:
 

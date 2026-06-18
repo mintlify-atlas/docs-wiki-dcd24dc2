@@ -94,7 +94,7 @@ app.UseAuthorization();
 app.UseConfiguredEndpoints();
 ```
 
-ABP marks `__AuthenticationMiddlewareSet = true` from inside its own `UseAuthentication` wrapper; if you call `app.UseAuthentication()` directly, the property is also set by ASP.NET Core (the warning checks the same key).
+The `__AuthenticationMiddlewareSet` flag is set by ASP.NET Core's own `app.UseAuthentication()` extension. `UseMultiTenancy` only reads it to decide whether to emit the warning — it does not enforce or reorder anything.
 
 ## The middleware
 

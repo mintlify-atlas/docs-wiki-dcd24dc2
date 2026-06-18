@@ -36,7 +36,8 @@ All Bootstrap tag helpers descend from primitives in `TagHelpers/`:
 | `IAbpTagHelperService<TTagHelper>` | `TagHelpers/IAbpTagHelperService.cs` | Marker for DI registration. |
 | `AbpTagHelperLocalizer` / `IAbpTagHelperLocalizer` | `TagHelpers/AbpTagHelperLocalizer.cs` | Resolves the `IStringLocalizer` for a tag helper's view context (used by `<abp-input asp-for>` label generation). |
 | `TagBuilderExtensions` | `TagHelpers/TagBuilderExtensions.cs` | `AddCssClass`, `RemoveCssClass`, conditional attribute helpers. |
-| `FontIconType` / `HtmlHeadingType` enums | `TagHelpers/` | Strongly typed icon and heading levels. |
+| `FontIconType` / `HtmlHeadingType` enums | `TagHelpers/FontIconType.cs`, `TagHelpers/HtmlHeadingType.cs` | Strongly typed icon and heading levels (`HtmlHeadingTypeExtensions.cs` maps to `<h1>`–`<h6>`). |
+| `Extensions/` | `TagHelpers/Extensions/` | `ModelExplorerExtensions`, `TagHelperAttributeExtensions`, `TagHelperContextExtensions`, `TagHelperExtensions`, `TagHelperOutputExtensions` — shared helpers consumed by every service class. |
 
 This split means a downstream module can `services.Replace<AbpAlertTagHelperService>` to override rendering globally — a common need when applying corporate themes.
 
@@ -56,21 +57,19 @@ Each folder under `TagHelpers/` ships one or more `<abp-*>` tag helpers. The tab
 | `Carousel/` | `<abp-carousel>`, `<abp-carousel-item>` | Controls, indicators, interval |
 | `Collapse/` | `<abp-collapse>` | Trigger id, default state |
 | `Dropdown/` | `<abp-dropdown>`, `<abp-dropdown-button>`, `<abp-dropdown-item>`, `<abp-dropdown-divider>` | Direction (`Up`, `Start`, `End`), split, auto-close |
-| `Extensions/` | helpers consumed by other tag helpers | Internal — not directly used |
 | `Figure/` | `<abp-figure>` | Caption position, responsive image |
-| `Form/` | `<abp-input>`, `<abp-select>`, `<abp-radio-input>`, `<abp-form-content>`, `<abp-dynamicform>`, `<abp-validation-attribute>` | DataAnnotations integration; honours `[DisabledInput]`, `[ReadOnlyInput]`, `[Placeholder]`, `[InputInfoText]`, `[SelectItems]`, `[DisplayOrder]`, `[DynamicFormIgnore]`, `[FormControlSize]`, `[TextArea]` from same folder |
-| `Form/DatePicker/` | `<abp-datepicker>` | Wraps the Bootstrap datepicker plugin |
+| `Form/` | `<abp-input>`, `<abp-select>`, `<abp-radio>`, `<abp-form-content>`, `<abp-dynamic-form>`, `<abp-form-row>`, `<abp-validation-summary>` | DataAnnotations integration; honours `[DisabledInput]`, `[ReadOnlyInput]`, `[Placeholder]`, `[InputInfoText]`, `[SelectItems]`, `[DisplayOrder]`, `[DynamicFormIgnore]`, `[FormControlSize]`, `[TextArea]` from same folder. `AbpInputTagHelper` / `AbpSelectTagHelper` / `AbpDynamicformTagHelper` (target element `abp-dynamic-form`) read these attributes via `ModelExplorerExtensions`. |
+| `Form/DatePicker/` | `<abp-date-picker>` / `<abp-date-range-picker>` | Wrap the Bootstrap date-range-picker plugin; `[DatePicker]`, `[DateRangePicker]`, `[DatePickerOptions]` attributes; `AbpDatePickerOptions` (`Drops`, `Opens`, `WeekNumbers`, `Range`). |
 | `Grid/` | `<abp-row>`, `<abp-column>` | Column sizes for xs/sm/md/lg/xl/xxl breakpoints |
 | `ListGroup/` | `<abp-list-group>`, `<abp-list-group-item>` | Flush, numbered, active, disabled |
-| `Modal/` | `<abp-modal>`, `<abp-modal-header>`, `<abp-modal-body>`, `<abp-modal-footer>` | `AbpModalSize` (`Default`, `Small`, `Large`, `XLarge`), `ButtonsAlign`, scrollable, centered |
-| `Nav/` | `<abp-nav>`, `<abp-nav-item>` | Pills/tabs variant, vertical |
-| `Pagination/` | `<abp-pagination>` | Bound to `IPagedResult`-style model |
+| `Modal/` | `<abp-modal>`, `<abp-modal-header>`, `<abp-modal-body>`, `<abp-modal-footer>` | `AbpModalSize` (`Default`, `Small`, `Large`, `XLarge`), `ButtonsAlign`, scrollable, centered; `AbpModalButtons` `[Flags]` |
+| `Nav/` | `<abp-nav>`, `<abp-nav-item>`, `<abp-nav-link>`, `<abp-navbar>` (`AbpNavBarTagHelper`), `<abp-navbar-brand>`, `<abp-navbar-nav>`, `<abp-navbar-text>`, `<abp-navbar-toggle>` | `NavStyle` (Tabs/Pills), `AbpNavAlign`, `AbpNavbarStyle`, `AbpNavbarSize` |
+| `Pagination/` | `<abp-paginator>` | Bound to `IPagedResult`-style model |
 | `Popover/` | `<abp-popover>` | Trigger, content, placement |
-| `ProgressBar/` | `<abp-progressbar>` | Striped, animated, value/max |
-| `Tab/` | `<abp-tabs>`, `<abp-tab>` | Type (`Tab`, `Pill`), vertical, default active |
+| `ProgressBar/` | `<abp-progress-bar>` | Striped, animated, value/max |
+| `Tab/` | `<abp-tabs>`, `<abp-tab>`, `<abp-tab-link>`, `<abp-tab-dropdown>` | `TabStyle` (`Tab`, `Pill`), vertical, default active |
 | `Table/` | `<abp-table>` | Striped, bordered, hover, responsive |
 | `Tooltip/` | `<abp-tooltip>` | Trigger, placement, html |
-| `Utils/` | shared helpers | `BootstrapColor` enum, color/string converters |
 
 ## Form-control attributes
 
@@ -101,7 +100,7 @@ The attributes inside `TagHelpers/Form/` modify how the input/select tag helpers
       <abp-select asp-for="Book.Type" />
     </form>
   </abp-modal-body>
-  <abp-modal-footer buttons-align="Right"
+  <abp-modal-footer button-alignment="Right"
                     buttons="@(AbpModalButtons.Cancel | AbpModalButtons.Save)" />
 </abp-modal>
 ```
@@ -196,14 +195,11 @@ To re-style every modal globally:
 ```csharp
 public class CompanyModalTagHelperService : AbpModalTagHelperService
 {
-    public CompanyModalTagHelperService(HtmlEncoder htmlEncoder, IUrlHelperFactory urlHelperFactory)
-        : base(htmlEncoder, urlHelperFactory) { }
-
-    public override Task ProcessAsync(TagHelperContext context, TagHelperOutput output)
+    public override async Task ProcessAsync(TagHelperContext context, TagHelperOutput output)
     {
-        // Add company branding class
+        await base.ProcessAsync(context, output);
+        // Add company branding class after base markup is emitted
         output.Attributes.SetAttribute("data-company-modal", "true");
-        return base.ProcessAsync(context, output);
     }
 }
 

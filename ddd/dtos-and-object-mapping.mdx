@@ -97,8 +97,8 @@ By default, `AutoObjectMappingProvider` is
 `NotImplementedAutoObjectMappingProvider` which throws unless you
 configured AutoMapper or Mapperly:
 
-```
-NotImplementedAutoObjectMappingProvider.cs
+```text
+framework/src/Volo.Abp.ObjectMapping/Volo/Abp/ObjectMapping/NotImplementedAutoObjectMappingProvider.cs
 ```
 
 So *some* provider must be wired in for non-trivial mapping.
@@ -404,7 +404,7 @@ mapping completes. For Mapperly, attach
 
 ## Canonical layout for a module's mapping files
 
-```
+```text
 MyCompany.MyModule.Application/
 └── MyCompany/MyModule/
     ├── MyModuleApplicationModule.cs                # ConfigureServices: Configure<AbpAutoMapperOptions>
@@ -413,7 +413,7 @@ MyCompany.MyModule.Application/
 
 Mapperly equivalent:
 
-```
+```text
 MyCompany.MyModule.Application/
 └── MyCompany/MyModule/
     ├── MyModuleApplicationModule.cs

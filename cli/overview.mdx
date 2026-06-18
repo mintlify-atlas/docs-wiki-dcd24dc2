@@ -145,13 +145,14 @@ The registry lives in `AbpCliCoreModule.ConfigureServices` and populates `AbpCli
 | `ProxyCommandBase.cs` | (base) | Shared logic for `generate-proxy` / `remove-proxy` |
 | `RemoveProxyCommand.cs` | `remove-proxy` | Delete previously generated proxy files |
 | `SuiteCommand.cs` | `suite` | Install / update / start ABP Suite |
-| `SwitchToLocalCommand.cs` | `switch-to-local` | Replace NuGet refs with local `<ProjectReference>` |
+| `SwitchToLocalCommand.cs` (class `SwitchToLocal`) | `switch-to-local` | Replace NuGet refs with local `<ProjectReference>` |
 | `SwitchToNightlyCommand.cs` | `switch-to-nightly` | Move packages to nightly MyGet feed |
 | `SwitchToPreRcCommand.cs` | `switch-to-prerc` | Switch npm packages to pre-rc track |
 | `SwitchToPreviewCommand.cs` | `switch-to-preview` | Switch packages to preview channel |
 | `SwitchToStableCommand.cs` | `switch-to-stable` | Move back to stable from a preview |
 | `TranslateCommand.cs` | `translate` | Bulk JSON resource translation helper |
 | `UpdateCommand.cs` | `update` | Bump NuGet/npm package versions in a solution |
+| `Internal/RecreateInitialMigrationCommand.cs` | `recreate-initial-migration` | Hidden command (`[HideFromCommandList]`) that re-runs `dotnet ef migrations add Initial` for the bundled `DbContext` projects |
 
 The `CommandSelector` uses the registered key, not the file name; the `Name` constant on each command class is the source of truth. Browse `AbpCliCoreModule.cs` to confirm every registration.
 
@@ -168,7 +169,7 @@ Inside `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/`, the following folders gr
 | `Args/` | Command-line argument parser | `ICommandLineArgumentParser`, `CommandLineArgs` |
 | `Auth/` | `account.abp.io` OAuth flow + token cache | `AuthService` |
 | `Build/` | Repository-aware build pipeline for `abp build` | `IDotNetProjectBuilder`, `IChangedProjectFinder`, `IBuildStatusGenerator` |
-| `Bundling/` | Blazor static-asset bundler | `IBundlingService`, `BundlingService`, `IScriptBundler`, `IStyleBundler` |
+| `Bundling/` | Blazor WebAssembly + MAUI Blazor static-asset bundler | `IBundlingService`, `BundlingService`, `IBundler`, `BundlerBase`, `Scripts/ScriptBundler`, `Styles/StyleBundler` |
 | `Configuration/` | `appsettings.json` style config reader | `IConfigReader` |
 | `GitHub/` | GitHub API helpers (rate-limited HTTP client) | `GithubHttpClientName` registration |
 | `Http/` | Shared HttpClient factory with auth handler | `CliHttpClientFactory`, `CliHttpClientHandler` |
@@ -178,7 +179,7 @@ Inside `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/`, the following folders gr
 | `ProjectBuilding/` | Template download + zip extraction pipeline | `ITemplateInfoProvider`, `TemplateProjectBuilder`, `ISourceCodeStore` |
 | `ProjectModification/` | NuGet/npm package mutation, theme adders | `VoloNugetPackagesVersionUpdater`, `NpmPackagesUpdater`, `ThemePackageAdder`, `AngularPwaSupportAdder`, `InitialMigrationCreator` |
 | `ServiceProxying/` | Client proxy generators (`csharp`, `js`, `ng`) | `IServiceProxyGenerator`, `ServiceProxyGeneratorBase<T>` |
-| `Telemetry/` | Activity tracking + enrichers | `ITelemetryService`, `TelemetrySessionInfoEnricher` |
+| `Telemetry/` | OSS no-op telemetry implementation | `NullTelemetryService` (real `ITelemetryService` + `TelemetrySessionInfoEnricher` live in `Volo.Abp.Core`) |
 | `Utils/` | Cross-cutting helpers (`CmdHelper`, `NpmHelper`, `NamespaceHelper`, `ProjectNameValidator`) | `ICmdHelper`, `NpmHelper` |
 | `Version/` | `Volo.Abp.Cli` self-version + NuGet probing | `CliVersionService`, `PackageVersionCheckerService` |
 

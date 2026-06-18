@@ -120,18 +120,23 @@ public async override Task InvokeAsync(HttpContext context, RequestDelegate next
 
 ## Resolver chain order
 
-`AbpTenantResolveOptions.TenantResolvers` is a `TypeList<ITenantResolveContributor>`. The default order, registered in `Volo.Abp.AspNetCore.MultiTenancy/AbpAspNetCoreMultiTenancyModule.cs`, is:
+`AbpTenantResolveOptions.TenantResolvers` is a `List<ITenantResolveContributor>`. The default order is set in two places: `AbpMultiTenancyModule.ConfigureServices` inserts `CurrentUserTenantResolveContributor` at index 0, and `AbpAspNetCoreMultiTenancyModule.ConfigureServices` appends the HTTP-bound contributors. The effective default list is:
 
 | # | Contributor | Source of tenant key |
 |---|-------------|----------------------|
-| 1 | `CurrentUserTenantResolveContributor` | `ClaimsPrincipal` &mdash; `tenantid` claim on the authenticated user. |
-| 2 | `QueryStringTenantResolveContributor` | `?__tenant=...` query string parameter. |
-| 3 | `FormTenantResolveContributor` | `__tenant` form field. |
+| 1 | `CurrentUserTenantResolveContributor` | `ClaimsPrincipal` &mdash; `AbpClaimTypes.TenantId` claim on the authenticated user. |
+| 2 | `QueryStringTenantResolveContributor` | `?__tenant=...` query-string parameter. |
+| 3 | `RouteTenantResolveContributor` | `{__tenant}` route token. |
 | 4 | `HeaderTenantResolveContributor` | `__tenant` HTTP header. |
 | 5 | `CookieTenantResolveContributor` | `__tenant` cookie. |
-| 6 | `RouteTenantResolveContributor` | `{__tenant}` route token. |
-| 7 | `DomainTenantResolveContributor` (when configured) | Subdomain pattern, e.g. `acme.app.com`. |
-| 8 | `ActionTenantResolveContributor` | Manual `httpContext.Items["abp_tenant_id"]`. |
+
+The `__tenant` key itself comes from `AbpAspNetCoreMultiTenancyOptions.TenantKey`. Three more contributors live in the source tree but are **not** registered by default &mdash; opt in by inserting them yourself:
+
+| Contributor | File | When to add |
+|-------------|------|-------------|
+| `FormTenantResolveContributor` | `Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/FormTenantResolveContributor.cs` | Pick the tenant from a form post (e.g. anti-CSRF login pages). |
+| `DomainTenantResolveContributor` | `Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/DomainTenantResolveContributor.cs` | Subdomain routing &mdash; instantiate with a format such as `{0}.app.com`. |
+| `ActionTenantResolveContributor` | `Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/ActionTenantResolveContributor.cs` | Delegate-based resolver; useful in tests or specialised hosts. |
 
 `TenantResolver.ResolveTenantIdOrNameAsync` iterates and breaks on the first contributor that calls `context.SetTenant(...)`:
 

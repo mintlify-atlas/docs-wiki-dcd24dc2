@@ -111,12 +111,13 @@ Key collaborators:
 
 | Service | File | Role |
 | --- | --- | --- |
-| `IScriptBundler` / `ScriptBundler` | `Bundling/Scripts/ScriptBundler.cs` | Concatenates + minifies JS via `IJavascriptMinifier`. |
-| `IStyleBundler` / `StyleBundler` | `Bundling/Styles/StyleBundler.cs` | Concatenates + minifies CSS via `ICssMinifier`. |
-| `IBundleCache` | from `Volo.Abp.AspNetCore.Bundling` | In-memory cache keyed by bundle name + content hash. |
-| `CachedBundleDynamicFileProvider` | `Bundling/CachedBundleDynamicFileProvider.cs` | Exposes the bundled output as virtual files. |
-| `IWebRequestResources` / `WebRequestResources` | `Bundling/Resources/` | Per-request set of resources already rendered (de-dup). |
-| `MvcUiBundlerBase` | `Bundling/MvcUiBundlerBase.cs` | Common bundling logic shared by script/style bundlers. |
+| `IScriptBundler` / `ScriptBundler` | `Bundling/Scripts/ScriptBundler.cs` (`Volo.Abp.AspNetCore.Bundling/IScriptBundler.cs`) | Concatenates + minifies JS via `IJavascriptMinifier`. |
+| `IStyleBundler` / `StyleBundler` | `Bundling/Styles/StyleBundler.cs` (`Volo.Abp.AspNetCore.Bundling/IStyleBundler.cs`) | Concatenates + minifies CSS via `ICssMinifier`. |
+| `IBundleCache` / `BundleCache` / `BundleCacheItem` | `Volo.Abp.AspNetCore.Bundling/BundleCache.cs` | Singleton in-memory cache keyed by bundle name + content hash; entries are `BundleCacheItem`. |
+| `BundleResult` | `Volo.Abp.AspNetCore.Bundling/BundleResult.cs` | Output of a `BundlerBase.Bundle(...)` call (content + extension). |
+| `CachedBundleDynamicFileProvider` | `Bundling/CachedBundleDynamicFileProvider.cs` | Exposes the bundled output as virtual files; `InMemoryFileInfoCacheItem` holds each generated file. |
+| `MvcUiBundlerBase` | `Bundling/MvcUiBundlerBase.cs` | Common bundling logic shared by script/style bundlers; derives from `BundlerBase` in `Volo.Abp.AspNetCore.Bundling`. |
+| `IBundler` / `BundlerBase` / `IBundlerContext` / `BundlerContext` | `Volo.Abp.AspNetCore.Bundling/Bundler*.cs` | Strategy-style bundling primitives invoked by `BundleManager`. |
 
 The minifiers come from `Volo.Abp.Minify` (`framework/src/Volo.Abp.Minify/`) — `NUglifyJavascriptMinifier`, `NUglifyCssMinifier`. `AbpBundlingOptions.MinificationIgnoredFiles` skips files that are already minified (e.g. CDN `*.min.js`).
 
@@ -169,6 +170,7 @@ The `Global` bundles are populated by the contributors in `Volo.Abp.AspNetCore.M
 
 | Folder | Libraries / files |
 | --- | --- |
+| `Anchor/` | `anchor.js` heading-anchor library |
 | `Bootstrap/` | `bootstrap.bundle.js`, `bootstrap.css` |
 | `BootstrapDatepicker/` | `bootstrap-datepicker.js`, `.css` |
 | `BootstrapDaterangepicker/` | `bootstrap-daterangepicker.js`, `.css` |
@@ -201,7 +203,10 @@ The `Global` bundles are populated by the contributors in `Volo.Abp.AspNetCore.M
 | `Timeago/` | `timeago.js` |
 | `TuiEditor/` | TOAST UI editor |
 | `Uppy/` | `uppy.js`, `.css` |
+| `Utils/` | Internal helpers re-used by other package contributors. |
 | `VeeValidate/` | `vee-validate.js` (Vue) |
+| `Vue/` | `vue.js` framework script |
+| `Zxcvbn/` | `zxcvbn.js` password-strength estimator |
 
 Each contributor uses `context.Files.AddIfNotContains("/libs/<lib>/file.js")` so transitive `[DependsOn]` chains cannot duplicate files. The `BootstrapScriptContributor` (`Packages/Bootstrap/BootstrapScriptContributor.cs`) is the canonical example:
 

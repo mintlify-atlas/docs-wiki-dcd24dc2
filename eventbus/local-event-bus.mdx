@@ -153,10 +153,10 @@ sequenceDiagram
 `LocalEventBus.GetHandlerFactories` reads `[LocalEventHandlerOrder(Order = …)]` (`Local/LocalEventHandlerOrderAttribute.cs`) via `ReflectionHelper.GetAttributesOfMemberOrDeclaringType`, then sorts handlers by `Order` ascending before returning the list. Handlers without the attribute default to order `0`. Order is **per event type**, not global — two handlers for different events do not affect each other.
 
 ```csharp
-[LocalEventHandlerOrder(Order = -10)]
+[LocalEventHandlerOrder(-10)]
 public class FirstHandler : ILocalEventHandler<MyEvent>, ITransientDependency { … }
 
-[LocalEventHandlerOrder(Order = 100)]
+[LocalEventHandlerOrder(100)]
 public class LastHandler : ILocalEventHandler<MyEvent>, ITransientDependency { … }
 ```
 

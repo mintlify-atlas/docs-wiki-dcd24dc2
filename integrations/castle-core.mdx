@@ -37,7 +37,7 @@ ABP composes these into a single generic interceptor type that any `IAbpIntercep
 
 ## Files
 
-```
+```text
 framework/src/Volo.Abp.Castle.Core/Volo/Abp/Castle/
 ├── AbpCastleCoreModule.cs                          — module
 └── DynamicProxy/
@@ -240,7 +240,7 @@ This split means **interceptor code can mutate `ReturnValue` after `ProceedAsync
 
 For an async method `Task<Book> CreateAsync(CreateBookDto dto)` on an application service, decorated with `[Authorize]` (which contributes `AuthorizationInterceptor : IAbpInterceptor`):
 
-```
+```text
 caller.CreateAsync(dto)
    │
    ▼ Castle proxy intercepts

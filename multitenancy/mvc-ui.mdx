@@ -268,7 +268,7 @@ public class AbpTenantController : AbpControllerBase, IAbpTenantAppService
 
 Both endpoints are open (no `[Authorize]`) — they are intentionally accessible to anonymous users so they can be used from the login page. They reveal only id / name / active status, not connection strings or any tenant settings. The Angular tenant box (`@abp/ng.theme.shared`) consumes them, as does the static MVC `tenant-switch.js` indirectly through `AbpTenantStore` on the JS side.
 
-The `IAbpTenantAppService` contract itself lives in `framework/src/Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy/Volo/Abp/AspNetCore/Mvc/MultiTenancy/` (in the abstractions assembly), so client proxy generators can produce typed clients.
+The `IAbpTenantAppService` contract and its `FindTenantResultDto` live in the shared MVC contracts assembly at `framework/src/Volo.Abp.AspNetCore.Mvc.Contracts/Volo/Abp/AspNetCore/Mvc/MultiTenancy/`, so client proxy generators can produce typed clients without referencing the UI package.
 
 ## Tag helper / view component hooks
 

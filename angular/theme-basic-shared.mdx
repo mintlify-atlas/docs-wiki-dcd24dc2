@@ -27,11 +27,11 @@ Runtime dependencies of `theme-shared`: `@ng-bootstrap/ng-bootstrap`, `@swimlane
 | `breadcrumb-items` | `BreadcrumbItemsComponent` | `abp-breadcrumb-items` | Renders the resolved trail using `RoutesService` |
 | `button` | `ButtonComponent` | `abp-button` | Bootstrap button with `loading`, `disabled`, `buttonType` inputs |
 | `card` | `CardComponent` | `abp-card` | `<abp-card>` Bootstrap card wrapper |
-| `checkbox` | `CheckboxComponent` | `abp-checkbox` | ControlValueAccessor wrapper |
+| `checkbox` | `FormCheckboxComponent` | `abp-checkbox` | ControlValueAccessor wrapper for checkboxes |
 | `confirmation` | `ConfirmationComponent` | `abp-confirmation` | Dialog template used by `ConfirmationService` |
-| `form-input` | `FormInputComponent`, `FormCheckboxComponent` | `abp-form-input`, `abp-form-checkbox` | Bootstrap-styled reactive inputs |
+| `form-input` | `FormInputComponent` | `abp-form-input` | Bootstrap-styled reactive input |
 | `http-error-wrapper` | `HttpErrorWrapperComponent` | (projected) | Renders the default 401/403/404/500 pages |
-| `internet-connection-status` | `InternetConnectionStatusComponent` | `abp-internet-connection-status` | Banner shown when offline |
+| `internet-connection-status` | `InternetConnectionStatusComponent` | `abp-internet-status` | Banner shown when offline |
 | `loader-bar` | `LoaderBarComponent` | `abp-loader-bar` | Top-of-page progress bar driven by `HttpWaitService` |
 | `loading` | `LoadingComponent` | `abp-loading` | Spinner placeholder |
 | `modal` | `ModalComponent` + `ModalCloseDirective` | `abp-modal`, `[abpClose]` | Bootstrap modal with hard/soft dismiss |
@@ -46,11 +46,11 @@ Runtime dependencies of `theme-shared`: `@ng-bootstrap/ng-bootstrap`, `@swimlane
 
 | Selector | Purpose |
 | --- | --- |
-| `[disabled]` | Strongly-typed `disabled` propagation to Bootstrap-style buttons |
+| `[abpDisabled]` | Strongly-typed `disabled` propagation to Bootstrap-style buttons |
 | `[abpEllipsis]` | CSS line-clamp with tooltip on overflow |
 | `[abpLoading]` | Inline loading spinner overlay |
-| `[ngxDatatableDefault]` | Pre-configures `<ngx-datatable>` with ABP defaults (column mode, footer, messages) |
-| `[ngxDatatableList]` | Adapter between `ListService` and `<ngx-datatable>` |
+| `ngx-datatable[default]` | Pre-configures `<ngx-datatable>` with ABP defaults (column mode, footer, messages) |
+| `ngx-datatable[list]` | Adapter between `ListService` and `<ngx-datatable>` |
 | `[abpVisible]` | Reactive `[hidden]` driven by an observable |
 
 ### Services
@@ -156,6 +156,8 @@ Layouts are registered in `DYNAMIC_LAYOUTS_TOKEN` via `provideThemeBasicConfig()
 | Component | Selector | Role |
 | --- | --- | --- |
 | `LogoComponent` | `abp-logo` | Renders `LOGO_URL`, optional link |
+| `AuthWrapperComponent` | `abp-auth-wrapper` | Account-layout login chrome backed by `AuthWrapperService` |
+| `TenantBoxComponent` | `abp-tenant-box` | Tenant switcher rendered inside `AuthWrapperComponent` |
 | `NavItemsComponent` | `abp-nav-items` | Top-bar items (right side) registered through `NavItemsService` |
 | `RoutesComponent` | `abp-routes` | Sidebar nav from `RoutesService` |
 | `CurrentUserComponent` | `abp-current-user` | Avatar + dropdown (manage profile, logout) |

@@ -86,7 +86,7 @@ OpenIddict itself doesn't talk to your repository — it talks to an `IOpenIddic
 3. Mutates the aggregate (creating / updating / deleting through ABP repository methods).
 4. Caches the result in `AbpOpenIddictApplicationCache` to keep token-issuance hot paths off the database.
 
-The companion managers (`AbpApplicationManager`, `AbpAuthorizationManager`, `AbpScopeManager`, `AbpTokenManager`) extend OpenIddict's `OpenIddict<Application|Authorization|Scope|Token>Manager` and add the ABP options/cache wiring. Use them — not the OpenIddict bare managers — when seeding programmatically.
+The companion managers (`AbpApplicationManager`, `AbpAuthorizationManager`, `AbpScopeManager`, `AbpTokenManager`) extend OpenIddict's `OpenIddictApplicationManager` / `OpenIddictAuthorizationManager` / `OpenIddictScopeManager` / `OpenIddictTokenManager` and add the ABP options/cache wiring. Use them — not the OpenIddict bare managers — when seeding programmatically.
 
 ## Protocol endpoints
 

@@ -96,21 +96,25 @@ public class MyMongoDbContext : AbpMongoDbContext
 
 | File | Purpose |
 | --- | --- |
-| `IMongoEntityModel.cs` | `Type EntityType`, `string CollectionName`, optional `CreateCollectionOptions`, optional `BsonClassMap`, index-builder action. |
-| `IMongoEntityModelBuilder.cs` / `MongoEntityModelBuilder.cs` | Fluent builder for the above. |
-| `IMongoModelBuilder.cs` / `MongoModelBuilder.cs` | Top-level model builder iterating registered entities. |
-| `IMongoModelSource.cs` / `MongoModelSource.cs` | Caches the materialised `MongoDbContextModel` per context type. |
-| `MongoDbContextModel.cs` | Holds `Entities : Dictionary<Type, IMongoEntityModel>`. |
-| `IMongoDbContextTypeProvider.cs` / `MongoDbContextTypeProvider.cs` | Resolves a logical context type to a replaced implementation type (multi-tenancy hook). |
-| `IHasBsonClassMap.cs` / `IHasCreateCollectionOptions.cs` / `IHasMongoIndexManagerAction.cs` | Per-entity opt-in interfaces consumed during model creation. |
-| `MongoCollectionAttribute.cs` | `[MongoCollection(string? collectionName)]` — applied to entity types to set the collection name declaratively. |
-| `AbpBsonClassMapExtensions.cs` | Conventions for `IEntity`, `IHasConcurrencyStamp`, `IHasExtraProperties`. |
-| `AbpBsonSerializer.cs` | Helper that removes pre-registered serializers (used in the static ctor). |
+| `IMongoEntityModel.cs` | Slim contract — `Type EntityType`, `string CollectionName`. Implementations may also implement `IHasBsonClassMap`, `IHasCreateCollectionOptions`, and `IHasMongoIndexManagerAction`. |
+| `IMongoEntityModelBuilder.cs` / `MongoEntityModelBuilder.cs` | Fluent builder that produces an `IMongoEntityModel` carrying the collection name plus optional `BsonClassMap`, `CreateCollectionOptions`, and index-manager action. |
+| `IMongoModelBuilder.cs` / `MongoModelBuilder.cs` | Top-level model builder that aggregates per-entity builders. |
+| `IMongoModelSource.cs` / `MongoModelSource.cs` | Caches the materialised `MongoDbContextModel` per `AbpMongoDbContext` type. |
+| `MongoDbContextModel.cs` | Holds the dictionary of `IMongoEntityModel` instances keyed by entity type, plus the configured `IMongoDatabase`. |
+| `IMongoDbContextTypeProvider.cs` / `MongoDbContextTypeProvider.cs` | Resolves a logical context type to a replaced implementation type (multi-tenancy hook via `AbpMongoDbContextOptions.DbContextReplacements`). |
+| `IHasBsonClassMap.cs` | Optional interface implemented by `IMongoEntityModel` instances that want to customize the BSON class map. |
+| `IHasCreateCollectionOptions.cs` | Optional interface for setting MongoDB `CreateCollectionOptions` on the collection. |
+| `IHasMongoIndexManagerAction.cs` | Optional interface for declaring indexes via `IMongoIndexManager` during model creation. |
+| `MongoCollectionAttribute.cs` | `[MongoCollection(string collectionName)]` — applied to entity types to set the collection name declaratively. |
+| `AbpBsonClassMapExtensions.cs` | Convention helpers for mapping `IEntity`, `IHasConcurrencyStamp`, `IHasExtraProperties` via `BsonClassMap`. |
+| `AbpBsonSerializer.cs` | Helper that removes a pre-registered serializer (used in `AbpMongoDbModule`'s static ctor to remove the default `Guid` serializer before registering ABP's `GuidSerializer(GuidRepresentation.Standard)`). |
 | `AbpGuidCustomBsonTypeMapper.cs` | Maps `Guid` → `BsonBinaryData` with `GuidRepresentation.Standard`. |
-| `AbpMongoDbDateTimeSerializer.cs` | `IClock.Normalize` integration so `DateTime` columns honour UTC/Local mode. |
-| `AbpMongoModelBuilderConfigurationOptions.cs` | Carries the collection-name prefix and other model-wide options. |
-| `MongoDbContextHelper.cs` | Internal resolver utilities. |
+| `AbpMongoDbDateTimeSerializer.cs` | `IClock.Normalize` integration so `DateTime` properties honour the configured kind. |
+| `AbpMongoModelBuilderConfigurationOptions.cs` | Model-wide options such as the collection-name prefix. |
+| `AbpMongoDbOptions.cs` | Global options for the MongoDB integration (collection-prefix, default class map conventions). |
+| `MongoDbContextHelper.cs` | Internal resolver / cache utilities. |
 | `MongoDbAsyncQueryableProvider.cs` | Bridges `IMongoQueryable<T>` to ABP's `IAsyncQueryableExecuter`. |
+| `AbpMongoDbContextExtensions.cs` | `Collection<TEntity>()` shortcut plus type-erased helpers. |
 
 ## `IMongoDbContextProvider<TMongoDbContext>`
 
@@ -185,7 +189,7 @@ Notable behaviour:
 - Soft delete & multi-tenant filtering is applied via `IMongoDbRepositoryFilterer<TEntity>` / `MongoDbRepositoryFilterer<TEntity>` (`Volo/Abp/Domain/Repositories/MongoDB/MongoDbRepositoryFilterer.cs`), which evaluates `IDataFilter<ISoftDelete>` / `IDataFilter<IMultiTenant>` and builds a `FilterDefinition<TEntity>`.
 - Bulk operations check for `IMongoDbBulkOperationProvider` (file `IMongoDbBulkOperationProvider.cs`) so you can plug in `MongoBulkWrite` providers.
 
-`MongoDbCoreRepositoryExtensions.cs` exposes `ToMongoQueryable<TEntity>(this IReadOnlyRepository<TEntity>)` shortcut.
+`Volo/Abp/Domain/Repositories/MongoDbCoreRepositoryExtensions.cs` exposes a `ToMongoQueryable<TEntity>(this IReadOnlyRepository<TEntity>)` shortcut and other casts to the underlying MongoDB driver.
 
 ## Transactions
 

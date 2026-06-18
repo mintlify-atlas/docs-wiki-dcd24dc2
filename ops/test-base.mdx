@@ -1,7 +1,7 @@
 ---
 title: "Volo.Abp.TestBase and Volo.Abp.AspNetCore.TestBase"
 sidebarTitle: "Test Base"
-description: "AbpIntegratedTest<TStartupModule>, AbpAsyncIntegratedTest, AbpAspNetCoreIntegratedTestBase and AbpWebApplicationFactoryIntegratedTest — the building blocks every *.Tests project in abpframework/abp inherits from."
+description: "AbpIntegratedTest, AbpAsyncIntegratedTest, AbpAspNetCoreIntegratedTestBase and AbpWebApplicationFactoryIntegratedTest — the four base classes every *.Tests project in abpframework/abp inherits from."
 ---
 
 Every `*.Tests` project in the framework, modules and templates inherits — directly or transitively — from one of four classes shipped by `framework/src/Volo.Abp.TestBase/` and `framework/src/Volo.Abp.AspNetCore.TestBase/`. They handle ABP container bootstrap, `IServiceCollection` overrides for the in-memory event bus / SQLite providers, and (for the ASP.NET Core variants) wiring `TestServer` into the dynamic client-proxy `HttpClientFactory`. This page documents each base class and shows the override hooks `test-all.ps1` ultimately exercises.

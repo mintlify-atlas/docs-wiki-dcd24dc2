@@ -122,7 +122,7 @@ Device-code is the path the login error handler nudges users toward when the ser
 
 Before sending credentials, `LoginCommand.HasMultipleOrganizationAndThisNotSpecified` calls `AuthService.CheckMultipleOrganizationsAsync`, which hits:
 
-```
+```text
 GET https://account.abp.io/api/license/check-multiple-organizations?username=<target>
 ```
 

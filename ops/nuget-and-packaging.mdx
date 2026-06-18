@@ -94,7 +94,7 @@ If you fork ABP and want per-package READMEs, add a `<PackageReadmeFile>` overri
     "releaseDate": "",
     "type": "stable",
     "message": "",
-    "leptonx": { "version": "5.0.5" }
+    "leptonx": { "version": "5.0.3" }
   }
   // …more entries, newest first
 ]
@@ -117,14 +117,14 @@ When cutting a new release, prepend an entry to this file (and ensure `leptonx.v
 
 ## `nupkg/` — the working directory
 
-```
+```text
 nupkg/
 ├── common.ps1            ← helpers + $solutions + $projects (~400 entries)
 ├── common.ps1.bak        ← backup snapshot
 ├── pack.ps1              ← dotnet pack every project, move .nupkg here
 ├── push_packages.ps1     ← dotnet nuget push every *.nupkg to nuget.org
 ├── push-nightly-packages-myget.ps1  ← legacy MyGet helper
-└── unit_test.ps1         ← `dotnet test --logger trx` per solution (rarely used)
+└── unit_test.ps1         ← dotnet test --logger trx per solution (rarely used)
 ```
 
 When `pack.ps1` finishes, this folder contains hundreds of `*.nupkg` files (e.g. `Volo.Abp.Core.10.2.0-rc.3.nupkg`). They stay here through step 3 (push) so failed pushes can be retried.

@@ -217,14 +217,14 @@ Used by the Tenant Management module to validate a connection string before savi
 
 | Package | Implementation | Strategy |
 | --- | --- | --- |
-| `Volo.Abp.EntityFrameworkCore.SqlServer` | `SqlServerConnectionStringChecker` | Opens against `master`, `ChangeDatabaseAsync(original)`. `ConnectTimeout = 1`. |
-| `Volo.Abp.EntityFrameworkCore.PostgreSql` | `NpgsqlConnectionStringChecker` | Similar approach using `template1`. |
-| `Volo.Abp.EntityFrameworkCore.MySQL` | `MySQLConnectionStringChecker` | Opens with `information_schema`. |
-| `Volo.Abp.EntityFrameworkCore.MySQL.Pomelo` | `PomeloMySQLConnectionStringChecker` | Same. |
-| `Volo.Abp.EntityFrameworkCore.Sqlite` | `SqliteConnectionStringChecker` | Opens the file (creates if missing). |
-| `Volo.Abp.EntityFrameworkCore.Oracle` | `OracleConnectionStringChecker` | Opens the service. |
-| `Volo.Abp.EntityFrameworkCore.Oracle.Devart` | `OracleDevartConnectionStringChecker` | Same via Devart driver. |
-| `Volo.Abp.MongoDB` | `MongoDBConnectionStringChecker` | `MongoClient.ListDatabaseNamesAsync`. |
+| `Volo.Abp.EntityFrameworkCore.SqlServer` | `SqlServerConnectionStringChecker` | Sets `ConnectTimeout = 1`, swaps `InitialCatalog` to `master` to open, then `ChangeDatabaseAsync(originalDatabaseName)` to set `DatabaseExists`. |
+| `Volo.Abp.EntityFrameworkCore.PostgreSql` | `NpgsqlConnectionStringChecker` | Sets `Timeout = 1`, swaps `Database` to `postgres` to open, then `ChangeDatabaseAsync(originalDatabaseName)`. |
+| `Volo.Abp.EntityFrameworkCore.MySQL` | `MySQLConnectionStringChecker` | Opens a `MySQLConnection` directly against the target database. |
+| `Volo.Abp.EntityFrameworkCore.MySQL.Pomelo` | `PomeloMySQLConnectionStringChecker` | Opens a `MySqlConnection` (Pomelo) directly against the target database. |
+| `Volo.Abp.EntityFrameworkCore.Sqlite` | `SqliteConnectionStringChecker` | Opens the file via `SqliteConnection.OpenAsync` (creates an empty database if missing — SQLite always reports `DatabaseExists = true` on success). |
+| `Volo.Abp.EntityFrameworkCore.Oracle` | `OracleConnectionStringChecker` | Opens an `OracleConnection` (Oracle.ManagedDataAccess) and reports the open state. |
+| `Volo.Abp.EntityFrameworkCore.Oracle.Devart` | `OracleDevartConnectionStringChecker` | Opens via the Devart `OracleConnection`. |
+| `Volo.Abp.MongoDB` | `MongoDBConnectionStringChecker` | Parses `MongoUrl.Create(...)` and calls `client.GetDatabase(mongoUrl.DatabaseName)`. The check succeeds if construction does not throw — there is no I/O round-trip. |
 
 All providers register their checker with `[Dependency(ReplaceServices = true)]`, so referencing the dialect package automatically swaps the implementation.
 

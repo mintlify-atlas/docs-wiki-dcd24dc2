@@ -200,30 +200,44 @@ with its default value. See [Object Extending](/ddd/object-extending).
 
 ## Multi-tenancy auto-stamping
 
-Both `Entity..ctor()` and `Entity<TKey>..ctor(TKey)` call
-`EntityHelper.TrySetTenantId(this)`. That helper inspects the runtime type
-for `IMultiTenant` and, if present, resolves `ICurrentTenant.Id` from the
-ambient DI scope to stamp the new entity.
+Both `Entity..ctor()` and `Entity<TKey>..ctor(TKey)` end up running the
+parameterless base `Entity()` constructor, which calls
+`EntityHelper.TrySetTenantId(this)`. That helper inspects the runtime type for
+`IMultiTenant` and, if present, reads the current tenant straight from the
+ambient `AsyncLocal` accessor (no DI lookup):
+
+```csharp
+public static void TrySetTenantId(IEntity entity)
+{
+    if (entity is not IMultiTenant multiTenantEntity) return;
+
+    var tenantId = AsyncLocalCurrentTenantAccessor.Instance.Current?.TenantId;
+    if (tenantId == multiTenantEntity.TenantId) return;
+
+    ObjectHelper.TrySetProperty(multiTenantEntity, x => x.TenantId, () => tenantId);
+}
+```
 
 ```mermaid
 sequenceDiagram
     actor Caller as ProductManager.CreateAsync
     participant Ent as new Product(...)
     participant Helper as EntityHelper.TrySetTenantId
-    participant CT as ICurrentTenant
+    participant ALC as AsyncLocalCurrentTenantAccessor
 
     Caller->>Ent: ctor()
     Ent->>Helper: TrySetTenantId(this)
-    Helper->>CT: get Id
-    CT-->>Helper: 11111111-1111-...
+    Helper->>ALC: Instance.Current?.TenantId
+    ALC-->>Helper: 11111111-1111-...
     Helper-->>Ent: this.TenantId = ...
 ```
 
 <Warning>
-The helper resolves `ICurrentTenant` from `DefaultServiceProvider`, which is
-the **root** provider. The current `ICurrentTenant` is an `AsyncLocal`-backed
-service, so this works only inside an active scope. Construct entities
-inside a request / domain-service method, not from a singleton constructor.
+`AsyncLocalCurrentTenantAccessor.Instance.Current` is the same `AsyncLocal`
+that `ICurrentTenant.Change(...)` writes into. Construct multi-tenant entities
+inside an active request or a `using (CurrentTenant.Change(...))` scope —
+constructing them from a singleton without an ambient tenant scope leaves
+`TenantId` at its default (`null`).
 </Warning>
 
 ## Domain event lifecycle
@@ -333,7 +347,7 @@ including UI, validation and definition providers.
 For an entity implementing `IMultiTenant, ISoftDelete`, EF Core / Mongo
 applies a global query filter:
 
-```
+```sql
 WHERE TenantId = @currentTenantId AND IsDeleted = 0
 ```
 

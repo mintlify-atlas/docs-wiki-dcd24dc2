@@ -166,10 +166,11 @@ count to a non-list response (e.g. a dashboard summary DTO).
 public interface IApplicationService : IRemoteService { }
 ```
 
-`IRemoteService` (in `Volo.Abp.Http.Abstractions`) is what causes
-application services to be auto-exposed as HTTP API endpoints by ABP's
-`AspNetCoreMvcConventionalControllerBuilder` — see
-[MVC Integration](/aspnetcore/mvc-integration).
+`IRemoteService` (in `framework/src/Volo.Abp.Core/Volo/Abp/IRemoteService.cs`)
+is the marker that causes application services to be auto-exposed as HTTP API
+endpoints by ABP's `AbpServiceConvention` /
+`ConventionalControllerFeatureProvider` pipeline in `Volo.Abp.AspNetCore.Mvc` —
+see [MVC Integration](/aspnetcore/mvc-integration).
 
 ### CRUD building blocks
 

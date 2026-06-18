@@ -6,8 +6,8 @@ description: "AbpComponentBase, ServiceProviderComponentActivator, AbpAuthentica
 
 Before drilling into Server, WebAssembly or MauiBlazor specifics, this page covers the **hosting-model-agnostic** Blazor layer that lives in three packages:
 
-- `Volo.Abp.AspNetCore.Components` — `AbpComponentBase`, the conventional registrar, dependency-injection plumbing.
-- `Volo.Abp.AspNetCore.Components.Web` — service abstractions used by every Blazor stack: cookies, local storage, UI messages, notifications, exception handling, claims cache, server URL provider.
+- `Volo.Abp.AspNetCore.Components` — `AbpComponentBase`, the conventional registrar, the DI-aware `ServiceProviderComponentActivator`, and the *contracts* for UI messages (`IUiMessageService`), notifications (`IUiNotificationService`), page progress (`IUiPageProgressService`), block-ui (`IBlockUiService`), user exception informing (`IUserExceptionInformer`), and alerts (`IAlertManager` / `AlertList` / `AlertMessage` / `AlertType`).
+- `Volo.Abp.AspNetCore.Components.Web` — host-side concretions: cookie/local-storage interop, default `SimpleUiMessageService`, `AbpBlockUiService`, the `UserExceptionInformer` implementation, the `AlertManager`, the claims cache, the configuration-cache reset contract, the server URL provider, and the `AbpAuthenticationState` host component.
 - `Volo.Abp.AspNetCore.Components.Web.Theming` — Blazor-side `ITheme` (returning a `Type`), `IComponentBundleManager`, `PageToolbar`, layout-hook component, `DynamicLayoutComponent`.
 
 Every Blazor app — whichever hosting model — depends on these (directly or transitively).
@@ -129,25 +129,26 @@ Key idioms an agent must know:
 
 Because every component owns its own scope, calling `await SomeAppService.DoAsync()` from an event handler captures *that* component's scope. Don't share the same `IRepository<T>` instance across components — each must resolve its own from `LazyGetRequiredService`.
 
-## Components.Web service surface
+## Component services — contracts in Components, hosts in Components.Web
 
-Inside `framework/src/Volo.Abp.AspNetCore.Components.Web/`:
+The **interfaces** (and their event-args / options) ship in `Volo.Abp.AspNetCore.Components` so `AbpComponentBase` itself can reference them without dragging in any host-specific code. The **implementations** ship in `Volo.Abp.AspNetCore.Components.Web`. Blazorise theme then replaces a subset (see `/ui/blazorise-ui`).
 
-| Service | File | Notes |
-| --- | --- | --- |
-| `IUiMessageService` / `SimpleUiMessageService` | `Messages/` | `Info/Success/Warning/Error/Confirm`. Default implementation raises a `MessageReceived` event; Blazorise theme provides `BlazoriseUiMessageService` which renders a modal. |
-| `IUiNotificationService` | `Notifications/` | Toast-style notifications. Same event pattern; Blazorise replaces it. |
-| `IUiPageProgressService` | `Progression/` | Page-top progress bar. |
-| `IBlockUiService` | `BlockUi/` | Modal "blocking" overlay. |
-| `IUserExceptionInformer` | `ExceptionHandling/` | Pretty-prints `AbpException`/`BusinessException`/`UserFriendlyException` through `Message` service. The `AbpExceptionHandlingLogger` plumbs unhandled logger events into this on the WASM side. |
-| `IAlertManager` | `Alerts/` | Same `AlertList` model as MVC, surfaced on `AbpComponentBase.Alerts`. |
-| `ICookieService` / `CookieService` | `CookieService.cs` | JS-interop wrapper around `abp.utils.{set,get,delete}Cookie`. |
-| `ILocalStorageService` / `LocalStorageService` | `LocalStorageService.cs` | `localStorage.getItem`/`setItem` interop. |
-| `IServerUrlProvider` / `DefaultServerUrlProvider` | `DefaultServerUrlProvider.cs` | Resolves the API root URL (overridden per stack). |
-| `IAbpUtilsService` / `AbpUtilsService` | `AbpUtilsService.cs` | Misc JS helpers (e.g. adding `rtl` class to `<body>`). |
-| `AbpComponentsClaimsCache` | `Security/AbpComponentsClaimsCache.cs` | Caches the current principal claims; refreshed when configuration changes. |
-| `ICurrentApplicationConfigurationCacheResetService` | `Configuration/` | Trigger to flush the cached `ApplicationConfigurationDto` — drives auth refresh + menu refresh. |
-| `IApplicationConfigurationChangedService` | `Security/ApplicationConfigurationChangedService.cs` | Fan-out event; components subscribe to re-render when settings/permissions change. |
+| Service | Contract file | Default impl | Notes |
+| --- | --- | --- | --- |
+| `IUiMessageService` | `Volo.Abp.AspNetCore.Components/Messages/IUiMessageService.cs` | `Volo.Abp.AspNetCore.Components.Web/Messages/SimpleUiMessageService.cs` | `Info/Success/Warn/Error/Confirm`. Default raises `MessageReceived`; `BlazoriseUiMessageService` re-replaces with a modal-rendering version. |
+| `IUiNotificationService` | `Volo.Abp.AspNetCore.Components/Notifications/IUiNotificationService.cs` | (Blazorise provides `BlazoriseUiNotificationService`; otherwise `NullUiNotificationService`) | Toast-style notifications. |
+| `IUiPageProgressService` | `Volo.Abp.AspNetCore.Components/Progression/IUiPageProgressService.cs` | (Blazorise provides `BlazoriseUiPageProgressService`; otherwise `NullUiPageProgressService`) | Page-top progress bar. Called by the WASM/MauiBlazor HTTP message handlers during `SendAsync`. |
+| `IBlockUiService` | `Volo.Abp.AspNetCore.Components/BlockUi/IBlockUiService.cs` | `Volo.Abp.AspNetCore.Components.Web/BlockUi/AbpBlockUiService.cs` | Modal "blocking" overlay. |
+| `IUserExceptionInformer` | `Volo.Abp.AspNetCore.Components/ExceptionHandling/IUserExceptionInformer.cs` | `Volo.Abp.AspNetCore.Components.Web/ExceptionHandling/UserExceptionInformer.cs` | Pretty-prints `AbpException`/`BusinessException`/`UserFriendlyException` through the `Message` service. `AbpExceptionHandlingLogger` plumbs unhandled logger events into this on the WASM side. |
+| `IAlertManager` / `AlertList` / `AlertMessage` / `AlertType` | `Volo.Abp.AspNetCore.Components/Alerts/` | `Volo.Abp.AspNetCore.Components.Web/Alerts/AlertManager.cs` | Same `AlertList` model as MVC, surfaced on `AbpComponentBase.Alerts`. |
+| `ICookieService` / `CookieService` | `Volo.Abp.AspNetCore.Components.Web/ICookieService.cs` / `CookieService.cs` | (same package) | JS-interop wrapper around `abp.utils.{set,get,delete}Cookie`. |
+| `ILocalStorageService` / `LocalStorageService` | `Volo.Abp.AspNetCore.Components.Web/ILocalStorageService.cs` / `LocalStorageService.cs` | (same package) | `localStorage.getItem`/`setItem` interop. |
+| `IServerUrlProvider` / `DefaultServerUrlProvider` | `Volo.Abp.AspNetCore.Components.Web/IServerUrlProvider.cs` / `DefaultServerUrlProvider.cs` | (same package) | Resolves the API root URL (overridden per stack — `WebAssemblyServerUrlProvider`, `MauiBlazorServerUrlProvider`). |
+| `IAbpUtilsService` / `AbpUtilsService` | `Volo.Abp.AspNetCore.Components.Web/IAbpUtilsService.cs` / `AbpUtilsService.cs` | (same package) | Misc JS helpers (e.g. `AddClassToTagAsync("body", "rtl")`). |
+| `AbpComponentsClaimsCache` | `Volo.Abp.AspNetCore.Components.Web/Security/AbpComponentsClaimsCache.cs` | (same package) | Caches the current principal claims; refreshed when configuration changes. |
+| `ICurrentApplicationConfigurationCacheResetService` | `Volo.Abp.AspNetCore.Components.Web/Configuration/ICurrentApplicationConfigurationCacheResetService.cs` | `NullCurrentApplicationConfigurationCacheResetService` (per-stack replacements: `BlazorServerCurrentApplicationConfigurationCacheResetService`, `BlazorWebAssemblyCurrentApplicationConfigurationCacheResetService`, `MauiCurrentApplicationConfigurationCacheResetService`) | Trigger to flush the cached `ApplicationConfigurationDto` — drives auth refresh + menu refresh. |
+| `ApplicationConfigurationChangedService` | `Volo.Abp.AspNetCore.Components.Web/Security/ApplicationConfigurationChangedService.cs` | (same package) | Fan-out event; components subscribe to re-render when settings/permissions change. |
+| `AbpExceptionHandlingLogger` / `AbpExceptionHandlingLoggerProvider` | `Volo.Abp.AspNetCore.Components.Web/ExceptionHandling/` | (same package) | `ILoggerProvider` that routes unhandled exceptions into `IUserExceptionInformer`. Plugged into the WASM host logger in `AbpAspNetCoreComponentsWebAssemblyModule.ConfigureServices`. |
 
 ### `AbpAuthenticationState`
 

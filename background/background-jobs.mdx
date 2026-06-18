@@ -68,24 +68,36 @@ The framework registers `NullBackgroundJobManager` by default in the abstraction
 
 ### `DefaultBackgroundJobManager`
 
-`framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/DefaultBackgroundJobManager.cs` is the in-process implementation. Its `EnqueueAsync<TArgs>` builds a `BackgroundJobInfo`:
+`framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/DefaultBackgroundJobManager.cs` is the in-process implementation. The public `EnqueueAsync<TArgs>` resolves the job name and then delegates to a protected `EnqueueAsync(string, object, ...)` overload that builds a `BackgroundJobInfo`:
 
 ```csharp
-var jobInfo = new BackgroundJobInfo
+public virtual async Task<string> EnqueueAsync<TArgs>(
+    TArgs args, BackgroundJobPriority priority = BackgroundJobPriority.Normal, TimeSpan? delay = null)
 {
-    Id              = GuidGenerator.Create(),
-    ApplicationName = BackgroundJobWorkerOptions.Value.ApplicationName,
-    JobName         = jobName,                  // typically args type FullName
-    JobArgs         = Serializer.Serialize(args),
-    Priority        = priority,
-    CreationTime    = Clock.Now,
-    NextTryTime     = Clock.Now
-};
+    var jobName = BackgroundJobOptions.Value.GetBackgroundJobName(typeof(TArgs));
+    var jobId = await EnqueueAsync(jobName, args!, priority, delay);
+    return jobId.ToString();
+}
 
-if (delay.HasValue) jobInfo.NextTryTime = Clock.Now.Add(delay.Value);
+protected virtual async Task<Guid> EnqueueAsync(
+    string jobName, object args, BackgroundJobPriority priority = BackgroundJobPriority.Normal, TimeSpan? delay = null)
+{
+    var jobInfo = new BackgroundJobInfo
+    {
+        Id              = GuidGenerator.Create(),
+        ApplicationName = BackgroundJobWorkerOptions.Value.ApplicationName,
+        JobName         = jobName,                  // typically args type FullName
+        JobArgs         = Serializer.Serialize(args),
+        Priority        = priority,
+        CreationTime    = Clock.Now,
+        NextTryTime     = Clock.Now
+    };
 
-await Store.InsertAsync(jobInfo);
-return jobInfo.Id;
+    if (delay.HasValue) jobInfo.NextTryTime = Clock.Now.Add(delay.Value);
+
+    await Store.InsertAsync(jobInfo);
+    return jobInfo.Id;
+}
 ```
 
 Key invariants encoded here:

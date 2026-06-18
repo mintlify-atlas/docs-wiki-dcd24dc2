@@ -81,7 +81,7 @@ public virtual string Calculate(BlobProviderArgs args)
 
 Result is used as the **blob name** inside the Azure container — i.e. the path under the container. Every multi-tenant container therefore lays out:
 
-```
+```text
 {azure-container}/host/<blob>                                 ← when running outside a tenant
 {azure-container}/tenants/{tenantId:D}/<blob>                 ← within a tenant
 ```

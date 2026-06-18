@@ -195,7 +195,7 @@ ABP's distributed event bus serialises events as ETOs. The base types live in
 Concrete ETOs for Identity sit alongside the constants — they are part of
 Domain.Shared because *subscribers in other services* must deserialise them:
 
-```
+```text
 modules/identity/src/Volo.Abp.Identity.Domain.Shared/Volo/Abp/Identity/
 ├── IdentityClaimTypeEto.cs
 ├── IdentityRoleEto.cs
@@ -270,7 +270,7 @@ certainly need a new constant or an enum instead.
 
 When creating `MyCompany.MyModule.Domain.Shared`:
 
-```
+```text
 MyCompany.MyModule.Domain.Shared/
 └── MyCompany/MyModule/
     ├── MyModuleDomainSharedModule.cs         # AbpModule, DependsOn(AbpDddDomainSharedModule)

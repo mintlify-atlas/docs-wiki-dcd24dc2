@@ -70,9 +70,9 @@ The connection-strings editor calls four endpoints:
 
 ## Generated proxies
 
-`packages/tenant-management/proxy/src/lib/`:
+`packages/tenant-management/proxy/src/lib/proxy/`:
 
-```
+```text
 tenant.service.ts        # Volo.Abp.TenantManagement.TenantAppService
 models.ts                # TenantDto, GetTenantsInput, TenantCreateDto, TenantUpdateDto,
                          # TenantConnectionStringInfoDto, etc.
@@ -178,7 +178,7 @@ Use it with `ReplaceableComponentsService.add({ key, component })` to swap the p
 
 ## DTOs cheat-sheet
 
-From `packages/tenant-management/proxy/src/lib/models.ts`:
+From `packages/tenant-management/proxy/src/lib/proxy/models.ts`:
 
 | DTO | Used for |
 | --- | --- |

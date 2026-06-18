@@ -14,23 +14,24 @@ This page is the map. It enumerates every template directory, what `abp new -t <
 
 ## The templates directory
 
-```
+```text
 templates/
 ├── app/                    # Layered DDD web application
 │   ├── aspnet-core/
-│   │   ├── src/            # 22 projects (Domain.Shared … Blazor.WebApp.Tiered.Client)
+│   │   ├── src/            # 22 projects (Domain.Shared ... Blazor.WebApp.Tiered.Client)
 │   │   └── test/           # 7 test projects
 │   └── angular/            # Standalone Angular workspace (Lepton X + ng-packs)
 ├── app-nolayers/           # Single-project "no-layers" web app
-│   ├── aspnet-core/        # 7 host variants (MVC, Blazor, Blazor.WebAssembly × {EF, Mongo})
+│   ├── aspnet-core/        # 10 csproj: Mvc, Mvc.Mongo, Blazor.Server, Blazor.Server.Mongo,
+│   │                       # Host, Host.Mongo, Blazor.WebAssembly/{Client,Server,Server.Mongo,Shared}
 │   └── angular/            # Angular workspace pointing at the no-layers Host
 ├── module/                 # Reusable module / NuGet-style package
 │   ├── aspnet-core/
-│   │   ├── src/            # 14 module projects (Domain.Shared … Blazor.WebAssembly.Bundling, Installer)
-│   │   ├── host/           # 8 dev/test host variants (Web.Unified, HttpApi.Host, Blazor.Host, AuthServer …)
+│   │   ├── src/            # 14 module projects (Domain.Shared ... Blazor.WebAssembly.Bundling, Installer)
+│   │   ├── host/           # 8 dev/test host variants (Web.Unified, HttpApi.Host, Blazor.Host, AuthServer ...)
 │   │   └── test/           # 6 test projects
 │   └── angular/            # ng-packs library + dev-app
-├── console/src/            # Single-project console host using AbpApplicationFactory
+├── console/src/            # Single-project console host using IHostBuilder + AddApplicationAsync
 ├── maui/src/               # .NET MAUI multi-platform app
 ├── wpf/src/                # WPF desktop app
 ├── Directory.Packages.props
@@ -98,7 +99,7 @@ The deep-dive pages enumerate every project per template; this table summarises 
 | Template | ASP.NET Core projects | Test projects | UI | Notes |
 | --- | --- | --- | --- | --- |
 | `app` | 22 (`Domain.Shared`, `Domain`, `Application.Contracts`, `Application`, `HttpApi`, `HttpApi.Client`, `EntityFrameworkCore`, `MongoDB`, `DbMigrator`, `AuthServer`, `Web`, `Web.Host`, `HttpApi.Host`, `HttpApi.HostWithIds`, `Blazor`, `Blazor.Client`, `Blazor.Server`, `Blazor.Server.Tiered`, `Blazor.WebApp`, `Blazor.WebApp.Client`, `Blazor.WebApp.Tiered`, `Blazor.WebApp.Tiered.Client`) | 7 | MVC / Blazor Server / Blazor WASM / Blazor WebApp / Angular | Full DDD layering, OpenIddict in `AuthServer`, `DbMigrator` is a console host that runs `MyProjectNameDbMigrationService` |
-| `app-nolayers` | 7 hosts (`Mvc`, `Mvc.Mongo`, `Blazor.Server`, `Blazor.Server.Mongo`, `Blazor.WebAssembly/Server`, `Blazor.WebAssembly/Server.Mongo`, `Host`, `Host.Mongo`) | none | MVC / Blazor Server / Blazor WASM | Single executable per host; `MyProjectNameModule.cs` depends directly on Account / Identity / OpenIddict modules; `--migrate-database` arg replaces `DbMigrator` |
+| `app-nolayers` | 10 csproj — 8 hosts (`Mvc`, `Mvc.Mongo`, `Blazor.Server`, `Blazor.Server.Mongo`, `Blazor.WebAssembly/Server`, `Blazor.WebAssembly/Server.Mongo`, `Host`, `Host.Mongo`) + WASM `Blazor.WebAssembly/Client` and `Blazor.WebAssembly/Shared` | none | MVC / Blazor Server / Blazor WASM | Single executable per host; `MyProjectNameModule.cs` depends directly on Account / Identity / OpenIddict modules; `--migrate-database` arg replaces `DbMigrator` |
 | `module` | 14 lib (`Domain.Shared`, `Domain`, `Application.Contracts`, `Application`, `HttpApi`, `HttpApi.Client`, `Web`, `Blazor`, `Blazor.Server`, `Blazor.WebAssembly`, `Blazor.WebAssembly.Bundling`, `EntityFrameworkCore`, `MongoDB`, `Installer`) + 8 host shells (`AuthServer`, `HttpApi.Host`, `Web.Host`, `Web.Unified`, `Blazor.Host`, `Blazor.Host.Client`, `Blazor.Server.Host`, `Host.Shared`) | 6 | MVC / Blazor (in host shells only) | Hosts are *only* there for dev / e2e; the lib projects are the deliverable |
 | `console` | 1 (`MyCompanyName.MyProjectName`) | none | Console | Uses `Host.CreateApplicationBuilder` + `AddApplicationAsync<MyProjectNameModule>` |
 | `maui` | 1 (`MyCompanyName.MyProjectName`) | none | MAUI | Uses `MauiApp.CreateBuilder().ConfigureContainer(new AbpAutofacServiceProviderFactory(...))` |

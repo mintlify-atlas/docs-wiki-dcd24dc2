@@ -257,6 +257,24 @@ When you call `AddHttpClientProxies(assembly, "MyService")`:
 | Validation | Runs client-side via the chained `ValidationInterceptor` before the HTTP call |
 | Cookies | Disabled on the primary handler except on Blazor WASM (`BROWSER` OS platform) |
 
+## Reference: shipped abstractions
+
+These are the interfaces declared by `Volo.Abp.Http.Client` (proxying-related). Replace any of them with `[Dependency(ReplaceServices = true)]` to customize behaviour.
+
+| Interface | Default implementation | Purpose |
+| --- | --- | --- |
+| `IHttpClientProxy<out TRemoteService>` | `HttpClientProxy<TRemoteService>` | Strongly-typed handle to a registered proxy. |
+| `IProxyHttpClientFactory` | `DefaultProxyHttpClientFactory` | Thin wrapper over `IHttpClientFactory` for `Create()` / `Create(name)`. |
+| `IApiDescriptionFinder` | `ApiDescriptionFinder` | Fetches `ApplicationApiDescriptionModel` from `/api/abp/api-definition` and resolves the action for an invocation. |
+| `IApiDescriptionCache` | `ApiDescriptionCache` | In-memory cache for the description models, keyed by base URL. |
+| `IClientProxyApiDescriptionFinder` | `ClientProxyApiDescriptionFinder` | Per-host static-proxy variant — looks up actions from a preloaded description model. |
+| `ICurrentApiVersionInfo` | `CurrentApiVersionInfo` (ambient `ApiVersionInfo`) | API version negotiated at request time. |
+| `IRemoteServiceHttpClientAuthenticator` | `NullRemoteServiceHttpClientAuthenticator` (replaced by `IdentityModelRemoteServiceHttpClientAuthenticator` when the IdentityModel module is added) | Adds credentials to the outgoing `HttpRequestMessage`. |
+| `IAbpAccessTokenProvider` | `NullAbpAccessTokenProvider` (replaced by `HttpContextAbpAccessTokenProvider` when the `IdentityModel.Web` module is added) | Returns the current access token (or `null`). |
+| `IObjectToQueryString<in TValue>` | per-type via `AbpHttpClientProxyingOptions.QueryStringConverts` | Serializes a parameter into the query string. |
+| `IObjectToFormData<in TValue>` | per-type via `AbpHttpClientProxyingOptions.FormDataConverts` | Serializes a parameter into form-data. |
+| `IObjectToPath<in TValue>` | per-type via the same options | Serializes a parameter into a path segment. |
+
 ## See also
 
 - [Remote services configuration](./remote-services) — where the `BaseUrl` comes from

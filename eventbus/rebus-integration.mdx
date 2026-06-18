@@ -95,15 +95,34 @@ PreConfigure<AbpRebusEventBusOptions>(options =>
 
 ## Publish path
 
-`RebusDistributedEventBus.PublishToEventBusAsync` either calls the user-supplied `AbpRebusEventBusOptions.Publish` callback or `IBus.Publish(eventData)`:
+`RebusDistributedEventBus.PublishToEventBusAsync` copies the current correlation id into Rebus headers and delegates to an internal `PublishAsync`, which either calls the user-supplied `AbpRebusEventBusOptions.Publish` callback or `IBus.Publish(eventData, headers)` after stamping a `Headers.MessageId`:
 
 ```csharp
-protected async override Task PublishToEventBusAsync(Type eventType, object eventData)
+protected override async Task PublishToEventBusAsync(Type eventType, object eventData)
+{
+    var headers = new Dictionary<string, string>();
+    if (CorrelationIdProvider.Get() != null)
+    {
+        headers.Add(EventBusConsts.CorrelationIdHeaderName, CorrelationIdProvider.Get()!);
+    }
+    await PublishAsync(eventType, eventData, headersArguments: headers);
+}
+
+protected virtual async Task PublishAsync(Type eventType, object eventData, Guid? eventId = null, Dictionary<string, string>? headersArguments = null)
 {
     if (AbpRebusEventBusOptions.Publish != null)
+    {
         await AbpRebusEventBusOptions.Publish(Rebus, eventType, eventData);
-    else
-        await Rebus.Publish(eventData);
+        return;
+    }
+
+    headersArguments ??= new Dictionary<string, string>();
+    if (!headersArguments.ContainsKey(Headers.MessageId))
+    {
+        headersArguments[Headers.MessageId] = (eventId ?? GuidGenerator.Create()).ToString("N");
+    }
+
+    await Rebus.Publish(eventData, headersArguments);
 }
 ```
 

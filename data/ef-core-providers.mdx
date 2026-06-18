@@ -19,11 +19,11 @@ Each EF Core dialect lives in its own NuGet package under `framework/src/`. Ever
 | `Volo.Abp.EntityFrameworkCore.PostgreSql` | `AbpEntityFrameworkCorePostgreSqlModule` | `UseNpgsql(Action<NpgsqlDbContextOptionsBuilder>?)` (also legacy `UsePostgreSql` marked `[Obsolete]`) | `Npgsql.EntityFrameworkCore.PostgreSQL` | `SequentialAsString` |
 | `Volo.Abp.EntityFrameworkCore.MySQL` | `AbpEntityFrameworkCoreMySQLModule` | `UseMySQL(Action<MySQLDbContextOptionsBuilder>?)` | `MySql.EntityFrameworkCore` (Oracle's) | `SequentialAsString` |
 | `Volo.Abp.EntityFrameworkCore.MySQL.Pomelo` | `AbpEntityFrameworkCoreMySQLPomeloModule` | `UseMySQL(Action<MySqlDbContextOptionsBuilder>?)` | `Pomelo.EntityFrameworkCore.MySql` | `SequentialAsString` |
-| `Volo.Abp.EntityFrameworkCore.Sqlite` | `AbpEntityFrameworkCoreSqliteModule` | `UseSqlite(Action<SqliteDbContextOptionsBuilder>?)` | `Microsoft.EntityFrameworkCore.Sqlite` | — (uses framework default) |
+| `Volo.Abp.EntityFrameworkCore.Sqlite` | `AbpEntityFrameworkCoreSqliteModule` | `UseSqlite(Action<SqliteDbContextOptionsBuilder>?)` | `Microsoft.EntityFrameworkCore.Sqlite` | — (Sqlite module does **not** set `DefaultSequentialGuidType`; framework default applies) |
 | `Volo.Abp.EntityFrameworkCore.Oracle` | `AbpEntityFrameworkCoreOracleModule` | `UseOracle(Action<OracleDbContextOptionsBuilder>?)` | `Oracle.EntityFrameworkCore` | `SequentialAsBinary` |
-| `Volo.Abp.EntityFrameworkCore.Oracle.Devart` | `AbpEntityFrameworkCoreOracleDevartModule` | `UseOracle(Action<Devart.Data.Oracle.Entity.OracleDbContextOptionsBuilder>?, bool useExistingConnectionIfAvailable)` | `Devart.Data.Oracle.EFCore` | `SequentialAsBinary` |
+| `Volo.Abp.EntityFrameworkCore.Oracle.Devart` | `AbpEntityFrameworkCoreOracleDevartModule` | `UseOracle(Action<OracleDbContextOptionsBuilder>? = null, bool useExistingConnectionIfAvailable = false)` (builder from `Devart.Data.Oracle.Entity`) | `Devart.Data.Oracle.EFCore` | `SequentialAsBinary` |
 
-Every dialect module looks essentially like:
+Every dialect module — except Sqlite, see below — looks essentially like the SQL Server one:
 
 ```csharp
 [DependsOn(typeof(AbpEntityFrameworkCoreModule))]
@@ -33,7 +33,10 @@ public class AbpEntityFrameworkCoreSqlServerModule : AbpModule
     {
         Configure<AbpSequentialGuidGeneratorOptions>(options =>
         {
-            options.DefaultSequentialGuidType ??= SequentialGuidType.SequentialAtEnd;
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAtEnd;
+            }
         });
         Configure<AbpEfCoreGlobalFilterOptions>(options =>
         {
@@ -43,13 +46,13 @@ public class AbpEntityFrameworkCoreSqlServerModule : AbpModule
 }
 ```
 
-The differences are: SQL Server uses `SequentialAtEnd` (matches `NEWSEQUENTIALID()`'s byte ordering); PostgreSQL/MySQL use `SequentialAsString` (text-ordered GUIDs sort well in `uuid` and `char(36)`); Oracle uses `SequentialAsBinary` (raw `RAW(16)` binary order).
+The differences are: SQL Server uses `SequentialAtEnd` (matches `NEWSEQUENTIALID()`'s byte ordering); PostgreSQL and both MySQL packages use `SequentialAsString` (text-ordered GUIDs sort well in `uuid` and `char(36)`); Oracle and Oracle.Devart use `SequentialAsBinary` (raw `RAW(16)` binary order). Sqlite does not configure `AbpSequentialGuidGeneratorOptions` at all — first match wins, so whichever dialect module is loaded sets the type. All seven dialect modules set `AbpEfCoreGlobalFilterOptions.UseDbFunction = true`.
 
 ## `UseSqlServer` (`Volo.Abp.EntityFrameworkCore.SqlServer`)
 
-`AbpDbContextOptionsSqlServerExtensions.UseSqlServer` simply calls `options.Configure(ctx => ctx.UseSqlServer(sqlServerOptionsAction))`. The inner `AbpDbContextConfigurationContextSqlServerExtensions.UseSqlServer` adds `UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery)` before applying the caller's options — split-query is the ABP default to avoid cartesian explosions with `Include`.
+`AbpDbContextOptionsSqlServerExtensions.UseSqlServer(options, action)` calls `options.Configure(ctx => ctx.UseSqlServer(action))`. The inner `AbpDbContextConfigurationContextSqlServerExtensions.UseSqlServer` checks `context.ExistingConnection` and chooses between `context.DbContextOptions.UseSqlServer(existingConnection, …)` and `…UseSqlServer(connectionString, …)`. In **both** branches it sets `optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery)` before invoking the caller-supplied `sqlServerOptionsAction` — split-query is the ABP default to avoid cartesian explosions with `Include` chains.
 
-`SqlServerConnectionStringChecker` (in `ConnectionStrings/`) opens a `SqlConnection` against the `master` database with `ConnectTimeout = 1`, then calls `ChangeDatabaseAsync(originalDatabaseName)` to verify both `Connected = true` and `DatabaseExists = true`. Registered with `[Dependency(ReplaceServices = true)]`.
+`SqlServerConnectionStringChecker` (in `ConnectionStrings/`) builds a `SqlConnectionStringBuilder` with `ConnectTimeout = 1`, swaps `InitialCatalog` to `master` to ensure the open succeeds even when the target catalog is missing, then `ChangeDatabaseAsync(oldDatabaseName)` to verify the catalog exists — setting `Connected = true` after open and `DatabaseExists = true` after the change. Registered with `[Dependency(ReplaceServices = true), ITransientDependency]`, so referencing the SqlServer package automatically swaps `DefaultConnectionStringChecker`.
 
 ## `UseNpgsql` (`Volo.Abp.EntityFrameworkCore.PostgreSql`)
 
@@ -62,7 +65,7 @@ public static void UseNpgsql(
 }
 ```
 
-`UsePostgreSql` exists as `[Obsolete("Use 'UseNpgsql(...)' method instead.")]`. The checker is `NpgsqlConnectionStringChecker`. `Microsoft/EntityFrameworkCore/AbpPostgreSqlModelBuilderExtensions.cs` adds helpers for case-insensitive collations.
+Both `UsePostgreSql(options, action)` and `UsePostgreSql<TDbContext>(options, action)` are kept as `[Obsolete("Use 'UseNpgsql(...)' method instead. This will be removed in future versions.")]` shims that forward to `context.UseNpgsql(...)`. `NpgsqlConnectionStringChecker` swaps the database to `postgres` (the always-present default catalog on a PostgreSQL server) with `Timeout = 1`, opens the connection, then calls `ChangeDatabaseAsync(oldDatabaseName)` to confirm the target database exists. `Microsoft/EntityFrameworkCore/AbpPostgreSqlModelBuilderExtensions.cs` exposes provider-specific model-builder helpers.
 
 ## `UseMySQL` (Oracle's driver — `Volo.Abp.EntityFrameworkCore.MySQL`)
 
@@ -85,12 +88,45 @@ public static void UseSqlite(
 }
 ```
 
+Sqlite is the odd module out — it has both `PreConfigureServices` and `ConfigureServices`:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<AbpSqliteOptions>(options =>
+    {
+        options.BusyTimeout = 5000;
+    });
+}
+
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpEfCoreGlobalFilterOptions>(options => { options.UseDbFunction = true; });
+
+    var sqliteOptions = context.Services.ExecutePreConfiguredActions<AbpSqliteOptions>();
+    if (sqliteOptions.BusyTimeout.HasValue)
+    {
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.ConfigureDefaultOnConfiguring((dbContext, dbContextOptionsBuilder) =>
+            {
+                if (dbContextOptionsBuilder.Options.Extensions.Any(e => e is SqliteOptionsExtension))
+                {
+                    dbContextOptionsBuilder.AddInterceptors(
+                        new SqliteBusyTimeoutSaveChangesInterceptor(sqliteOptions.BusyTimeout.Value));
+                }
+            }, overrideExisting: false);
+        });
+    }
+}
+```
+
 Extras specific to SQLite:
 
-- `AbpSqliteOptions.BusyTimeout` (milliseconds, default `5000`) — applied in `AbpEntityFrameworkCoreSqliteModule.ConfigureServices` by attaching a `SqliteBusyTimeoutSaveChangesInterceptor` to every `DbContext` that has a `SqliteOptionsExtension`.
-- `Sqlite/AbpUnitTestSqliteConnection.cs` — helper that keeps an in-memory SQLite connection open across tests.
-- `Interceptors/SqliteBusyTimeoutSaveChangesInterceptor.cs` — sets `PRAGMA busy_timeout` on the underlying connection.
-- Checker: `SqliteConnectionStringChecker`.
+- `AbpSqliteOptions.BusyTimeout` (milliseconds, default `5000`) — overridable in another module's `PreConfigureServices` via `PreConfigure<AbpSqliteOptions>`.
+- `Interceptors/SqliteBusyTimeoutSaveChangesInterceptor.cs` — `SaveChangesInterceptor` that issues `PRAGMA busy_timeout` on the underlying SQLite connection. Attached only to `DbContext`s that already carry a `SqliteOptionsExtension`.
+- `Sqlite/AbpUnitTestSqliteConnection.cs` — helper for unit tests that keeps a single `:memory:` SQLite connection open across the lifetime of a test fixture.
+- Checker: `SqliteConnectionStringChecker` — opens the file (or `:memory:`) via `SqliteConnection.OpenAsync`. SQLite creates the file if missing, so a successful open implies `Connected = true, DatabaseExists = true`.
 
 ## `UseOracle` (`Volo.Abp.EntityFrameworkCore.Oracle`)
 
@@ -99,16 +135,21 @@ Uses `Oracle.EntityFrameworkCore.Infrastructure.OracleDbContextOptionsBuilder`. 
 ## `UseOracle` (Devart — `Volo.Abp.EntityFrameworkCore.Oracle.Devart`)
 
 ```csharp
+using Devart.Data.Oracle.Entity;
+
 public static void UseOracle(
     [NotNull] this AbpDbContextOptions options,
-    Action<Devart.Data.Oracle.Entity.OracleDbContextOptionsBuilder>? oracleOptionsAction = null,
+    Action<OracleDbContextOptionsBuilder>? oracleOptionsAction = null,
     bool useExistingConnectionIfAvailable = false)
 {
-    options.Configure(context => context.UseOracle(oracleOptionsAction, useExistingConnectionIfAvailable));
+    options.Configure(context =>
+    {
+        context.UseOracle(oracleOptionsAction, useExistingConnectionIfAvailable);
+    });
 }
 ```
 
-Adds the `useExistingConnectionIfAvailable` flag — Devart can reuse an already-open `DbConnection` instead of opening a fresh one, useful when `AbpDbContextConfigurationContext.ExistingConnection` is set (e.g. in tests). Checker: `OracleDevartConnectionStringChecker`. The package also ships `Microsoft/EntityFrameworkCore/AbpOracleModelBuilderExtensions.cs` for Oracle-specific column type mapping.
+Adds the `useExistingConnectionIfAvailable` flag — Devart can reuse an already-open `DbConnection` instead of opening a fresh one, useful when `AbpDbContextConfigurationContext.ExistingConnection` is set (e.g. in tests that share a connection). Checker: `OracleDevartConnectionStringChecker`. The Devart package also ships `Microsoft/EntityFrameworkCore/AbpOracleModelBuilderExtensions.cs` for Oracle-specific column type mapping; the non-Devart `Volo.Abp.EntityFrameworkCore.Oracle` package does not ship a model-builder extensions file.
 
 ## Choosing a sequential GUID
 

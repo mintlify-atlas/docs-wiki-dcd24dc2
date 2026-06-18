@@ -135,7 +135,7 @@ Defined in `enums/view-modes.ts`. Drives the template `@switch`:
 
 ### `PermissionsService` (proxy)
 
-`packages/permission-management/proxy/src/lib/permissions.service.ts` is the generated wrapper around `Volo.Abp.PermissionManagement.HttpApi`. Key methods:
+`packages/permission-management/proxy/src/lib/proxy/permissions.service.ts` is the generated wrapper around `Volo.Abp.PermissionManagement.HttpApi`. Key methods:
 
 | Method | HTTP | Endpoint |
 | --- | --- | --- |
@@ -151,7 +151,7 @@ The `apiName` is `'AbpPermissionManagement'` — mapped to a URL via `Environmen
 
 ## DTOs
 
-`packages/permission-management/proxy/src/lib/models.ts` defines the canonical wire-types used by every theme/module that opens permissions:
+`packages/permission-management/proxy/src/lib/proxy/models.ts` defines the canonical wire-types used by every theme/module that opens permissions:
 
 | DTO | Purpose |
 | --- | --- |

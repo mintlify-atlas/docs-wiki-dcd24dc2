@@ -148,5 +148,5 @@ The trade-off: a 48-bit millisecond timestamp is *predictable*. If you need ungu
 ## Related
 
 - `/ddd/entities-and-aggregates` — how aggregates take their id through the constructor.
-- `/data/entity-framework-core` — `Volo.Abp.EntityFrameworkCore.{MySQL,Oracle,PostgreSql,SqlServer}` modules each `PreConfigure<AbpSequentialGuidGeneratorOptions>` for their flavour.
+- `/data/entity-framework-core` — `Volo.Abp.EntityFrameworkCore.MySQL`, `Volo.Abp.EntityFrameworkCore.Oracle`, `Volo.Abp.EntityFrameworkCore.PostgreSql`, and `Volo.Abp.EntityFrameworkCore.SqlServer` each `PreConfigure<AbpSequentialGuidGeneratorOptions>` for their flavour.
 - `/data/mongodb` — Mongo aggregates also use `IGuidGenerator`; ordering doesn't matter for `_id`, so any layout is fine.

@@ -134,7 +134,7 @@ internal static void AddCoreServices(this IServiceCollection services)
 
 ### `ConfigureServices` order
 
-`AbpApplicationBase.ConfigureServices()` (lines 304–392 in `AbpApplicationBase.cs`) enforces the canonical order:
+`AbpApplicationBase.ConfigureServices()` (the synchronous overload at ~line 307 in `AbpApplicationBase.cs`; the async sibling `ConfigureServicesAsync()` lives at ~line 214 with identical structure) enforces the canonical order:
 
 1. Construct a single `ServiceConfigurationContext` and assign it to every `AbpModule.ServiceConfigurationContext`.
 2. `IPreConfigureServices.PreConfigureServices(context)` on each module that implements it.
@@ -253,7 +253,7 @@ The generic `DisposeAction<T>` accepts a state parameter, enabling static lambda
 
 ## Telemetry
 
-`SetupTelemetryTrackingAsync()` (lines 145–195 of `AbpApplicationBase.cs`) opt-out reports a single activity via `Internal.Telemetry.ITelemetryService.AddActivityAsync(ActivityNameConsts.ApplicationRun)` only when:
+`SetupTelemetryTrackingAsync()` (defined alongside the sync `SetupTelemetryTracking()` at ~lines 157-195 of `AbpApplicationBase.cs`) opt-out reports a single activity via `Internal.Telemetry.ITelemetryService.AddActivityAsync(ActivityNameConsts.ApplicationRun)` only when:
 
 ```csharp
 return abpHostEnvironment.IsDevelopment()

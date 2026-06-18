@@ -144,17 +144,29 @@ The `Text` argument is a JSON string of the template variables — Aliyun render
 
 ## Replacing the sender
 
-If you need a custom request body (e.g. pass `OutId` for callback correlation), inherit `AliyunSmsSender`, override `SendAsync`, and register with `[Dependency(ReplaceServices = true)]`:
+Note: `AliyunSmsSender.SendAsync` is **not** declared `virtual` (only `CreateClient` is). To customize the request body — for example to pass `OutId` for callback correlation — implement `ISmsSender` directly (or shadow `SendAsync` with `new`) and register with `[Dependency(ReplaceServices = true)]`:
 
 ```csharp
 [Dependency(ReplaceServices = true)]
-public class MyAliyunSmsSender : AliyunSmsSender
+public class MyAliyunSmsSender : ISmsSender, ITransientDependency
 {
-    public MyAliyunSmsSender(IOptionsMonitor<AbpAliyunSmsOptions> o) : base(o) { }
+    protected AbpAliyunSmsOptions Options { get; }
 
-    public override async Task SendAsync(SmsMessage smsMessage)
+    public MyAliyunSmsSender(IOptionsMonitor<AbpAliyunSmsOptions> options)
     {
-        var client = CreateClient();
+        Options = options.CurrentValue;
+    }
+
+    public async Task SendAsync(SmsMessage smsMessage)
+    {
+        var client = new AlibabaCloud.SDK.Dysmsapi20170525.Client(
+            new AlibabaCloud.OpenApiClient.Models.Config
+            {
+                AccessKeyId     = Options.AccessKeyId,
+                AccessKeySecret = Options.AccessKeySecret,
+                Endpoint        = Options.EndPoint
+            });
+
         await client.SendSmsAsync(new AlibabaCloud.SDK.Dysmsapi20170525.Models.SendSmsRequest
         {
             PhoneNumbers  = smsMessage.PhoneNumber,
@@ -166,6 +178,8 @@ public class MyAliyunSmsSender : AliyunSmsSender
     }
 }
 ```
+
+If you only need to swap the `Client` (different credentials / endpoint), subclassing `AliyunSmsSender` and overriding `CreateClient` is sufficient — the inherited `SendAsync` then uses your client.
 
 ## See also
 

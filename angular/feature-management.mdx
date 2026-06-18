@@ -168,7 +168,7 @@ The `FreeTextInputDirective` reads the validator name on the `valueType` payload
 ```mermaid
 graph LR
   click[User clicks Save]
-  click --> diff[Compute UpdateFeatureDto[]]
+  click --> diff["Compute UpdateFeatureDto array"]
   diff --> http[FeaturesService.update]
   http --> backend[/api/feature-management/features]
   backend --> reload[Component reloads features]

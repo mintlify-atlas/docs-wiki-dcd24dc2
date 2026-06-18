@@ -11,11 +11,11 @@ The toggle state is stored at the application layer (`Volo.Abp.Data`). The trans
 
 | File | Type | Notes |
 | --- | --- | --- |
-| `IDataFilter.cs` | `IDataFilter` (non-generic) + `IDataFilter<TFilter>` | Methods `Enable()`, `Disable()`, `IsEnabled`. |
-| `DataFilter.cs` | `DataFilter : IDataFilter, ISingletonDependency` | Facade caching `IDataFilter<TFilter>` in `ConcurrentDictionary<Type, object>`. |
-| `DataFilter.cs` (cont.) | `DataFilter<TFilter> : IDataFilter<TFilter>` | Uses `AsyncLocal<DataFilterState>` so toggles never bleed across requests. |
-| `DataFilterState.cs` | `DataFilterState { bool IsEnabled }` | `Clone()` snapshots state when an async-flow boundary is crossed. |
-| `AbpDataFilterOptions.cs` | `AbpDataFilterOptions { DefaultStates : Dictionary<Type, DataFilterState> }` | Override the initial state of a filter. |
+| `IDataFilter.cs` | `IDataFilter<TFilter>` and `IDataFilter` | `IDataFilter<TFilter>` exposes `IDisposable Enable()`, `IDisposable Disable()`, `bool IsEnabled`. `IDataFilter` is the type-routed façade with `IDisposable Enable<TFilter>()`, `IDisposable Disable<TFilter>()`, `bool IsEnabled<TFilter>()`. |
+| `DataFilter.cs` | `DataFilter : IDataFilter, ISingletonDependency` | Façade — resolves `IDataFilter<TFilter>` from DI on first access and caches in a `ConcurrentDictionary<Type, object>`. |
+| `DataFilter.cs` (cont.) | `DataFilter<TFilter> : IDataFilter<TFilter>` (registered via `AddSingleton(typeof(IDataFilter<>), typeof(DataFilter<>))`) | State lives in `AsyncLocal<DataFilterState>`, lazy-initialized from `AbpDataFilterOptions.DefaultStates`. Toggles do not bleed across requests or `await` boundaries between scopes. |
+| `DataFilterState.cs` | `DataFilterState { bool IsEnabled }` | `Clone()` returns `new DataFilterState(IsEnabled)`; used when seeding the async-local from `DefaultStates`. |
+| `AbpDataFilterOptions.cs` | `AbpDataFilterOptions { DefaultStates : Dictionary<Type, DataFilterState> }` | Override the initial state of a filter. If absent, `EnsureInitialized()` falls back to `new DataFilterState(true)`. |
 
 Registration (in `AbpDataModule.ConfigureServices`):
 

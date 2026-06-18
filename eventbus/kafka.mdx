@@ -91,16 +91,26 @@ public void Initialize()
 }
 ```
 
-`IKafkaMessageConsumer.Create` returns a singleton-per-(topic,group,connection) consumer that runs `_consumer.Consume()` on a dedicated `Task`. Internally it uses `EnableAutoOffsetStore = false` and stores offsets after the handler returns, providing at-least-once semantics.
+`IKafkaMessageConsumerFactory.Create` returns a `KafkaMessageConsumer` bound to (topic, group, connection) that runs `_consumer.Consume()` on a dedicated `Task`. Combined with the inbox's `MessageId` deduplication this gives at-least-once delivery semantics.
 
 ## Publish path
 
 Producing is direct — there is no Kafka-specific publish overload, only the inherited `PublishToEventBusAsync`:
 
 ```csharp
-protected async override Task PublishToEventBusAsync(Type eventType, object eventData)
+protected override async Task PublishToEventBusAsync(Type eventType, object eventData)
 {
-    await PublishAsync(eventType, eventData, headers: null, headersArguments: null, correlationId: CorrelationIdProvider.Get());
+    var headers = new Headers
+    {
+        { "messageId", Encoding.UTF8.GetBytes(Guid.NewGuid().ToString("N")) }
+    };
+
+    if (CorrelationIdProvider.Get() != null)
+    {
+        headers.Add(EventBusConsts.CorrelationIdHeaderName, Encoding.UTF8.GetBytes(CorrelationIdProvider.Get()!));
+    }
+
+    await PublishAsync(AbpKafkaEventBusOptions.TopicName, eventType, eventData, headers);
 }
 ```
 

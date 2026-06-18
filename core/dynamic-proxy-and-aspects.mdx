@@ -230,7 +230,7 @@ sequenceDiagram
 
 The framework does **not** attach interceptors during boot for every class. Each cross-cutting feature module subscribes to the `OnRegistred` pipeline (see [Dependency injection](/core/dependency-injection)) and decides per-type. The relevant API is `services.OnRegistered(ctx => ctx.Interceptors.TryAdd<MyInterceptor>())`.
 
-The Castle Windsor (`Volo.Abp.Castle.Core`) and Autofac (`Volo.Abp.Autofac`) integrations replay this list during container build, picking the `ITypeList<IAbpInterceptor>` off each `IOnServiceRegistredContext` and wiring up Castle's `ProxyGenerationOptions` with `AbpAsyncDeterminationInterceptor<TInterceptor>` per entry.
+The Castle DynamicProxy bridge (`Volo.Abp.Castle.Core`, which depends only on `Castle.Core` and `Castle.Core.AsyncInterceptor` — there is no Windsor container involved) and the Autofac integration (`Volo.Abp.Autofac`) replay this list during container build, picking the `ITypeList<IAbpInterceptor>` off each `IOnServiceRegistredContext` and wiring up Castle's `ProxyGenerationOptions` with `AbpAsyncDeterminationInterceptor<TInterceptor>` per entry.
 
 `ServiceCollectionRegistrationActionExtensions.IsAbpClassInterceptorsDisabled(services)` and `services.DisableAbpClassInterceptors(selector)` provide global / selective opt-outs. The `[DisableAbpFeatures]` attribute (`framework/src/Volo.Abp.Core/Volo/Abp/DisableAbpFeaturesAttribute.cs`) with `DisableInterceptors = true` instructs the integration to skip class-proxy creation for that type.
 

@@ -154,32 +154,39 @@ public class ExtensionPropertyPolicyConfiguration
 
 ## Module wiring
 
-`AbpObjectExtendingModule` does very little — registry state is static. It registers `ExtensibleObjectValidator` as a contributor to the object validation pipeline:
+`AbpObjectExtendingModule` is intentionally empty — the registry state lives in the static `ObjectExtensionManager.Instance` singleton, so there are no DI services for the module to wire. It declares its dependency on the localization and validation abstractions so that the `ValidationResult` / `IStringLocalizer` types used by extension property validators are available:
 
 ```csharp
-[DependsOn(typeof(AbpValidationModule), typeof(AbpDataModule))]
+[DependsOn(
+    typeof(AbpLocalizationAbstractionsModule),
+    typeof(AbpValidationAbstractionsModule)
+    )]
 public class AbpObjectExtendingModule : AbpModule
 {
-    public override void ConfigureServices(ServiceConfigurationContext context)
-    {
-        Configure<AbpValidationOptions>(options =>
-        {
-            options.ObjectValidationContributors.Add<ExtensibleObjectValidator>();
-        });
-    }
+
 }
 ```
 
 ## Validation pipeline integration
 
-`ExtensibleObjectValidator` (in `ExtensibleObjectValidator.cs`) implements `IObjectValidationContributor`. For every object validated by `IObjectValidator` it:
+`ExtensibleObjectValidator` (in `ExtensibleObjectValidator.cs`) is a **static helper class**, not an `IObjectValidationContributor`. It is invoked from the `IValidatableObject.Validate(ValidationContext)` implementation on `ExtensibleObject` and on `AggregateRoot` / `AggregateRoot<TKey>`:
 
-1. Looks up the type in `ObjectExtensionManager.Instance.GetOrNull(type)`.
-2. For each registered property, builds an `ObjectExtensionPropertyValidationContext` containing the actual value from `ExtraProperties`.
-3. Runs each `Validator` action and each `Attribute` (via `ValidationAttribute.GetValidationResult`).
-4. Appends `ValidationResult` instances to the outer `ObjectValidationContext.Errors`.
+```csharp
+// ExtensibleObject.Validate / AggregateRoot.Validate
+public virtual IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+{
+    return ExtensibleObjectValidator.GetValidationErrors(this, validationContext);
+}
+```
 
-The validator runs alongside the standard `[Required]`-style validator chain registered by `Volo.Abp.Validation`, so MVC model binding, app-service interception, and manual `IObjectValidator.Validate` calls all enforce extension property rules consistently.
+`ExtensibleObjectValidator.GetValidationErrors` (and the related `CheckValue` / `IsValid` overloads):
+
+1. Looks up the runtime type in `ObjectExtensionManager.Instance.GetOrNull(type)`.
+2. For each registered `ObjectExtensionPropertyInfo`, builds an `ObjectExtensionPropertyValidationContext` containing the actual value from `ExtraProperties[name]`.
+3. Runs every registered `Validator` action and every `ValidationAttribute` (via `ValidationAttribute.GetValidationResult`).
+4. Returns a `List<ValidationResult>` that the caller's `Validate` implementation yields back to the validation pipeline.
+
+Because the framework's `MethodInvocationValidator` and MVC model binder both honour `IValidatableObject.Validate`, MVC model binding, app-service interception, and manual `IObjectValidator.Validate` calls all enforce extension property rules consistently — without any extra contributor registration.
 
 ## Mapping pipeline integration
 
@@ -199,9 +206,19 @@ sequenceDiagram
   Map-->>App: dto
 ```
 
-`MappingPropertyDefinitionChecks` is a flags enum (`None`, `Source`, `Destination`, `Both`). It tells the mapper whether the property must be registered on the source type, destination type, or both. Default is `Both` — both entity and DTO must register `"SocialSecurityNumber"` to participate.
+`MappingPropertyDefinitionChecks` is a `[Flags]` enum declared in `MappingPropertyDefinitionChecks.cs`:
 
-`ExtensibleObjectMapper` is a static helper invoked by ABP's AutoMapper module when the source/destination type both implement `IHasExtraProperties`. The default `AbpAutoMapperConfigurationContext.AddProfile<T>` extension registers the after-map action automatically.
+| Value | Meaning |
+| --- | --- |
+| `Null = 0` | Sentinel used by attributes to avoid nullable enum fields — treated the same as `Null`/unset by the mapper. |
+| `None = 1 << 0` | No check. Copy every extra property from source to destination. |
+| `Source = 1 << 1` | Copy only properties registered on the source type via `ObjectExtensionManager`. |
+| `Destination = 1 << 2` | Copy only properties registered on the destination type. |
+| `Both = Source \| Destination` | Property must be registered on **both** types to participate. |
+
+`MapExtraPropertiesAttribute.DefinitionChecks` defaults to `Null`. The most common explicit choice for cross-module mapping is `Both`, so each side has to opt in to receive an extra property.
+
+`ExtensibleObjectMapper` is the static helper that performs the copy. ABP's AutoMapper integration invokes it through `AbpAutoMapperExtensibleObjectExtensions.MapExtraProperties(...)` (an `IMappingExpression<TSource, TDestination>` extension) and the Mapperly provider invokes it from `MapperlyAutoObjectMappingProvider.TryMapExtraProperties` when the mapper class is annotated with `[MapExtraProperties]`.
 
 ## Persistence integration
 

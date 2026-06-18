@@ -66,7 +66,7 @@ The repository root is laid out as a meta-monorepo of dotnet solutions plus an A
 | --- | --- | --- |
 | `framework/src/` | 169 NuGet packages — the framework itself (Core, DDD, Data, AspNetCore.*, EventBus, BackgroundJobs, BlobStoring providers, Caching, MultiTenancy, Authorization, Cli, etc.). | [Repository layout](/overview/repository-layout) |
 | `framework/test/` | Test base assemblies plus per-package unit and integration test projects. | [TestBase](/ops/test-base) |
-| `modules/` | 19 pre-built application modules (Identity, Account, OpenIddict, IdentityServer, PermissionManagement, SettingManagement, FeatureManagement, TenantManagement, AuditLogging, BackgroundJobs, BlobStoring.Database, CmsKit, Blogging, Docs, Users, VirtualFileExplorer, BasicTheme, ClientSimulation). | [Application modules](/modules/overview) |
+| `modules/` | 18 pre-built application modules (`account`, `audit-logging`, `background-jobs`, `basic-theme`, `blob-storing-database`, `blogging`, `client-simulation`, `cms-kit`, `docs`, `feature-management`, `identity`, `identityserver`, `openiddict`, `permission-management`, `setting-management`, `tenant-management`, `users`, `virtual-file-explorer`). | [Application modules](/modules/overview) |
 | `templates/` | Solution templates (`app`, `app-nolayers`, `module`, `console`, `maui`, `wpf`) with `aspnet-core` and `angular` sub-trees. | [Solution templates](/templates/overview) |
 | `npm/ng-packs/` | Nx workspace producing `@abp/ng.*` Angular packages (core, account, identity, permission-management, …). | [Angular UI](/angular/overview) |
 | `npm/packs/` | Pure JS/CSS NPM packages bundled by the MVC UI. | [Bundling](/aspnetcore/mvc-ui-bundling) |
@@ -122,7 +122,7 @@ The repository root is laid out as a meta-monorepo of dotnet solutions plus an A
     UI navigation menus, MVC Razor pages, Blazor (Web/Server/WASM/MauiBlazor), Blazorise, MAUI client, minification.
   </Card>
   <Card title="Application Modules" icon="puzzle-piece" href="/modules/overview">
-    19 plug-in modules — Identity, Account, OpenIddict, CmsKit, Docs, Blogging and more.
+    18 plug-in modules — Identity, Account, OpenIddict, CmsKit, Docs, Blogging and more.
   </Card>
   <Card title="Angular UI" icon="angular" href="/angular/overview">
     `@abp/ng.*` packages under `npm/ng-packs/packages/` — core, account, identity, theme-shared, schematics.

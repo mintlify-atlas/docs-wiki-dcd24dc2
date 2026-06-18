@@ -196,7 +196,7 @@ protected CrudAppService(IRepository<TEntity, TKey> repository) : base(repositor
 | `MapToGetOutputDto(TEntity)` | Uses `ObjectMapper`. |
 | `MapToGetOutputDtoAsync(TEntity)` | Default returns synchronous `MapToGetOutputDto`. |
 | `MapToGetListOutputDto(TEntity)` | When `TGetListOutputDto == TGetOutputDto`, falls back to `MapToGetOutputDto`. |
-| `ApplyDefaultSorting(IQueryable)` | If `TEntity : IHasCreationTime`, orders by `CreationTime` descending. Otherwise sorts by `Id`. |
+| `ApplyDefaultSorting(IQueryable)` | If `TEntity : IHasCreationTime`, orders by `CreationTime` descending. Otherwise orders by `Id` descending. |
 | `ApplyPaging(IQueryable, TGetListInput)` | Honours `IPagedResultRequest.SkipCount` + `MaxResultCount`, capped by `LimitedResultRequestDto.MaxMaxResultCount`. |
 | `ApplySorting(IQueryable, TGetListInput)` | If `TGetListInput : ISortedResultRequest`, applies the `Sorting` string via Dynamic LINQ. |
 | `CreateFilteredQueryAsync(TGetListInput)` | Default returns the unfiltered queryable. **Override this to add `Where(...)` clauses.** |

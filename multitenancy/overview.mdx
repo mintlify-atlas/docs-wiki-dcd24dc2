@@ -74,10 +74,10 @@ Modules — for example Identity, Tenant Management, Audit Logging — gate thei
 
 | Type | Path | Notes |
 | --- | --- | --- |
-| `MultiTenancySides` | `.../AbpMultiTenancyOptions/MultiTenancySides.cs` | `Tenant=1`, `Host=2`, `Both=3`. `ICurrentTenant.GetMultiTenancySide()` returns `Tenant` when `Id != null`, otherwise `Host`. |
-| `MultiTenancyDatabaseStyle` | `.../MultiTenancyDatabaseStyle.cs` | `Shared`, `PerTenant`, `Hybrid` — the model behind `MultiTenantConnectionStringResolver`'s fallbacks. |
-| `TenantUserSharingStrategy` | `.../TenantUserSharingStrategy.cs` | `Isolated` (default) vs `Shared` — drives Identity module's user uniqueness rules. |
-| `IgnoreMultiTenancyAttribute` | `.../IgnoreMultiTenancyAttribute.cs` | Marker. Repositories check it on entities/DTOs to skip the `TenantId` query filter (e.g. `TenantConfigurationCacheItem`). |
+| `MultiTenancySides` | `Volo.Abp.MultiTenancy.Abstractions/.../MultiTenancySides.cs` | `[Flags]` byte enum: `Tenant = 1`, `Host = 2`, `Both = Tenant \| Host`. `ICurrentTenant.GetMultiTenancySide()` returns `Tenant` when `Id` has a value, otherwise `Host`. |
+| `MultiTenancyDatabaseStyle` | `Volo.Abp.MultiTenancy.Abstractions/.../MultiTenancyDatabaseStyle.cs` | `[Flags]` enum: `Shared = 1`, `PerTenant = 2`, `Hybrid = Shared \| PerTenant`. The model behind `MultiTenantConnectionStringResolver`'s fallbacks. |
+| `TenantUserSharingStrategy` | `Volo.Abp.MultiTenancy.Abstractions/.../TenantUserSharingStrategy.cs` | `Isolated = 0` (default) or `Shared = 1`. Drives Identity module's user-uniqueness rules. |
+| `IgnoreMultiTenancyAttribute` | `Volo.Abp.MultiTenancy.Abstractions/.../IgnoreMultiTenancyAttribute.cs` | Marker (`AttributeTargets.All`). Used by repositories to skip the `TenantId` query filter (e.g. `TenantConfigurationCacheItem` is `[IgnoreMultiTenancy]`). |
 
 ## `IMultiTenant` and the data filter
 
@@ -113,9 +113,10 @@ public static MultiTenancySides GetMultiTenancySide(this ClaimsPrincipal princip
 
 | Event | Path | Trigger |
 | --- | --- | --- |
-| `TenantChangedEvent` | `Abstractions/.../TenantChangedEvent.cs` | Published by local handlers (not by `CurrentTenant.Change` itself — by tenant *configuration* changes in the Tenant Management module's domain). |
-| `CreateTenantEto` | `Abstractions/.../CreateTenantEto.cs` | Distributed (`abp.multi_tenancy.create.tenant`). Tenant Management raises it after a successful `CreateAsync`. |
-| `TenantConnectionStringUpdatedEto` | `Abstractions/.../TenantConnectionStringUpdatedEto.cs` | Distributed (`abp.multi_tenancy.tenant.connection_string.updated`). Lets subscribers (e.g. background workers, schedulers) flush per-tenant caches when a connection string moves. |
+| `TenantChangedEvent` | `Abstractions/.../TenantChangedEvent.cs` | Local event. Published by `TenantManager.ChangeNameAsync` and by `TenantAppService.UpdateAsync` / `DeleteAsync`. `TenantConfigurationCacheItemInvalidator` handles it to evict the tenant from the cache. |
+| `TenantCreatedEto` | `Abstractions/.../TenantCreatedEto.cs` | Distributed (`abp.multi_tenancy.tenant.created`). `TenantAppService.CreateAsync` publishes it after the tenant row is committed. The `AdminEmail` / `AdminPassword` extras ride in `Properties`. |
+| `TenantConnectionStringUpdatedEto` | `Abstractions/.../TenantConnectionStringUpdatedEto.cs` | Distributed (`abp.multi_tenancy.tenant.connection_string.updated`). Carries `OldValue` / `NewValue` for a single named connection string. Subscribers (other API hosts, background workers) flush per-tenant caches when a connection string moves. |
+| `CreateTenantEto` | `Abstractions/.../CreateTenantEto.cs` | Distributed (`abp.multi_tenancy.create.tenant`). Defined for cross-host orchestration of tenant provisioning (e.g. a SaaS shell asking a tenancy host to create a tenant). Not published by Tenant Management itself. |
 
 ## Where to go next
 

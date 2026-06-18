@@ -306,7 +306,7 @@ You can reference more than one provider module — the coordinator chain just g
 | SkiaSharp + ImageSharp | SkiaSharp first for resize (last-registered wins); ImageSharp covers GIF/BMP/TIFF and compression. |
 | SkiaSharp + Magick.NET | SkiaSharp resizer for hot-path JPEG/PNG/WebP, Magick.NET for GIF & compression. |
 
-Because of the **reverse-iteration** rule, the **last module loaded** is asked first. Use `[DependsOn(...)]` ordering or `Configure<AbpImagingAbstractionsModule>` to tweak this if you want a specific contributor to win.
+Because of the **reverse-iteration** rule, the **last module loaded** is asked first. Module load order is controlled by `[DependsOn(...)]` — put the module whose contributors should win **last** in the dependency chain. There is no `Configure<...>` knob for contributor ordering; the `IEnumerable<IImageResizerContributor>` injection follows the container's registration order, and `ImageResizer` / `ImageCompressor` simply iterate that enumeration in reverse.
 
 <Tip>
 If you need to pin a particular provider for a particular call path, bypass the chain and inject the contributor type directly:
@@ -373,7 +373,7 @@ Each branch:
 
 ```csharp
 [HttpPost("upload-avatar")]
-[ResizeImage(width: 256, height: 256, "file")]
+[ResizeImage(256, 256, "file", Mode = ImageResizeMode.Crop)]
 [CompressImage("file")]
 public async Task<string> UploadAvatar(IFormFile file)
 {
@@ -384,13 +384,20 @@ public async Task<string> UploadAvatar(IFormFile file)
 
 The filters run in attribute order — resize first (smaller pixel count), then compress (better ratio on the smaller image).
 
-The default `Mode` for `ResizeImageAttribute` is the `default(ImageResizeMode) == ImageResizeMode.None` — which means **no aspect-ratio enforcement**. If you want square cropping, set it:
+`ResizeImageAttribute.Mode` is a public settable property (not a constructor argument). With no explicit value the field is `default(ImageResizeMode) == ImageResizeMode.None`, which the filter forwards to `new ImageResizeArgs(Width, Height, Mode)`. Because `Mode` is non-nullable on the attribute, the args ctor receives `ImageResizeMode.None` and `ImageResizer.ChangeDefaultResizeMode` does **not** rewrite it from `ImageResizeOptions.DefaultResizeMode` — that sentinel substitution only fires when the args carry `ImageResizeMode.Default`. To pick a mode at the call site use named-argument attribute syntax:
 
 ```csharp
-[ResizeImage(256, 256, "file") { Mode = ImageResizeMode.Crop }]
+[ResizeImage(256, 256, "file", Mode = ImageResizeMode.Crop)]
 ```
 
-Or globally via `ImageResizeOptions.DefaultResizeMode` so that any `ImageResizeMode.Default` falls into the chosen mode.
+To change the mode for every caller that does pass `ImageResizeMode.Default` (or constructs `ImageResizeArgs` without specifying `mode`, since the args type itself defaults to `ImageResizeMode.Default`), configure it globally:
+
+```csharp
+Configure<ImageResizeOptions>(options =>
+{
+    options.DefaultResizeMode = ImageResizeMode.Crop;
+});
+```
 
 ## Wiring guide
 

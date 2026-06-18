@@ -357,7 +357,7 @@ protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext worker
 }
 ```
 
-- The lock name comes from `AbpBackgroundJobWorkerOptions.DistributedLockName` (defaults to `AbpBackgroundJobs`).
+- The lock name comes from `AbpBackgroundJobWorkerOptions.DistributedLockName` (defaults to `"AbpBackgroundJobWorker"`).
 - The timeout is the default (zero) — if another instance already holds the lock, this tick is skipped and the worker waits for `Timer.Period`.
 - Multiple replicas can be deployed safely: only one drains `IBackgroundJobStore` per cycle.
 

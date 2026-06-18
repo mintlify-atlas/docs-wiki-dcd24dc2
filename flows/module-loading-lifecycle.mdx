@@ -200,7 +200,7 @@ public class AbpModuleDescriptor : IAbpModuleDescriptor
 
 ## Lifecycle contributors: extensibility
 
-You can add custom hooks by implementing `IModuleLifecycleContributor` and adding the type to `AbpModuleLifecycleOptions.Contributors`. Inside `Volo.Abp.Modularity.AbpModularityModule` (the framework's bootstrap module) the default list is wired:
+You can add custom hooks by implementing `IModuleLifecycleContributor` and adding the type to `AbpModuleLifecycleOptions.Contributors`. The default list is registered by `InternalServiceCollectionExtensions.AddCoreAbpServices` (in `framework/src/Volo.Abp.Core/Volo/Abp/Internal/`), called from `AbpApplicationBase`'s constructor:
 
 ```csharp
 Configure<AbpModuleLifecycleOptions>(options =>
@@ -274,7 +274,7 @@ public class MyWebModule : AbpModule { ... }
 
 After `SortByDependency`, the order in `IModuleContainer.Modules` is:
 
-```
+```text
 AbpCoreModule (and friends with no deps)
 ↓
 AbpDataModule, AbpUnitOfWorkModule, AbpSecurityModule, AbpAuditingModule, ...

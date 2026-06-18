@@ -185,11 +185,11 @@ The subsystems in `Volo.Abp.Core` have an explicit ordering that the conventiona
 
 | Phase | What runs | Where defined |
 | --- | --- | --- |
-| Constructor (sync, ABp) | `services.TryAddObjectAccessor<IServiceProvider>()`, `AddSingleton<IAbpApplication>(this)`, `AddSingleton<IModuleContainer>(this)`, `AddSingleton<IAbpHostEnvironment>(...)`, `AddCoreServices()`, `AddCoreAbpServices(this, options)`. | `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs` (lines 24-71) |
+| Constructor (sync, ABp) | `services.TryAddObjectAccessor<IServiceProvider>()`, `AddSingleton<IAbpApplication>(this)`, `AddSingleton<IModuleContainer>(this)`, `AddSingleton<IAbpHostEnvironment>(...)`, `AddCoreServices()`, `AddCoreAbpServices(this, options)`. | `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs` (the `internal AbpApplicationBase(...)` ctor, ~lines 39-72) |
 | `AddCoreServices` | `services.AddOptions()`, `AddLogging()`, `AddLocalization()`. | `Volo/Abp/Internal/InternalServiceCollectionExtensions.cs` |
 | `AddCoreAbpServices` | `ModuleLoader`, `AssemblyFinder`, `TypeFinder`, `IInitLoggerFactory`, `ISimpleStateCheckerManager<>`, `IStaticDefinitionCache<,>` + lifecycle contributors. | Same file. |
 | `LoadModules` | Walk `[DependsOn]` graph; load plug-ins; sort topologically; emit `ServiceCollection` singletons for every module instance. | `Volo/Abp/Modularity/ModuleLoader.cs` |
-| `ConfigureServices` | `PreConfigureServices` → `services.AddAssembly(moduleAssembly)` × N → `ConfigureServices` → `PostConfigureServices`. | `AbpApplicationBase.cs` (lines 304-392) |
+| `ConfigureServices` | `PreConfigureServices` → `services.AddAssembly(moduleAssembly)` × N → `ConfigureServices` → `PostConfigureServices`. | `AbpApplicationBase.cs` (`ConfigureServicesAsync` at ~line 214; sync `ConfigureServices` at ~line 307) |
 | `InitializeModules` (post-build) | `IModuleLifecycleContributor` instances in the order registered by `AbpModuleLifecycleOptions.Contributors`. | `Volo/Abp/Modularity/ModuleManager.cs` |
 | `ShutdownModules` | Module list reversed, then each contributor's `Shutdown[Async]`. | Same file. |
 

@@ -23,7 +23,7 @@ public class AbpMemoryDbModule : AbpModule
 }
 ```
 
-`UnitOfWorkMemoryDatabaseProvider<TMemoryDbContext>` lives under `Volo/Abp/Uow/MemoryDb/`. It hands every UoW the same `IMemoryDatabase` singleton (lookup via `MemoryDatabaseManager.Get(databaseName)`), so writes inside the UoW are immediately visible to subsequent reads in the same UoW — there is no "save changes" round-trip.
+`UnitOfWorkMemoryDatabaseProvider<TMemoryDbContext>` lives under `Volo/Abp/Uow/MemoryDb/`. `GetDatabaseAsync` resolves the connection string via `IConnectionStringResolver.ResolveAsync<TMemoryDbContext>()` (using `CurrentTenant.Change(null)` first when the context is `[IgnoreMultiTenancy]`), builds the UoW key `"{TMemoryDbContext.FullName}_{connectionString}"`, and `GetOrAddDatabaseApi(key, () => new MemoryDbDatabaseApi(_memoryDatabaseManager.Get(connectionString)))`. Because `MemoryDatabaseManager` (singleton) caches the same `IMemoryDatabase` per connection-string key, writes inside the UoW are immediately visible to subsequent reads — there is no "save changes" round-trip.
 
 ## `MemoryDbContext`
 
@@ -48,7 +48,7 @@ public interface IMemoryDatabase
 }
 ```
 
-The default implementation `MemoryDatabase` (`Volo/Abp/Domain/Repositories/MemoryDb/MemoryDatabase.cs`) keeps a `ConcurrentDictionary<Type, object>` of `IMemoryDatabaseCollection<T>` instances. `GenerateNextId<TEntity, TKey>()` defers to `InMemoryIdGenerator` which supports `int`, `long`, `Guid`, and `string` keys.
+The default implementation `MemoryDatabase` (`Volo/Abp/Domain/Repositories/MemoryDb/MemoryDatabase.cs`, `ITransientDependency`) keeps a `ConcurrentDictionary<Type, object>` of `IMemoryDatabaseCollection<T>` instances and a parallel `ConcurrentDictionary<Type, InMemoryIdGenerator>` for per-entity counters. `GenerateNextId<TEntity, TKey>()` defers to the internal `InMemoryIdGenerator` which supports `Guid` (`Guid.NewGuid()`), `int` (`Interlocked.Increment` of a per-entity `int` counter) and `long` (likewise). Any other key type throws `AbpException("Not supported PrimaryKey type: ...")`.
 
 ## `IMemoryDatabaseCollection<TEntity>`
 
@@ -102,7 +102,7 @@ Highlights:
 
 ## `InMemoryIdGenerator`
 
-File: `InMemoryIdGenerator.cs`. Thread-safe sequence generator for `int`, `long`, `Guid` (sequential), `string` (GUID-to-string). Used by `MemoryDatabase.GenerateNextId`.
+File: `InMemoryIdGenerator.cs` (internal class). Thread-safe sequence generator. Supported `TKey`s: `Guid` → `Guid.NewGuid()` (not sequential), `int` → `Interlocked.Increment(ref _lastInt)`, `long` → `Interlocked.Increment(ref _lastLong)`. Any other key type throws `AbpException`. Used by `MemoryDatabase.GenerateNextId<TEntity, TKey>`.
 
 ## DI registration
 

@@ -215,22 +215,22 @@ A resource permission targets a `(resourceName, name, resourceKey)` triple — u
 
 ```mermaid
 flowchart LR
-    Caller[[Application code]] -->|"IsGrantedAsync(\"BookStore.Books.Create\")"| Checker
-    subgraph PermissionChecker
+    Caller[Application code] -->|IsGrantedAsync name| Checker
+    subgraph PC[PermissionChecker]
       Checker[PermissionChecker]
       Checker -->|GetOrNullAsync| DefMgr[PermissionDefinitionManager]
       DefMgr -->|static| Static[StaticPermissionDefinitionStore]
       DefMgr -->|dynamic| Dyn[DynamicPermissionDefinitionStore]
       Checker -->|IsEnabledAsync| State[SimpleStateCheckerManager]
-      Checker -->|ValueProviders.foreach| Mgr[PermissionValueProviderManager]
+      Checker -->|foreach ValueProvider| Mgr[PermissionValueProviderManager]
       Mgr --> U[UserPermissionValueProvider]
       Mgr --> R[RolePermissionValueProvider]
       Mgr --> C[ClientPermissionValueProvider]
     end
-    U -->|"name, \"U\", userId"| Store
-    R -->|"name, \"R\", role"| Store
-    C -->|"name, \"C\", clientId"| Store
-    Store[IPermissionStore<br/>(PermissionStore)] --> Cache[(IDistributedCache<br/>PermissionGrantCacheItem)]
+    U -->|name, U, userId| Store
+    R -->|name, R, role| Store
+    C -->|name, C, clientId| Store
+    Store[IPermissionStore / PermissionStore] --> Cache[(IDistributedCache PermissionGrantCacheItem)]
     Store --> Repo[IPermissionGrantRepository]
     Repo --> DB[(PermissionGrants table)]
 ```

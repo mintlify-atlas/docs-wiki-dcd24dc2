@@ -225,7 +225,7 @@ The provider extension methods (e.g. `UseSqlServer`, `UseNpgsql`) target `AbpDbC
 
 - `Migrations/EfCoreDatabaseMigrationEventHandlerBase.cs` — base class for `ApplyDatabaseMigrationsEto` handlers that runs `Database.MigrateAsync()` for tenant connection strings.
 - `Migrations/EfCoreRuntimeDatabaseMigratorBase.cs` — auto-migration on app start.
-- `DistributedEvents/DbContextEventOutbox.cs` / `DbContextEventInbox.cs` (+ `OutgoingEventRecord`, `IncomingEventRecord`, `EventOutboxConfigExtensions`, `EventInboxConfigExtensions`, `IHasEventOutbox`, `IHasEventInbox`, `EventOutboxDbContextModelBuilderExtensions`, `EventInboxDbContextModelBuilderExtensions`) — DB-backed event inbox/outbox plugged into `AbpDistributedEventBusOptions`. See `/flows/distributed-event-publish`.
+- `DistributedEvents/` — DB-backed event inbox/outbox plugged into `AbpDistributedEventBusOptions`. Files: `DbContextEventOutbox.cs` / `IDbContextEventOutbox.cs`, `DbContextEventInbox.cs` / `IDbContextEventInbox.cs`, `OutgoingEventRecord.cs`, `IncomingEventRecord.cs`, `EfCoreOutboxConfigExtensions.cs`, `EfCoreInboxConfigExtensions.cs`, `IHasEventOutbox.cs`, `IHasEventInbox.cs`, `EventOutboxDbContextModelBuilderExtensions.cs`, `EventInboxDbContextModelBuilderExtensions.cs`. See `/flows/distributed-event-publish`.
 
 ## Cross-references
 

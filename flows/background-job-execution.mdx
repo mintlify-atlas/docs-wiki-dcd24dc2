@@ -114,7 +114,7 @@ protected virtual async Task<Guid> EnqueueAsync(string jobName, object args, Bac
 | `ApplicationName` | `AbpBackgroundJobWorkerOptions.ApplicationName` | Multi-tenant/multi-app stores can shard. |
 | `JobName` | `AbpBackgroundJobOptions.GetBackgroundJobName(argsType)` | Logical key the worker uses to look up the job type. |
 | `JobArgs` | `IBackgroundJobSerializer.Serialize(args)` | JSON-encoded arg payload. |
-| `Priority` | caller | `Low|BelowNormal|Normal|AboveNormal|High` &mdash; influences `GetWaitingJobsAsync` ordering. |
+| `Priority` | caller | `BackgroundJobPriority` enum &mdash; `Low`, `BelowNormal`, `Normal`, `AboveNormal`, `High`; influences `GetWaitingJobsAsync` ordering. |
 | `CreationTime` | `IClock.Now` | Anchor for the "abandon after N seconds" check. |
 | `NextTryTime` | now or `now + delay` | What `GetWaitingJobsAsync` filters on. |
 

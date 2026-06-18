@@ -18,7 +18,7 @@ The Aliyun provider package is `framework/src/Volo.Abp.BlobStoring.Aliyun/Volo/A
 | `AliyunBlobNamingNormalizer.cs` | OSS bucket name rules (lowercase, dashes, no underscores, 3-63 chars). |
 | `IAliyunBlobNameCalculator.cs` + `DefaultAliyunBlobNameCalculator.cs` | `host/{blob}` vs. `tenants/{tenantId:D}/{blob}` object key. |
 | `IOssClientFactory.cs` + `DefaultOssClientFactory.cs` | Creates `IOss` clients either with the long-lived access pair, or with STS-issued temporary credentials cached via `IDistributedCache`. |
-| `AliyunTemporaryCredentialsCacheItem.cs` | `{ AccessKeyId, AccessKeySecret, SecurityToken, Expiration }` cache item (encrypted). |
+| `AliyunTemporaryCredentialsCacheItem.cs` | `{ AccessKeyId, AccessKeySecret, SecurityToken }` cache item (the three values are `IStringEncryptionService`-encrypted before being stored). |
 
 ## Module
 
@@ -89,13 +89,15 @@ a.Policy          = "{ \"Statement\": [...] }";
 
 `DefaultOssClientFactory.GetOssClient(configuration)`:
 
-1. If `UseSecurityTokenService == false` → `return new OssClient(Endpoint, AccessKeyId, AccessKeySecret);`.
-2. Otherwise call `GetTemporaryCredentialsAsync(configuration)`:
-   - `Cache.GetAsync(configuration.TemporaryCredentialsCacheKey)` — if hit, decrypt the stored `AccessKeyId`/`AccessKeySecret`/`SecurityToken` via `IStringEncryptionService` and use them.
-   - On miss, create an `AcsClient(new DefaultProfile(RegionId, AccessKeyId, AccessKeySecret))`, send `AssumeRoleRequest { RoleArn, RoleSessionName, DurationSeconds, Policy }`, encrypt the response and `SetAsync` with `AbsoluteExpiration = response.Credentials.Expiration` (the actual expiry timestamp Aliyun returned).
+1. `Check.NotNullOrWhiteSpace` on `AccessKeyId`, `AccessKeySecret` and `Endpoint`.
+2. If `UseSecurityTokenService == false` → `return new OssClient(Endpoint, AccessKeyId, AccessKeySecret);`.
+3. Otherwise `GetSecurityTokenClient(configuration)`:
+   - `Cache.Get(configuration.TemporaryCredentialsCacheKey)` — if hit, decrypt the stored `AccessKeyId`/`AccessKeySecret`/`SecurityToken` via `IStringEncryptionService` and use them.
+   - On miss, build `DefaultProfile.GetProfile(RegionId, AccessKeyId, AccessKeySecret)`, create a `DefaultAcsClient(profile)` and send `AssumeRoleRequest { AcceptFormat = JSON, RoleArn, RoleSessionName, DurationSeconds, Policy }`. `Policy` is sent as `null` when the configured string is empty (the role's own permissions then apply unrestricted).
+   - Encrypt the three fields of `response.Credentials` via `IStringEncryptionService` and `Cache.Set` with `AbsoluteExpirationRelativeToNow = DurationSeconds - 10` seconds.
    - Build `new OssClient(Endpoint, ak, sk, securityToken)`.
 
-The cached `AliyunTemporaryCredentialsCacheItem` also stores `Expiration`, so callers can verify validity without parsing tokens.
+Note that the cached `AliyunTemporaryCredentialsCacheItem` only holds the three encrypted credential strings — it does not persist `response.Credentials.Expiration`. Effective validity is enforced by the cache entry's own TTL (`DurationSeconds - 10s`), matching the AWS provider.
 
 ## `AliyunBlobProvider`
 
@@ -123,7 +125,7 @@ return CurrentTenant.Id == null
 ## Operational notes
 
 - **Per-call client construction**. `OssClient` is small and cheap to instantiate; it owns its own connection state internally.
-- **STS expiration**. Cache TTL uses the actual `Credentials.Expiration` from STS rather than `DurationSeconds - 10s` (as in the AWS provider). This matches Aliyun's response model.
+- **STS expiration**. Cache TTL is `DurationSeconds - 10` seconds (same pattern as the AWS provider). The 10-second skew leaves room for the round-trip latency between issuing the cached session and Aliyun OSS validating it on the next request.
 - **`TemporaryCredentialsCacheKey`** defaults to a per-configuration GUID. Override when you want sub-second reuse across all instances of the same role/policy.
 - **Encryption at rest**. `IStringEncryptionService` encrypts the three credential fields in the cache item. Configure `AbpStringEncryptionOptions` consistently.
 

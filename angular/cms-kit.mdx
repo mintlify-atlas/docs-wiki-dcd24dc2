@@ -8,7 +8,7 @@ description: "Inside @abp/ng.cms-kit: admin pages for blogs, pages, comments, ta
 
 ## Package layout
 
-```
+```text
 packages/cms-kit/
 ├── package.json           # @abp/ng.cms-kit
 ├── src/                   # umbrella entry point
@@ -225,11 +225,11 @@ The tab is registered through the same provider pattern documented in [`angular/
 `GlobalResourcesComponent` instead uses CodeMirror for the CSS and JS panels:
 
 ```html
-<abp-code-mirror-editor
+<abp-codemirror-editor
   [(ngModel)]="css"
   [language]="'css'"
   [theme]="'dark'">
-</abp-code-mirror-editor>
+</abp-codemirror-editor>
 ```
 
 Both wrappers lazy-load their underlying libraries (`@toast-ui/editor` and `codemirror`) via dynamic `import()`, so the initial bundle does not pay the editor cost.

@@ -64,20 +64,23 @@ public class MemoryBlobProvider : BlobProviderBase, ITransientDependency
 
 ### Lifetime gotcha
 
-`ITransientDependency` looks alarming — a transient provider would mean a new store per resolution and instant data loss. The dictionary survives because `IBlobProviderSelector` resolves `IEnumerable<IBlobProvider>` from the root container, and `DefaultBlobProviderSelector` is `ITransientDependency` but its dependencies (including the resolved provider instance) are constructed once per request scope. **In practice the provider is re-instantiated frequently, but the dictionary is a field on the provider instance, so storage is not shared across resolutions.**
+The provider is registered as **transient** (`ITransientDependency`), and the `ConcurrentDictionary<string, byte[]>` is an instance field initialised in the constructor. Every fresh resolution of `MemoryBlobProvider` (or of `IEnumerable<IBlobProvider>` from `DefaultBlobProviderSelector`, which is itself transient) therefore gets a **new, empty store** — there is no static or singleton backing field.
 
-To make this work as expected, register the provider as a **singleton** in your test module (or wrap the dictionary in a singleton service) before depending on it:
+Whether reads see prior writes depends entirely on how often the DI container creates a new provider instance for you. Inside a single `BlobContainerFactory.Create(name)` → provider call chain you do get the same instance, but anything that resolves `IBlobContainer<T>` a second time (a new HTTP request, a new scope, a fresh injection point) goes through `DefaultBlobProviderSelector` again and may receive a different `MemoryBlobProvider` with an empty dictionary.
+
+To make persistence across resolutions explicit — which is usually what tests want — replace the registration with a singleton in your test module:
 
 ```csharp
 public override void ConfigureServices(ServiceConfigurationContext context)
 {
     context.Services.Replace(
         ServiceDescriptor.Singleton<MemoryBlobProvider, MemoryBlobProvider>());
-    context.Services.AddSingleton<IBlobProvider>(sp => sp.GetRequiredService<MemoryBlobProvider>());
+    context.Services.AddSingleton<IBlobProvider>(sp =>
+        sp.GetRequiredService<MemoryBlobProvider>());
 }
 ```
 
-`AbpBlobStoringMemoryModule` itself does not do this — it's a deliberate choice so the package can stay minimal for the most common case (single-resolution test inside one `using var application = ...`). Production code should never rely on the memory provider.
+`AbpBlobStoringMemoryModule` itself does not do this — the package stays minimal and the caller decides on the appropriate lifetime. Production code should never rely on the memory provider.
 
 ### Operations
 

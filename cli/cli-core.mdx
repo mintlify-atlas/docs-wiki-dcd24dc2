@@ -155,12 +155,15 @@ public AbpCliConfig Read(string directory)
 {
   "AbpCli": {
     "Bundle": {
-      "Mode": "OnePerProject",
+      "Mode": "BundleAndMinify",
+      "Name": "global",
       "Parameters": { "LeptonXTheme.Layout": "side-menu" }
     }
   }
 }
 ```
+
+`BundleConfig.Mode` accepts only `None`, `Bundle`, or `BundleAndMinify` (enum `BundlingMode`); the default is `BundleAndMinify`. `Name` defaults to `"global"` and is used as the output filename stem under `wwwroot/`.
 
 `InstallLibsCommand`, `BundleCommand` and `BuildCommand` all call `IConfigReader.Read(currentDirectory)` to pick up bundle settings. JSON comments are tolerated (`/* */` and `//`) because Visual Studio writes commented appsettings by default.
 

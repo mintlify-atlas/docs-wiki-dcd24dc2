@@ -23,7 +23,7 @@ Inside `AbpAspNetCoreModule.OnApplicationInitialization` (and the per-template `
 | 5 | Time zone | `AbpTimeZoneMiddleware` &mdash; `Microsoft/AspNetCore/Timing/` | `app.UseAbpRequestLocalization()` |
 | 6 | Authentication | `app.UseAuthentication()` (ASP.NET Core) | host code |
 | 7 | Dynamic claims | `AbpDynamicClaimsMiddleware` &mdash; `Volo/Abp/AspNetCore/Security/Claims/` | `app.UseDynamicClaims()` (configures `IAuthenticateResultFeature`) |
-| 8 | Multi-tenancy | `MultiTenancyMiddleware` &mdash; `Volo/Abp/AspNetCore/MultiTenancy/` | `app.UseMultiTenancy()` |
+| 8 | Multi-tenancy | `MultiTenancyMiddleware` &mdash; `Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/` | `app.UseMultiTenancy()` |
 | 9 | Authorization | `app.UseAuthorization()` (ASP.NET Core) | host code |
 | 10 | Unit of work | `AbpUnitOfWorkMiddleware` &mdash; `Volo/Abp/AspNetCore/Uow/` | `app.UseUnitOfWork()` |
 | 11 | Auditing | `AbpAuditingMiddleware` &mdash; `Volo/Abp/AspNetCore/Auditing/` | `app.UseAuditing()` |
@@ -120,7 +120,7 @@ This is what surfaces freshly-revoked permissions or just-flipped feature flags 
 
 ### 4. Multi-tenancy
 
-`MultiTenancyMiddleware.InvokeAsync` (`Volo/Abp/AspNetCore/MultiTenancy/MultiTenancyMiddleware.cs`):
+`MultiTenancyMiddleware.InvokeAsync` (`framework/src/Volo.Abp.AspNetCore.MultiTenancy/Volo/Abp/AspNetCore/MultiTenancy/MultiTenancyMiddleware.cs`):
 
 ```csharp
 var tenant = await _tenantConfigurationProvider.GetAsync(saveResolveResult: true);

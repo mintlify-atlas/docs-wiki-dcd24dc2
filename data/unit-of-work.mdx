@@ -9,7 +9,24 @@ Source: `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/`.
 
 ## Module
 
-`AbpUnitOfWorkModule` (file `AbpUnitOfWorkModule.cs`) hooks `UnitOfWorkInterceptorRegistrar.RegisterIfNeeded` into `IServiceCollection.OnRegistered`. Any registered type whose declaring class implements `IUnitOfWorkEnabled` or carries `[UnitOfWork]` gets wrapped with `UnitOfWorkInterceptor`.
+`AbpUnitOfWorkModule` (file `AbpUnitOfWorkModule.cs`) overrides `PreConfigureServices` and hooks `UnitOfWorkInterceptorRegistrar.RegisterIfNeeded` into `IServiceCollection.OnRegistered`:
+
+```csharp
+public class AbpUnitOfWorkModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.OnRegistered(UnitOfWorkInterceptorRegistrar.RegisterIfNeeded);
+    }
+}
+```
+
+`UnitOfWorkInterceptorRegistrar.ShouldIntercept` calls `UnitOfWorkHelper.IsUnitOfWorkType(implementationType.GetTypeInfo())` and skips types listed in `DynamicProxyIgnoreTypes`. The rule (`UnitOfWorkHelper`):
+
+1. Type or any method on the type carries `[UnitOfWork]` → eligible.
+2. Type implements `IUnitOfWorkEnabled` → eligible.
+
+Eligible registrations get `UnitOfWorkInterceptor` added through `context.Interceptors.TryAdd<UnitOfWorkInterceptor>()`. There is no module-level configuration block — the module is single-purpose.
 
 ## File-by-file enumeration
 
@@ -30,7 +47,7 @@ Source: `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/`.
 | `UnitOfWorkInterceptorRegistrar.cs` | static | Decides which DI registrations need the interceptor. |
 | `UnitOfWorkTransactionBehavior.cs` | enum | `Auto`, `Enabled`, `Disabled`. |
 | `IUnitOfWorkTransactionBehaviourProvider.cs` / `NullUnitOfWorkTransactionBehaviourProvider.cs` | provider | Pluggable per-runtime override (e.g. ASP.NET Core sets it based on HTTP method/route). |
-| `AlwaysDisableTransactionsUnitOfWorkManager.cs` | `AlwaysDisableTransactionsUnitOfWorkManager : UnitOfWorkManager` | Test helper that forces `IsTransactional = false`. |
+| `AlwaysDisableTransactionsUnitOfWorkManager.cs` | `AlwaysDisableTransactionsUnitOfWorkManager : IUnitOfWorkManager` (delegates to a wrapped `UnitOfWorkManager`; marked `[DisableConventionalRegistration]`) | Test helper that mutates `options.IsTransactional = false` on `Begin` / `BeginReserved` / `TryBeginReserved`. |
 | `AbpUnitOfWorkOptions.cs` | `AbpUnitOfWorkOptions : IAbpUnitOfWorkOptions` | `IsTransactional`, `IsolationLevel?`, `Timeout?` (ms). `Clone()`. |
 | `IAbpUnitOfWorkOptions.cs` | read-only view of options | Exposed via `IUnitOfWork.Options`. |
 | `AbpUnitOfWorkDefaultOptions.cs` | global defaults | `TransactionBehavior = Auto`, plus default `IsolationLevel`/`Timeout`. `Normalize(options)` fills in unset values. `CalculateIsTransactional(autoValue)` resolves `Auto` → true/false. |
@@ -85,32 +102,49 @@ sequenceDiagram
 
 ### Outer / inner / reserved
 
-- **Outer UoW exists & `requiresNew == false`** → `Begin` returns a `ChildUnitOfWork`. The child's `CompleteAsync` is a no-op; only the outer commits.
-- **Outer UoW exists & `requiresNew == true`** → a fresh root UoW is created, `SetOuter(outerUow)` is called so it can still chain `Failed` events. The new UoW becomes the ambient one until disposed.
-- **Reservation** — `Reserve("_AbpActionUnitOfWork")` creates a UoW with `IsReserved = true` early in the pipeline (e.g. `AbpUnitOfWorkMiddleware` for ASP.NET Core). `[UnitOfWork]`-wrapped methods then call `TryBeginReserved(name, options)` which initialises the reserved UoW with the method's options, so middleware-level state (current tenant, current user) is captured before the action runs.
+`UnitOfWorkManager.Begin(options, requiresNew)`:
+
+- **Outer UoW exists & `requiresNew == false`** → returns `new ChildUnitOfWork(currentUow)`. The child forwards `SaveChangesAsync` / `RollbackAsync` / `AddOrReplaceLocalEvent` / `AddOrReplaceDistributedEvent` to the parent, but `CompleteAsync()` is `Task.CompletedTask` — only the outer commits.
+- **Otherwise** → `CreateNewUnitOfWork()` creates a fresh `IServiceScope`, resolves a new `IUnitOfWork` from it, calls `SetOuter(outerUow)` (with the current ambient UoW, or `null` if none), then `_ambientUnitOfWork.SetUnitOfWork(unitOfWork)`. A `Disposed` handler restores the previous ambient UoW and disposes the scope. Finally `Initialize(options)` normalizes the options through `AbpUnitOfWorkDefaultOptions.Normalize`.
+- **Reservation** — `Reserve("_AbpActionUnitOfWork")` calls `CreateNewUnitOfWork()` (same scope mechanics) and then `unitOfWork.Reserve(reservationName)` which sets `IsReserved = true` and `ReservationName`. The constant `UnitOfWork.UnitOfWorkReservationName = "_AbpActionUnitOfWork"` is used by `AbpUnitOfWorkMiddleware` to reserve a UoW for the whole ASP.NET Core request before the action runs. `[UnitOfWork]`-wrapped methods later call `unitOfWorkManager.TryBeginReserved(name, options)` which walks `_ambientUnitOfWork.UnitOfWork`'s `Outer` chain looking for one whose `IsReservedFor(name)` is true and, if found, calls `Initialize(options)` on it. That way the reserved UoW gets the method's transactional options while the ambient state set up by middleware (current tenant, current user) is preserved.
+
+`AmbientUnitOfWork.GetCurrentByChecking()` walks the `Outer` chain skipping any UoW whose `IsReserved`, `IsDisposed` or `IsCompleted` is true, so reserved-but-not-initialized UoWs are invisible to `UnitOfWorkManager.Current`.
 
 ### Event ordering
 
-`UnitOfWork.AddOrReplaceLocalEvent` / `AddOrReplaceDistributedEvent` accept an optional `Predicate<UnitOfWorkEventRecord>? replacementSelector`. If supplied and a previous record matches, the new event replaces it — this is how "entity updated" events deduplicate across multiple modifications. Otherwise the event is appended with `EventOrderGenerator.GetNext()`. On commit, events are sorted by `EventOrder` ascending, then dispatched via `IUnitOfWorkEventPublisher`.
+`UnitOfWork.AddOrReplaceLocalEvent` / `AddOrReplaceDistributedEvent` accept an optional `Predicate<UnitOfWorkEventRecord>? replacementSelector`. The event is first buffered into `LocalEventWithPredicates` / `DistributedEventWithPredicates` and, on `CompleteAsync`, flushed into `LocalEvents` / `DistributedEvents`. During flushing, if the selector matches a previously buffered record the new record reuses that record's `EventOrder` (via `SetOrder`) — this is how an "entity updated" event collapses across multiple modifications of the same aggregate during the UoW. Otherwise the record keeps the `EventOrder` it was created with (typically from `EventOrderGenerator.GetNext()`, a process-wide `Interlocked.Increment` counter).
+
+On commit, `CompleteAsync` loops: sort `LocalEvents` by `EventOrder` ascending, publish via `IUnitOfWorkEventPublisher.PublishLocalEventsAsync`, then do the same for `DistributedEvents`, then `SaveChangesAsync` again (because handlers may have produced more changes), then drain any new buffered events. The loop terminates only when both lists are empty. Then `CommitTransactionsAsync` commits every registered `ITransactionApi`, `IsCompleted` is set, and the registered `OnCompleted` handlers run.
 
 ### Transaction decision
 
-`UnitOfWorkInterceptor.CreateOptions` resolves `IsTransactional` like this when the attribute does not set it:
+`UnitOfWorkInterceptor.CreateOptions` runs `unitOfWorkAttribute?.SetOptions(options)` first (so an explicit `[UnitOfWork(IsTransactional = true)]` wins). If the attribute did not set `IsTransactional`, the interceptor falls back to:
 
 ```csharp
+var defaultOptions = serviceProvider.GetRequiredService<IOptions<AbpUnitOfWorkDefaultOptions>>().Value;
 options.IsTransactional = defaultOptions.CalculateIsTransactional(
     autoValue: serviceProvider.GetRequiredService<IUnitOfWorkTransactionBehaviourProvider>().IsTransactional
                ?? !invocation.Method.Name.StartsWith("Get", StringComparison.InvariantCultureIgnoreCase)
 );
 ```
 
-So by default a method whose name starts with `Get` is read-only (no transaction), everything else opens one — unless `AbpUnitOfWorkDefaultOptions.TransactionBehavior` is `Enabled`/`Disabled` to force it.
+`AbpUnitOfWorkDefaultOptions.CalculateIsTransactional(autoValue)` switches on `TransactionBehavior`:
+
+| `TransactionBehavior` | Result |
+| --- | --- |
+| `UnitOfWorkTransactionBehavior.Enabled` | `true` (always transactional) |
+| `UnitOfWorkTransactionBehavior.Disabled` | `false` (never transactional) |
+| `UnitOfWorkTransactionBehavior.Auto` (default) | the `autoValue` argument |
+
+The default `autoValue` is `!invocation.Method.Name.StartsWith("Get", InvariantCultureIgnoreCase)` — so by convention a method called `GetSomethingAsync` is non-transactional and everything else is transactional. `IUnitOfWorkTransactionBehaviourProvider` can override the auto value before that fallback fires; the default `NullUnitOfWorkTransactionBehaviourProvider` returns `null` and `AbpAspNetCoreUowOptions`-driven providers can use it to flip the convention based on HTTP verb. The companion `AlwaysDisableTransactionsUnitOfWorkManager : IUnitOfWorkManager` (annotated `[DisableConventionalRegistration]`) forces `options.IsTransactional = false` in `Begin`, `BeginReserved` and `TryBeginReserved` regardless of these settings — wire it up in tests that must not open ambient transactions.
 
 ## Failure handling
 
-`UnitOfWork.SaveChangesAsync` / `CompleteAsync` catch exceptions, stash them in `_exception`, raise `Failed`, then rethrow. `Dispose` rolls back any active transaction (`ISupportsRollback`), fires `Disposed`, and pops itself off `AmbientUnitOfWork`.
+`UnitOfWork.CompleteAsync` wraps the publish-loop / commit chain in a `try`/`catch` that stores the exception in `_exception` and rethrows. The `Failed` event is raised by `Dispose` when `_exception != null` (carrying a `UnitOfWorkFailedEventArgs` with the exception and the `IsRolledback` flag); otherwise the `Disposed` event is raised with `UnitOfWorkEventArgs`. The ambient pop-off is wired in `UnitOfWorkManager.CreateNewUnitOfWork`'s `Disposed` handler: it calls `_ambientUnitOfWork.SetUnitOfWork(outerUow)` and disposes the per-UoW `IServiceScope`.
 
-`AbpDbConcurrencyException` (in `Volo.Abp.Data`) is the canonical concurrency error — EF Core wraps `DbUpdateConcurrencyException` into it via `AbpDbContext.SaveChangesOnDbContextAsync`.
+`RollbackAsync` sets `_isRolledback = true` and walks every active database API for `ISupportsRollback` and every active transaction API for `ISupportsRollback`, calling `RollbackAsync` on each. After `_isRolledback` is true, both `SaveChangesAsync` and `CompleteAsync` become no-ops.
+
+`AbpDbConcurrencyException` (in `Volo.Abp.Data`) is the canonical concurrency error. `AbpDbContext.SaveChangesOnDbContextAsync` catches `DbUpdateConcurrencyException`, logs each conflicting `EntityEntry`, and rethrows as `AbpDbConcurrencyException(ex.Message, ex)`. The UoW's exception path then captures it normally.
 
 ## Cross-references
 

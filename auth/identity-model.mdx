@@ -57,7 +57,20 @@ The dedicated `IHttpClient` name `"IdentityModelAuthenticationServiceHttpClientN
 | `ValidateIssuerName` | `true` | Discovery policy. |
 | `ValidateEndpoints` | `true` | Discovery policy. |
 
-Any additional `(key, value)` pair stored in the dictionary is forwarded to the token endpoint by `AddParametersToRequestAsync`, so custom OpenIddict claims like `__tenant`, `acr_values`, or your own protocol extensions can be propagated through configuration alone.
+Additional dictionary entries whose **key begins with `[o]`** (case-insensitive) are forwarded to the token endpoint by `AddParametersToRequestAsync` as extra `Parameters` on the `ProtocolRequest`. The `[o]` prefix exists so the framework can distinguish protocol parameters from accessor keys without colliding with the strongly-typed properties above; override `AddParametersToRequestAsync` if you want to strip or rewrite the prefix before it hits the wire. Use this hook to push values like `acr_values`, `prompt`, or your own OpenIddict extension parameters through configuration alone.
+
+```csharp
+// framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityModelAuthenticationService.cs
+protected virtual Task AddParametersToRequestAsync(IdentityClientConfiguration configuration, ProtocolRequest request)
+{
+    foreach (var pair in configuration.Where(p => p.Key.StartsWith("[o]", StringComparison.OrdinalIgnoreCase)))
+    {
+        request.Parameters.Add(pair.Key, pair.Value!);
+    }
+
+    return Task.CompletedTask;
+}
+```
 
 ## `AbpIdentityClientOptions.GetClientConfiguration`
 
@@ -139,7 +152,7 @@ public class IdentityModelAuthenticationService : IIdentityModelAuthenticationSe
 
 Behaviours worth knowing:
 
-- **Cache key** is `string.Join(",", configuration.Select(x => x.Key + ":" + x.Value)).ToSha256()` — every field of the `IdentityClientConfiguration` participates, so switching tenant, scope or grant type yields a different cache entry.
+- **Cache key** is `string.Join(",", configuration.Select(x => x.Key + ":" + x.Value)).ToSha256()` (see `IdentityModelTokenCacheItem.CalculateCacheKey`) — every key/value in the `IdentityClientConfiguration` dictionary participates, so switching scope, grant type or any `[o]` parameter yields a different cache entry. Per-tenant uniqueness comes from the tenant-scoped configuration lookup above (and from `AddHeaders` propagating `__tenant`), not from the token cache key itself.
 - **In development the TTL is forced to 5 seconds** to keep iteration fast. Production uses `CacheAbsoluteExpiration` (default 30 minutes). Make sure that value is shorter than the access token's `expires_in`.
 - The bearer header is hard-coded to `"Bearer"` in `SetAccessToken` (`// TODO: "Bearer" should be configurable`).
 - Errors from the token endpoint are unwrapped: the long Duende error payload is split on `<eof/>` so the resulting `AbpException` message stays readable.
@@ -160,7 +173,7 @@ Behaviours worth knowing:
 
 Anything else throws `AbpException("Grant type was not implemented: …")`. The `Refresh token` flow is not exposed here — long-lived service identities use `client_credentials`, interactive users use cookies/OIDC.
 
-`AddParametersToRequestAsync` (called from each `Create…TokenRequestAsync`) loops over the `IdentityClientConfiguration` dictionary and copies anything that is not a known property into the request's `Parameters`. That is how you propagate custom parameters like `acr_values` or `__tenant`.
+`AddParametersToRequestAsync` (called from each `Create…TokenRequestAsync`) walks the `IdentityClientConfiguration` dictionary and forwards every entry whose key starts with `[o]` into the request's `Parameters`. Use that prefix in configuration (`IdentityClients:Default:[o]acr_values`) to propagate custom OAuth parameters. The current-tenant id is propagated separately by `AddHeaders`, which sets the default tenant header (`TenantResolverConsts.DefaultTenantKey` → `__tenant`) on the outbound `HttpClient`.
 
 `IdentityModelHttpRequestMessageOptions` (`IdentityModelHttpRequestMessageOptions.cs`) lets you mutate the outgoing `HttpRequestMessage` (e.g. set additional headers) globally — register the options in `ConfigureServices`.
 

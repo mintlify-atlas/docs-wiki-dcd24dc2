@@ -14,7 +14,7 @@ At runtime an ABP app is a graph of `IAbpModule` instances rooted at a single **
 
 ```mermaid
 flowchart LR
-  Host["WebApplication / generic Host<br/>(Program.cs)"] --> Factory["AbpApplicationFactory<br/>framework/src/Volo.Abp.Autofac/...AbpApplicationFactory.cs"]
+  Host["WebApplication / generic Host<br/>(Program.cs)"] --> Factory["AbpApplicationFactory<br/>framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationFactory.cs"]
   Factory --> Base["AbpApplicationBase<br/>framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs"]
   Base --> Loader["IModuleLoader<br/>Volo.Abp.Modularity.ModuleLoader"]
   Loader --> Graph["Module dependency graph<br/>[DependsOn] attributes"]
@@ -92,16 +92,16 @@ flowchart TB
 
 | Member | Type | Source |
 | --- | --- | --- |
-| `StartupModuleType` | `Type` | `AbpApplicationBase.cs` line ~24 |
-| `Services` | `IServiceCollection` | line ~28 |
-| `ServiceProvider` | `IServiceProvider` | line ~26 |
-| `Modules` | `IReadOnlyList<IAbpModuleDescriptor>` | line ~30 |
-| `ApplicationName` | `string?` | line ~32 |
-| `InstanceId` | `string` (GUID per process) | line ~34 |
+| `StartupModuleType` | `Type` | `AbpApplicationBase.cs` line 25 |
+| `ServiceProvider` | `IServiceProvider` | line 27 |
+| `Services` | `IServiceCollection` | line 29 |
+| `Modules` | `IReadOnlyList<IAbpModuleDescriptor>` | line 31 |
+| `ApplicationName` | `string?` | line 33 |
+| `InstanceId` | `string` (GUID per process) | line 35 |
 
-The constructor (lines 38–72) runs `services.AddCoreServices()` and `services.AddCoreAbpServices(this, options)`, then calls `LoadModules(services, options)` which delegates to `IModuleLoader.LoadModules(services, StartupModuleType, options.PlugInSources)` (line 146). If `options.SkipConfigureServices` is false it then calls `ConfigureServices()`, the sync wrapper around `ConfigureServicesAsync()` defined further down the same file.
+The constructor (lines 38–73) runs `services.AddCoreServices()` (line 65) and `services.AddCoreAbpServices(this, options)` (line 66), then assigns `Modules = LoadModules(services, options)` (line 68). `LoadModules` (lines 147–156) delegates to `IModuleLoader.LoadModules(services, StartupModuleType, options.PlugInSources)`. If `options.SkipConfigureServices` is false the constructor finishes by calling `ConfigureServices()` (line 72), the sync wrapper around `ConfigureServicesAsync()` defined further down the same file.
 
-`ConfigureServicesAsync()` (line ~210) iterates every loaded module four times in declared order:
+`ConfigureServicesAsync()` (line 214) iterates every loaded module four times in declared order:
 
 <Steps>
   <Step title="PreConfigureServices">
@@ -114,11 +114,11 @@ The constructor (lines 38–72) runs `services.AddCoreServices()` and `services.
     Calls `IPostConfigureServices.PostConfigureServicesAsync(context)`. Last chance to mutate `IServiceCollection`.
   </Step>
   <Step title="Initialize (after BuildServiceProvider)">
-    Once the host builds `ServiceProvider`, `InitializeModulesAsync()` (line 107) resolves `IModuleManager` and runs three more passes: `OnPreApplicationInitialization` → `OnApplicationInitialization` → `OnPostApplicationInitialization`. Both methods exist as overrideable virtuals on `AbpModule.cs` (lines 64–96).
+    Once the host builds `ServiceProvider`, `InitializeModulesAsync()` (line 107) resolves `IModuleManager` and runs three more passes: `OnPreApplicationInitialization` → `OnApplicationInitialization` → `OnPostApplicationInitialization`. All three exist as overrideable virtuals on `AbpModule.cs` (sync + async pairs, lines 65–95).
   </Step>
 </Steps>
 
-Graceful shutdown is handled by `ShutdownAsync()` (line 74) which calls `IModuleManager.ShutdownModulesAsync(new ApplicationShutdownContext(scope.ServiceProvider))` running every module's `OnApplicationShutdownAsync`.
+Graceful shutdown is handled by `ShutdownAsync()` (line 76) which calls `IModuleManager.ShutdownModulesAsync(new ApplicationShutdownContext(scope.ServiceProvider))` running every module's `OnApplicationShutdownAsync` (defined on `AbpModule.cs` around line 95).
 
 <Note>
 The deeper boot sequence — host → factory → loader → lifecycle contributors → DI build — is documented in `/flows/application-startup`. This page covers only the architectural shape.
@@ -126,7 +126,17 @@ The deeper boot sequence — host → factory → loader → lifecycle contribut
 
 ## `IAbpModule`, `AbpModule` and `[DependsOn]`
 
-`framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModule.cs` defines the bare contract: `void ConfigureServices(ServiceConfigurationContext context)`. `AbpModule.cs` provides the abstract base that also implements `IOnPreApplicationInitialization`, `IOnApplicationInitialization`, `IOnPostApplicationInitialization`, `IOnApplicationShutdown`, `IPreConfigureServices`, `IPostConfigureServices` (the union — every lifecycle hook a module can plug into).
+`framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModule.cs` defines the bare contract — two methods, sync and async:
+
+```csharp
+public interface IAbpModule
+{
+    Task ConfigureServicesAsync(ServiceConfigurationContext context);
+    void ConfigureServices(ServiceConfigurationContext context);
+}
+```
+
+`AbpModule.cs` provides the abstract base that implements `IAbpModule` *and* `IOnPreApplicationInitialization`, `IOnApplicationInitialization`, `IOnPostApplicationInitialization`, `IOnApplicationShutdown`, `IPreConfigureServices`, `IPostConfigureServices` (the union — every lifecycle hook a module can plug into). Each interface comes as a sync + async pair, and `AbpModule` ships virtual no-op implementations of both so concrete modules can override either.
 
 Module dependencies are declared by **attribute, not by DI**:
 
@@ -214,9 +224,9 @@ await app.InitializeApplicationAsync();
 await app.RunAsync();
 ```
 
-- `UseAutofac()` is `Volo.Abp.Autofac` (`framework/src/Volo.Abp.Autofac/Volo/Abp/Autofac/AbpAutofacExtensions.cs`). ABP requires Autofac to honour open-generic registrations, property injection and interception.
-- `builder.AddApplicationAsync<TStartupModule>()` lives in `Volo.Abp.AspNetCore` and ultimately calls `AbpApplicationFactory.CreateAsync(...)` → constructs `AbpApplicationWithExternalServiceProvider`, runs `ConfigureServicesAsync` on every module.
-- `app.InitializeApplicationAsync()` resolves the built app, sets the root service provider, runs `InitializeModulesAsync()`.
+- `UseAutofac()` on the `IHostBuilder` is defined in `framework/src/Volo.Abp.Autofac/Microsoft/Extensions/Hosting/AbpAutofacHostBuilderExtensions.cs` and registers `AbpAutofacServiceProviderFactory` (`framework/src/Volo.Abp.Autofac/Volo/Abp/Autofac/AbpAutofacServiceProviderFactory.cs`). ABP requires Autofac to honour open-generic registrations, property injection and interception.
+- `builder.AddApplicationAsync<TStartupModule>()` lives in `framework/src/Volo.Abp.AspNetCore/Microsoft/Extensions/DependencyInjection/WebApplicationBuilderExtensions.cs` and ultimately calls `AbpApplicationFactory.CreateAsync(...)` (in `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationFactory.cs`) → constructs `AbpApplicationWithExternalServiceProvider`, runs `ConfigureServicesAsync` on every module.
+- `app.InitializeApplicationAsync()` resolves the built `IAbpApplicationWithExternalServiceProvider`, sets the root service provider, and runs `InitializeModulesAsync()` on `AbpApplicationBase`.
 
 The startup module `MyProjectNameAuthServerModule` typically `[DependsOn]`s `MyProjectNameApplicationModule`, `MyProjectNameEntityFrameworkCoreModule`, the OpenIddict module, an IdentityServer/OpenIddict UI module, and theme modules — pulling in ~50–100 transitive ABP modules. The full transitive list is what makes the loader's topological sort the single source of truth for boot order.
 

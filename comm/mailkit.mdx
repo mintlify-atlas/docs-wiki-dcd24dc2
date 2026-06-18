@@ -31,7 +31,7 @@ The module body is empty. All registration happens through attributes on `MailKi
 public class MailKitSmtpEmailSender : EmailSenderBase, IMailKitSmtpEmailSender
 ```
 
-`ReplaceServices = true` means it overrides the default `IEmailSender` and `ISmtpEmailSender` registrations from `Volo.Abp.Emailing`. Any code injecting `IEmailSender` after referencing this module gets the MailKit implementation transparently.
+`ReplaceServices = true` makes the registration replace the default `IEmailSender` registration from `Volo.Abp.Emailing`. Note that `MailKitSmtpEmailSender` implements `IMailKitSmtpEmailSender` and `IEmailSender` (via `EmailSenderBase`) — it does **not** implement `ISmtpEmailSender`. If your code injects `ISmtpEmailSender` directly, you still get the BCL `SmtpEmailSender`; inject `IEmailSender` (or `IMailKitSmtpEmailSender`) to get the MailKit implementation.
 
 ## `AbpMailKitOptions`
 

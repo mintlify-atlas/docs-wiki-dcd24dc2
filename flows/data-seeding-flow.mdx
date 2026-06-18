@@ -131,7 +131,7 @@ Two notable things:
 
 | Call | Effect |
 |------|--------|
-| `AddDataMigrationEnvironment()` | Sets `IDataSeedingModeProvider.IsSeeding = true` so framework code can suppress noisy notifications/events. |
+| `AddDataMigrationEnvironment()` | Registers an `AbpDataMigrationEnvironment` object accessor (`Volo/Abp/Data/AbpDataMigrationEnvironmentExtensions.cs`). Modules check `IServiceCollection.IsDataMigrationEnvironment()` and short-circuit work that does not belong in a migrator process &mdash; for example `AbpBackgroundJobsAbstractionsModule` and `AbpBackgroundWorkersModule` disable their workers, and `AbpAspNetCoreMvcUiBundlingModule` skips bundle generation. |
 | `application.InitializeAsync()` | Same boot as a web app &mdash; every module's `OnApplicationInitialization` runs. This is what registers all `IDataSeedContributor`s onto `AbpDataSeedOptions`. |
 
 ## Contributor registration
@@ -201,20 +201,23 @@ See [Unit of work flow](/flows/unit-of-work-flow) for the interceptor mechanics.
 
 ### `SeedInSeparateUow` mode
 
-For long-running seeders (think hundreds of localisation rows, thousands of permission grants) the "everything in one transaction" model can be a problem. The helper `DataSeederExtensions.WithSeedInSeparateUow(...)` opts into per-contributor UoWs:
+For long-running seeders (think hundreds of localisation rows, thousands of permission grants) the "everything in one transaction" model can be a problem. The helper `DataSeederExtensions.SeedInSeparateUowAsync(...)` opts into per-contributor UoWs:
 
 ```csharp
-public static DataSeedContext WithSeedInSeparateUow(this DataSeedContext context,
-    AbpUnitOfWorkOptions? uowOptions = null, bool requiresNew = false)
+public static Task SeedInSeparateUowAsync(this IDataSeeder seeder,
+    Guid? tenantId = null,
+    AbpUnitOfWorkOptions? options = null,
+    bool requiresNew = false)
 {
-    context.Properties[SeedInSeparateUow] = true;
-    if (uowOptions != null) context.Properties[SeedInSeparateUowOptions] = uowOptions;
-    if (requiresNew) context.Properties[SeedInSeparateUowRequiresNew] = requiresNew;
-    return context;
+    var context = new DataSeedContext(tenantId);
+    context.WithProperty(SeedInSeparateUow, true);
+    context.WithProperty(SeedInSeparateUowOptions, options);
+    context.WithProperty(SeedInSeparateUowRequiresNew, requiresNew);
+    return seeder.SeedAsync(context);
 }
 ```
 
-When this property is present, `DataSeeder` opens a fresh UoW per contributor via `IUnitOfWorkManager.Begin(options, requiresNew)`. Pros and cons:
+The three `DataSeederExtensions` constants &mdash; `SeedInSeparateUow`, `SeedInSeparateUowOptions`, `SeedInSeparateUowRequiresNew` &mdash; are the exact keys `DataSeeder.SeedAsync` looks for in `context.Properties`. When `SeedInSeparateUow` is present, `DataSeeder` opens a fresh UoW per contributor via `IUnitOfWorkManager.Begin(options, requiresNew)`. Pros and cons:
 
 | Mode | Pro | Con |
 |------|-----|-----|
@@ -327,7 +330,7 @@ Custom modules add their own contributors via `Configure<AbpDataSeedOptions>` as
     `DataSeedContributorList` is an ordered list. If you depend on another contributor's data, register yours *after* it &mdash; the framework cannot infer dependencies.
   </Accordion>
   <Accordion title="Suppress distributed events during seeding">
-    The seeded entities normally publish `EntityCreatedEto` via `CompleteAsync`. If your subscribers do not want to react to seed inserts, gate them on `IDataSeedingModeProvider.IsSeeding`, which `AddDataMigrationEnvironment()` sets to `true`.
+    The seeded entities normally publish `EntityCreatedEto` via `CompleteAsync`. If your subscribers should ignore seed inserts, check `IServiceCollection.IsDataMigrationEnvironment()` during module configuration (the same flag `AbpBackgroundWorkersModule` uses to avoid starting workers in DbMigrator) or guard the handler on `DataSeedContext.Properties` you set explicitly.
   </Accordion>
   <Accordion title="Tenant connection string must be resolvable">
     `using (_currentTenant.Change(tenant.Id))` only works if the tenant row has a connection string (or the host falls back to the global). See [Connection-string resolver](/multitenancy/connection-string-resolver).
@@ -336,17 +339,23 @@ Custom modules add their own contributors via `Configure<AbpDataSeedOptions>` as
 
 ## Calling seed from runtime code
 
-Outside DbMigrator, `IDataSeeder` is callable from any service. The most common case is during tenant creation, where the tenant-management module schedules a seed run right after the tenant row + connection string are committed:
+Outside DbMigrator, `IDataSeeder` is callable from any service. The most common case is during tenant creation, where the tenant-management module schedules a seed run right after the tenant row + connection string are committed. The `DataSeedContext.WithProperty(key, value)` fluent helper is the universal extension point &mdash; contributors read those properties to pick up out-of-band data like admin credentials:
 
 ```csharp
-await _dataSeeder.SeedAsync(
-    new DataSeedContext(createdTenantId)
-        .WithProperty("AdminEmail", input.AdminEmail)
-        .WithProperty("AdminPassword", input.AdminPassword)
-        .WithSeedInSeparateUow(requiresNew: true));
+var context = new DataSeedContext(createdTenantId)
+    .WithProperty("AdminEmail", input.AdminEmail)
+    .WithProperty("AdminPassword", input.AdminPassword);
+
+// Either keep the single-UoW default:
+await _dataSeeder.SeedAsync(context);
+
+// Or opt into per-contributor UoWs via the dedicated extension:
+await _dataSeeder.SeedInSeparateUowAsync(
+    tenantId: createdTenantId,
+    requiresNew: true);
 ```
 
-The `Properties` bag is the universal extension point &mdash; contributors read it to pick up out-of-band data like admin credentials.
+`SeedInSeparateUowAsync` builds the `DataSeedContext` internally and fills in the three `DataSeederExtensions` keys &mdash; it does not take user properties, so when both are needed call the two-step form: build the context with `WithProperty`, set `context.Properties[DataSeederExtensions.SeedInSeparateUow] = true`, then `SeedAsync(context)`.
 
 ## Related pages
 

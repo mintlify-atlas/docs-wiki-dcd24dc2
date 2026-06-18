@@ -124,7 +124,7 @@ public interface ITheme
 A Razor page picks a layout by **name**, not by path — usually inside the page's `OnPageHandlerExecuting` or directly at the top of the `.cshtml`:
 
 ```csharp
-public class StandardLayouts
+public static class StandardLayouts
 {
     public const string Application = "Application";  // app pages w/ sidebar + toolbar
     public const string Account     = "Account";      // login / register

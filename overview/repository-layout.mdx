@@ -59,13 +59,13 @@ Every entry from `ls -1` at the repo root, annotated:
 | `global.json` | file | Pins .NET SDK to **`10.0.100`** with `rollForward=latestFeature` |
 | `latest-versions.json` | file | Sequence of `{version, leptonx, type}` entries consumed by templates & CLI |
 | `lowcode/` | dir | `schema/` JSON Schemas used by ABP Studio low-code module designer |
-| `modules/` | dir | 19 application modules (Identity, OpenIddict, CmsKit, …) |
+| `modules/` | dir | 18 application modules (Identity, OpenIddict, CmsKit, …) plus a `README.md` |
 | `npm/` | dir | All JavaScript: Angular `ng-packs`, MVC `packs`, lerna config, publish scripts |
 | `nupkg/` | dir | Release-time .nupkg producer (`pack.ps1`, `push_packages.ps1`, `common.ps1`) |
 | `source-code/` | dir | Modules redistributed as **source** (zipped by ABP Studio for "source-code" purchases): `SourceCodes.slnx` + per-module `Volo.Abp.<X>.SourceCode/` |
 | `studio/` | dir | `source-codes/` mirror used by ABP Studio's package replacement workflow |
 | `templates/` | dir | 6 solution templates: `app`, `app-nolayers`, `module`, `console`, `maui`, `wpf` |
-| `test/` | dir | Root-level cross-cutting tests (e.g. shared integration scaffolding) |
+| `test/` | dir | Standalone test/benchmark solutions: `AbpPerfTest/` (with/without ABP perf harness — `AbpPerfTest.WithAbp`, `AbpPerfTest.WithoutAbp`, JMeter scripts under `_jmeter/`) and `DistEvents/` (distributed event-bus demo apps: `DistDemoApp.EfCoreRabbitMq`, `DistDemoApp.MongoDbKafka`, `DistDemoApp.MongoDbRebus`, `DistDemoApp.Shared`) |
 | `tools/` | dir | `github-changelog-generator`, `localization-key-synchronizer`, `nuget/nuget.exe`, `smtp-prober-email-sender.exe` |
 
 ## `framework/`
@@ -146,7 +146,7 @@ graph TB
 
 ## `modules/`
 
-19 official application modules (`ls modules`):
+18 official application modules (`ls modules` — plus a top-level `README.md`):
 
 | Directory | Module purpose | Notable startup module class |
 | --- | --- | --- |
@@ -157,7 +157,7 @@ graph TB
 | `blob-storing-database/` | EF/Mongo `IBlobProvider` implementation | `BlobStoringDatabaseDomainModule` |
 | `blogging/` | Sample blogging module (used by abp.io) | `BloggingDomainModule` |
 | `client-simulation/` | Load-testing simulation tool | `ClientSimulationDomainModule` |
-| `cms-kit/` | Blogs, pages, comments, tags, polls | `CmsKitDomainModule`, `CmsKitProDomainModule` |
+| `cms-kit/` | Blogs, pages, comments, tags, polls — split between public (`Volo.CmsKit.*`) and admin (`Volo.CmsKit.Admin.*`) layer fans | `CmsKitDomainModule`, `CmsKitAdminApplicationModule` |
 | `docs/` | Multi-source documentation viewer | `DocsDomainModule` |
 | `feature-management/` | Persisted feature flags | `FeatureManagementDomainModule` |
 | `identity/` | User/role/claim management on top of ASP.NET Identity | `AbpIdentityDomainModule` |
@@ -323,7 +323,7 @@ source-code/
 
 | Path | Purpose |
 | --- | --- |
-| `test/` | Cross-module integration test scaffolding shared by multiple solutions |
+| `test/` | Two standalone solutions: `AbpPerfTest/AbpPerfTest.slnx` (perf benchmarks) and `DistEvents/DistEventsDemo.slnx` (distributed-event-bus demo) — not invoked by `build/build-all.ps1` |
 | `docs/` | Source of the documentation site at abp.io/docs |
 | `apiSpec/` | Auto-generated public-API markdown surface (1 file currently visible) |
 | `ai-rules/` | Markdown rule packs that ABP Studio AI features inject into prompts: `common/`, `data/`, `template-specific/`, `testing/`, `ui/` |

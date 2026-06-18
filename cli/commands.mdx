@@ -53,7 +53,7 @@ All flag-parsing helpers used below live as nested `static class Options` types 
 | [`prompt`](#prompt) | `PromptCommand.cs` | Enter REPL (handled in `CliService.RunPromptAsync`) | — |
 | [`remove-proxy`](#remove-proxy) | `RemoveProxyCommand.cs` | Delete files emitted by `generate-proxy` | mirrors `generate-proxy` flags |
 | [`suite`](#suite) | `SuiteCommand.cs` | Install/update/remove/start ABP Suite | `install`, `update`, `remove`, `(default)` start |
-| [`switch-to-local`](#switch-to-local) | `SwitchToLocalCommand.cs` | Replace NuGet refs with local `<ProjectReference>` | `-s/--solution`, `-p/--paths` |
+| [`switch-to-local`](#switch-to-local) | `SwitchToLocalCommand.cs` (class `SwitchToLocal`) | Replace NuGet refs with local `<ProjectReference>` | `-s/--solution`, `-p/--paths` |
 | [`switch-to-nightly`](#switch-to-nightly) | `SwitchToNightlyCommand.cs` | Move packages to nightly MyGet feed | (positional path) |
 | [`switch-to-prerc`](#switch-to-prerc) | `SwitchToPreRcCommand.cs` | Switch npm packages to pre-rc track | (positional path) |
 | [`switch-to-preview`](#switch-to-preview) | `SwitchToPreviewCommand.cs` | Switch packages to preview channel | (positional path) |

@@ -205,7 +205,7 @@ protected virtual float CalculateRatio(uint width, uint height)
 | `None` | `image.Resize(W, H)` with computed target | Plain resize — Magick.NET preserves aspect when one axis is 0 by default. |
 | `Stretch` | `image.Resize(new MagickGeometry(W, H) { IgnoreAspectRatio = true })` | Force exact dimensions, distort aspect. |
 | `Pad` | Compute scale-to-fit, `image.Resize(newW, newH)`, then `image.Extent(W, H, Gravity.Center, MagickColors.Transparent)` | Fit-inside with transparent center-padding. |
-| `BoxPad` | Like `Pad` but with a `boxPadWidth/Height` based on source < target check; doesn't upscale when source is smaller than the box. | Original is centered inside an exact-size transparent box. |
+| `BoxPad` | Branches on `sourceWidth < boxPadWidth && sourceHeight < boxPadHeight`; if so, resizes the canvas to the computed `boxPad*` size, otherwise keeps the original pixel dimensions. Then `image.Extent(W, H, Gravity.Center, MagickColors.Transparent)`. | Original is centered inside an exact-size transparent box. |
 | `Max` | Compute scale-to-cover, `image.Resize(W, H)` | Result fully covers target box; one dimension can exceed target. |
 | `Min` | Constrain to ≤ target preserving aspect; if source already smaller, no upscale | Result fits inside target without enlargement. |
 | `Crop` | `image.Extent(W, H, Gravity.Center, Transparent)`, `image.Crop(new MagickGeometry(W, H) { IgnoreAspectRatio = true }, Gravity.Center)` | Center-crop to exact target size. |

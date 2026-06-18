@@ -236,7 +236,7 @@ $response = Invoke-RestMethod @releaseParams
 | `name` | Same as tag |
 | `body` | Hard-coded empty string; release notes are auto-generated through the GitHub UI afterwards |
 | `draft` | `$isDraft` → `false` by default; `$true` while testing |
-| `prerelease` | `true` if `$isRcVersion` ∈ {`true`, `y`, `rc`} |
+| `prerelease` | `true` if `$isRcVersion` matches `true`, `y`, or `rc` |
 
 The `readme.md` comment block warns that **step 6 (GitHub release) in their numbered list is "not active"** for some maintainers' workflows — they prefer to publish the release manually from the GitHub UI with auto-generated notes. Either path is supported.
 

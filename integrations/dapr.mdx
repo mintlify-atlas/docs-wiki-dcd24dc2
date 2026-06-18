@@ -18,7 +18,7 @@ The pub/sub bus that publishes events through these endpoints lives in `Volo.Abp
 
 ### Files
 
-```
+```text
 framework/src/Volo.Abp.Dapr/Volo/Abp/Dapr/
 ├── AbpDaprModule.cs           — module: binds AbpDaprOptions, picks up env vars
 ├── AbpDaprOptions.cs          — HttpEndpoint, GrpcEndpoint, DaprApiToken, AppApiToken
@@ -175,7 +175,7 @@ Used by the event-bus subscribe endpoint (below) to decode Dapr's CloudEvent `da
 
 ### Files
 
-```
+```text
 framework/src/Volo.Abp.AspNetCore.Mvc.Dapr/Volo/Abp/AspNetCore/Mvc/Dapr/
 ├── AbpAspNetCoreMvcDaprModule.cs    — depends on Mvc + Dapr modules
 ├── IDaprAppApiTokenValidator.cs     — Check / IsValid / GetOrNull
@@ -345,7 +345,7 @@ Three things to notice:
 
 ## How the pieces fit together
 
-```
+```text
 host appsettings
    │
    ▼ "Dapr": { HttpEndpoint, DaprApiToken, AppApiToken } / env vars

@@ -95,7 +95,7 @@ The numbered scripts must run from `deploy/` (each does `cd ..\nupkg` or `cd ..`
 
 ## `npm/` — JavaScript build & publish
 
-`npm/lerna.json` glues `npm/packs/*` (MVC packs only) into a Lerna 3 monorepo at version `10.2.0-rc.3`, `npmClient: yarn`. Angular `npm/ng-packs/` is a self-managed Nx/Angular workspace published separately.
+`npm/lerna.json` glues `npm/packs/*` (MVC packs only) into a Lerna monorepo at version `10.2.0-rc.3`, `npmClient: yarn`. The `lerna` field declares `3.18.4` and matches the `lerna ^3.18.4` `devDependency` in `npm/package.json`. Angular `npm/ng-packs/` is a self-managed Nx/Angular workspace (`npm/ng-packs/nx.json`, its own `lerna.publish.json` + `lerna.version.json`) published separately.
 
 | Script | Purpose |
 | --- | --- |
